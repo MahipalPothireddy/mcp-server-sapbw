@@ -90,9 +90,23 @@ All notable changes to this project are documented here. The format is based on
     `bw_analyze_routine`.
   - Capability catalog gained `RSTRANSTEPROUT` (field-routine code-ids) and `RSTRANSEG`.
 
+- Lineage service (build prompt B6), offline- and live-smoke-verified:
+  - Models (`models/lineage.py`): `LineageNode` (incl. the DataSource boundary with
+    `upstream_resolved`), `LineageEdge` (declared vs advisory routine edges, update mode),
+    `LineageGraph`, `ImpactAnalysis`, `TraceToSource` — aligned with the design.md sketch.
+  - `LineageService` (`services/lineage.py`): BFS over declared edges from transformations (RSTRAN)
+    and DTPs (RSBKDTP, with update mode), merged, plus advisory routine-derived edges parsed from a
+    target's routines (B5 parser). Cycle-guarded, depth- and node-capped.
+  - `bw_impact_analysis` additionally runs a reverse RSAABAP scan to find objects whose *routines*
+    read the target — dependencies invisible to BW's own where-used lists (advisory).
+  - `bw_trace_to_source` walks upstream to the DataSource boundary.
+  - Tools: `bw_get_lineage`, `bw_impact_analysis`, `bw_trace_to_source`.
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).
+- Lineage node ids are object technical names (unique enough for lineage); routine-derived edges are
+  advisory (heuristic lower bound). The DataSource is a boundary node (`upstream_resolved=False`).
 - Routine analysis is a heuristic lower bound (mission Known Limitation 3): dynamic SQL,
   function-module and class-method calls are not followed; `/BIC/`-to-object resolution is advisory.
 - Chain frequency is classified from observed run cadence (RSPCLOGCHAIN), not from chain names or

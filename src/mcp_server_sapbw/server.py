@@ -25,6 +25,7 @@ from .core.connection import ReadOnlyConnectionPool
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
+from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
 from .models.transformations import (
@@ -37,6 +38,7 @@ from .repositories.chains import ChainsRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.search import SearchRepository
 from .repositories.transformations import TransformationsRepository
+from .services.lineage import LineageService
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 _MAX_TOOL_NAME = 40
@@ -132,6 +134,7 @@ class Runtime(Protocol):
     def providers(self, system: str) -> ProvidersRepository: ...
     def search(self, system: str) -> SearchRepository: ...
     def transformations(self, system: str) -> TransformationsRepository: ...
+    def lineage(self, system: str) -> LineageService: ...
 
 
 class ServerRuntime:
@@ -189,6 +192,9 @@ class ServerRuntime:
 
     def transformations(self, system: str) -> TransformationsRepository:
         return TransformationsRepository(self._connection(system), self.capability(system))
+
+    def lineage(self, system: str) -> LineageService:
+        return LineageService(self._connection(system), self.capability(system))
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -423,6 +429,39 @@ def bw_analyze_routine(
     if isinstance(result, UnsupportedResult):
         return result
     return RoutineAnalysisResult(transformation_id=transformation_id, analyses=result)
+
+
+# --- lineage tools -----------------------------------------------------------------------
+
+
+@_readonly_tool
+def bw_get_lineage(
+    system: str, name: str, direction: LineageDirection = "both", depth: int = 3
+) -> LineageGraph | UnsupportedResult:
+    """Directed lineage graph around an object (upstream/downstream/both) to a depth.
+
+    Nodes + edges JSON, including advisory routine-derived edges (a target's routines' reads). Large
+    graphs are truncated at a node cap with ``truncated=true``.
+    """
+    return runtime().lineage(system).get_lineage(name, direction=direction, depth=depth)
+
+
+@_readonly_tool
+def bw_impact_analysis(
+    system: str, name: str, depth: int = 3
+) -> ImpactAnalysis | UnsupportedResult:
+    """Downstream blast radius of a change, including objects whose routines read the target.
+
+    The routine-embedded consumers are dependencies invisible to BW's own where-used lists; they are
+    advisory (heuristic lower bound).
+    """
+    return runtime().lineage(system).impact_analysis(name, depth=depth)
+
+
+@_readonly_tool
+def bw_trace_to_source(system: str, name: str, depth: int = 8) -> TraceToSource | UnsupportedResult:
+    """Trace an object upstream, hop by hop, to the originating DataSource boundary."""
+    return runtime().lineage(system).trace_to_source(name, depth=depth)
 
 
 def main() -> None:

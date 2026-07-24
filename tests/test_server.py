@@ -20,6 +20,7 @@ from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
+from mcp_server_sapbw.services.lineage import LineageService
 
 _TABLES = {
     "chain_attr": "RSPCCHAINATTR",
@@ -56,6 +57,7 @@ class _Conn:
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
+        params = list(parameters or [])
         if "TOTAL_COUNT" in sql:
             return [(1,)]
         if "RSPCCHAINATTR" in sql:
@@ -84,11 +86,27 @@ class _Conn:
             return [("E", "Load one", "Load one target set")]
         if "RSAABAP" in sql:
             return [("METHOD start.",), ("  SELECT * FROM mara INTO TABLE lt.",), ("ENDMETHOD.",)]
+        if "RSBKDTP" in sql:  # no DTP edges in this fixture
+            return []
         if "RSTRAN" in sql:
-            if "OBJSTAT" in sql:  # get_transformation header (12 cols)
-                return [("ACT", "RSDS", "", "DS_A", "ADSO", "", "ADSO_T", "CODE1", "", "", "", "")]
-            return [("TR1", "RSDS", "DS_A", "ADSO", "ADSO_T", "CODE1", "", "")]  # list (8 cols)
+            return self._rstran(sql, params)
         return []
+
+    @staticmethod
+    def _rstran(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        # Synthetic flow: DS_A --TR1--> ADSO_T (TR1 has start routine CODE1).
+        name = str(params[-1]) if params else ""
+        if "OBJSTAT" in sql:  # get_transformation / get_routine_code header (12 cols)
+            return [("ACT", "RSDS", "", "DS_A", "ADSO", "", "ADSO_T", "CODE1", "", "", "", "")]
+        if "STARTROUTINE IN" in sql or "TRANID IN" in sql:  # reverse impact search
+            return []
+        if "SOURCENAME = ?" in sql:  # lineage downstream
+            return [("ADSO_T", "ADSO", "TR1")] if name == "DS_A" else []
+        if "TARGETNAME = ?" in sql:
+            if "SOURCENAME" in sql:  # lineage upstream
+                return [("DS_A", "RSDS", "TR1")] if name == "ADSO_T" else []
+            return [("TR1",)] if name == "ADSO_T" else []  # transformations_targeting
+        return [("TR1", "RSDS", "DS_A", "ADSO", "ADSO_T", "CODE1", "", "")]  # list (8 cols)
 
 
 class FakeRuntime:
@@ -118,6 +136,9 @@ class FakeRuntime:
 
     def transformations(self, system: str) -> TransformationsRepository:
         return TransformationsRepository(_Conn(), self._cap)
+
+    def lineage(self, system: str) -> LineageService:
+        return LineageService(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -201,6 +222,26 @@ def test_analyze_routine_via_client_is_lower_bound() -> None:
     assert analyses
     assert all(a["completeness"] == "lower_bound" for a in analyses)
     assert analyses[0]["provenance"]["source_table"] == "RSAABAP"
+
+
+def test_get_lineage_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call("bw_get_lineage", {"system": "qa", "name": "DS_A", "direction": "downstream"})
+    )
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    names = {n["name"] for n in body["nodes"]}
+    assert {"DS_A", "ADSO_T"} <= names
+    assert any(e["src"] == "DS_A" and e["dst"] == "ADSO_T" for e in body["edges"])
+
+
+def test_trace_to_source_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_trace_to_source", {"system": "qa", "name": "ADSO_T"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert "DS_A" in body["datasources_reached"]
 
 
 def test_registered_tool_names_are_valid() -> None:
