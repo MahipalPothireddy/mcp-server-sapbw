@@ -104,7 +104,10 @@ jobs:
           bic='/(BIC|BI0)/[A-Za-z0-9_]{3,}'
           zy='\b[ZY][A-Z0-9_]{4,}\b'
           combined="($bic)|($zy)"
-          allow='^(ZZ_TEST|YYYYMMDD|YYYYMMDDHHMMSS)$'   # generic non-customer placeholders
+          # Generic non-customer tokens that match the Z/Y pattern: throwaway/date placeholders,
+          # plus ZY_FIELDS (a former internal SQL column alias, since renamed, that appears in one
+          # earlier commit's PROGRESS.md prose -- not a customer object).
+          allow='^(ZZ_TEST|YYYYMMDD|YYYYMMDDHHMMSS|ZY_FIELDS)$'
           fail=0
 
           # 1) Working tree (git-ignored dirs and fixtures excluded).

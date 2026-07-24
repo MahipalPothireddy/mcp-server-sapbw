@@ -150,6 +150,18 @@ All notable changes to this project are documented here. The format is based on
   - Prompts (`prompts/workflows.py`): `analyze_impact`, `troubleshoot_missing_data`,
     `document_dataflow`, `review_scenario`, `onboard_analyst`, `pre_change_checklist`.
 
+- Documentation generator (build prompt B10, mission Section 8), offline- and live-smoke-verified:
+  - `DocGenerator` (`services/docgen.py`) composes every repository and service to render the full
+    markdown knowledge base: `index.md`, `01-inventory/` through `08-scenarios/`, and a non-empty
+    `99-gaps-and-risks.md`. Lineage pages carry Mermaid flow diagrams plus graph JSON; every page
+    has backlinks and a source-table citation footer; generated descriptions render with a visible
+    marker; the gaps register aggregates unsupported/truncated/connector-gated/advisory items.
+  - Output-location safety refuses to write into the git-tracked repo tree (writes outside the repo
+    or under a git-ignored dir, defaulting to `output/docs/<system>`); generation is bounded per
+    section with truncation recorded.
+  - Tool: `bw_generate_docs(system, output_dir, limit)` returning a manifest (files, page count,
+    gaps count, truncation flag).
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).

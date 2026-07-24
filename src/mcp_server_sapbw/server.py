@@ -46,6 +46,7 @@ from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
 from .repositories.transformations import TransformationsRepository
 from .services.analyzers import Analyzers
+from .services.docgen import DocGenerator, DocGenResult
 from .services.lineage import LineageService
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
@@ -164,6 +165,7 @@ class Runtime(Protocol):
     def queries(self, system: str) -> QueriesRepository: ...
     def hana(self, system: str) -> HanaRepository: ...
     def analyzers(self, system: str) -> Analyzers: ...
+    def docgen(self, system: str) -> DocGenerator: ...
 
 
 class ServerRuntime:
@@ -238,6 +240,13 @@ class ServerRuntime:
         # An empty connector registry: ECC/Tableau/BOBJ connectors are deferred, so the
         # connector-gated scenarios (9.6/9.7/9.8) report "not configured" rather than guessing.
         return Analyzers(
+            self._connection(system),
+            self.capability(system),
+            registry=ConnectorRegistry(),
+        )
+
+    def docgen(self, system: str) -> DocGenerator:
+        return DocGenerator(
             self._connection(system),
             self.capability(system),
             registry=ConnectorRegistry(),
@@ -639,6 +648,23 @@ def bw_review_scenario(
     """Run one risk scenario by id: 9.1-9.8 or "layer_violations" (mission Section 9)."""
     limit, _ = _clamp_page(limit, 0)
     return runtime().analyzers(system).run_scenario(scenario, limit=limit)
+
+
+# --- documentation generation tool -------------------------------------------------------
+
+
+@_readonly_tool
+def bw_generate_docs(system: str, output_dir: str | None = None, limit: int = 15) -> DocGenResult:
+    """Render the full markdown knowledge base (mission Section 8) to a git-ignored directory.
+
+    Writes an index, per-section catalogues and detail pages (chains, lineage with Mermaid,
+    providers, transformations, queries, HANA, the eight risk scenarios), and a non-empty
+    gaps-and-risks register. ``output_dir`` must be outside the tracked repo tree; it defaults to
+    ``output/docs/<system>``. Returns a manifest of the files written.
+    """
+    limit, _ = _clamp_page(limit, 0)
+    target = output_dir or f"output/docs/{system}"
+    return runtime().docgen(system).generate(target, limit=limit)
 
 
 # --- prompts (analyst workflows composing the read-only tools) ---------------------------

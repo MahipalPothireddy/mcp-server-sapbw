@@ -23,6 +23,7 @@ from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
 from mcp_server_sapbw.services.analyzers import Analyzers
+from mcp_server_sapbw.services.docgen import DocGenerator
 from mcp_server_sapbw.services.lineage import LineageService
 
 _TABLES = {
@@ -207,6 +208,9 @@ class FakeRuntime:
 
     def analyzers(self, system: str) -> Analyzers:
         return Analyzers(_Conn(), self._cap)
+
+    def docgen(self, system: str) -> DocGenerator:
+        return DocGenerator(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -413,3 +417,15 @@ async def _list_prompt_names() -> list[str]:
     async with Client(server.mcp) as client:
         prompts = await client.list_prompts()
         return [p.name for p in prompts]
+
+
+def test_generate_docs_via_client(tmp_path: Any) -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call("bw_generate_docs", {"system": "qa", "output_dir": str(tmp_path / "kb")})
+    )
+    body = _report_body(result)
+    assert body["page_count"] > 0
+    assert body["gaps_count"] > 0
+    assert (tmp_path / "kb" / "index.md").is_file()
+    assert (tmp_path / "kb" / "99-gaps-and-risks.md").is_file()
