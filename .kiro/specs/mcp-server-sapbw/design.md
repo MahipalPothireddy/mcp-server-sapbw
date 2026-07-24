@@ -311,10 +311,29 @@ Key per-domain notes:
 The lineage service builds a single directed multigraph over BW/HANA objects and traverses it for
 `bw_get_lineage`, `bw_impact_analysis`, and `bw_trace_to_source`.
 
-**Scope boundary (intentional sequencing).** The current build resolves lineage from the
-**DataSource down to reports** — not from ECC down to reports. That is a sequencing decision, not a
-permanent boundary, so the graph model carries the extension points *now* and an ECC connector (or
-an offline source bundle) can later attach parent nodes **without changing any node or edge type**.
+**End-to-end lineage target.** The complete source-to-consumer picture the graph is designed to
+represent is:
+
+```
+ECC extractor (+ enhancement logic) → DataSource → transformation (detailed rule/routine logic)
+  → DSO/ADSO → calc view → CompositeProvider → DSO → query → report
+```
+
+The **active build (B3–B10) delivers the BW spine**, end to end within BW/HANA: DataSource →
+detailed transformation logic (field rules + full routine source) → providers → **calc-view →
+CompositeProvider** and **CompositeProvider → DSO** crossings → query → report. The **ECC extremity
+— extractor enhancement logic — is planned but sequenced after the spine** (deferred tasks 37/38).
+This is intentional sequencing, not a permanent boundary: the graph model already carries the
+extension points (DataSource boundary node; `source_object` / `unresolved_dependency` types;
+`source_extract` / `unresolved_call` edges) so ECC parents attach **without changing any node or
+edge type**.
+
+**On "ECC enhancement logic" specifically.** The enhancement *inventory* (that `Z*`/`Y*` fields were
+appended) is reachable from the ECC SQL Server DB; the enhancement *logic* (what the exit does, what
+it reads) is **not reachable from any live DB** — `REPOSRC.DATA` is compressed on every platform —
+so it is resolved offline via the **source bundle** (exported ABAP source) matched to the
+`unresolved_dependency` nodes. Obtaining ECC enhancement logic therefore requires exported source
+files, not a live connection; that is a hard constraint, independent of sequencing.
 
 **Node.**
 
@@ -399,7 +418,11 @@ class LineageEdge(BaseModel):
 
 1. **Declared edges** — from `RSTRAN` (source/target), `RSBKDTP` (with `UPDMODE`), `RSDCUBEMULTI`
    (MultiProvider parts), the CompositeProvider part-provider table, `SYS.OBJECT_DEPENDENCIES`
-   (calc-view base tables), and `RSZCOMPIC` (query→provider). `confidence = "exact"`.
+   (calc-view base tables), and `RSZCOMPIC` (query→provider). `confidence = "exact"`. A
+   CompositeProvider part-provider may be a **calc view** or a DSO/ADSO: when it is a calc view, a
+   `composite_part` edge runs from the `calcview` node into the CompositeProvider, so
+   **calc-view → CompositeProvider** and **CompositeProvider → DSO** are both first-class edges in
+   the end-to-end path.
 2. **Advisory edges** — from the routine parser (below): for each routine, every resolved `/BIC//BI0/`
    table read becomes a `routine_lookup` edge into the routine's transformation target, with
    `derivation = "routine"`, `confidence = "advisory"`, and the routine ID in `note`. These are the

@@ -24,6 +24,23 @@ repository/service is built in the repository/service phases, and its MCP tools 
 the MCP-surface phase, which depends on the layers beneath. Cross-references note the originating
 build prompt.
 
+**End-to-end lineage coverage.** The target path is
+`ECC extractor(+enhancement logic) → DataSource → transformation logic → DSO → calc view →
+CompositeProvider → DSO → query → report`. Coverage by task:
+
+| End-to-end element | Task(s) |
+|---|---|
+| Detailed transformation logic (field rules + full routine source) | 13, 15, 18 |
+| calc view → CompositeProvider (calc view as part-provider) | 15 (hana), 19 (edge), 29/30 (tools) |
+| CompositeProvider → DSO | 14, 19; scenario 24.3 |
+| DataSource boundary + upstream extension | 19 (boundary node) |
+| ECC extractor enhancement **inventory** (Z*/Y* heuristic from BW alone) | 24.6 |
+| ECC extractor enhancement **logic** (exit ABAP; needs exported source) | 37 (source bundle) + 38 (ECC connector) — **deferred** |
+
+The BW spine (rows 1–4) is delivered in the active build (B3–B10). The ECC extremity (rows 5–6) is
+sequenced after the spine; enhancement *logic* requires exported ABAP source (`REPOSRC` compressed),
+so it is gated on the source bundle regardless of sequencing.
+
 ---
 
 ## Phase 0 — Scaffolding (B0)
