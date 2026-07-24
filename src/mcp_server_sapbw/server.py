@@ -19,12 +19,14 @@ from typing import Any, Literal, Protocol
 from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field
 
+from .connectors.base import ConnectorRegistry
 from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnectionPool
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
+from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.provenance import UnsupportedResult
@@ -36,12 +38,14 @@ from .models.transformations import (
     Transformation,
     TransformationSummary,
 )
+from .prompts.workflows import register_prompts
 from .repositories.chains import ChainsRepository
 from .repositories.hana import HanaRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
 from .repositories.transformations import TransformationsRepository
+from .services.analyzers import Analyzers
 from .services.lineage import LineageService
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
@@ -159,6 +163,7 @@ class Runtime(Protocol):
     def lineage(self, system: str) -> LineageService: ...
     def queries(self, system: str) -> QueriesRepository: ...
     def hana(self, system: str) -> HanaRepository: ...
+    def analyzers(self, system: str) -> Analyzers: ...
 
 
 class ServerRuntime:
@@ -227,6 +232,15 @@ class ServerRuntime:
         return HanaRepository(
             self._connection(system),  # type: ignore[arg-type]
             self.capability(system),
+        )
+
+    def analyzers(self, system: str) -> Analyzers:
+        # An empty connector registry: ECC/Tableau/BOBJ connectors are deferred, so the
+        # connector-gated scenarios (9.6/9.7/9.8) report "not configured" rather than guessing.
+        return Analyzers(
+            self._connection(system),
+            self.capability(system),
+            registry=ConnectorRegistry(),
         )
 
     def list_systems(self) -> list[SystemStatus]:
@@ -584,6 +598,52 @@ def bw_get_hana_crossings(
     return (
         runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
     )
+
+
+# --- risk-analyzer tools (mission Section 9) ---------------------------------------------
+
+
+@_readonly_tool
+def bw_check_load_latency(system: str, limit: int = 25) -> ScenarioReport | UnsupportedResult:
+    """Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk)."""
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().analyzers(system).check_load_latency(limit=limit)
+
+
+@_readonly_tool
+def bw_check_schedule_risk(
+    system: str, limit: int = _DEFAULT_PAGE
+) -> ScenarioReport | UnsupportedResult:
+    """Scenario 9.7: report schedules vs. feeding-chain p95 completion (needs a BI connector)."""
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().analyzers(system).schedule_risk(limit=limit)
+
+
+@_readonly_tool
+def bw_find_layer_violations(
+    system: str, max_dso_depth: int = 3, limit: int = _DEFAULT_PAGE
+) -> ScenarioReport | UnsupportedResult:
+    """Structural anti-patterns: CP->DSO, CP->InfoObject, and over-deep DSO stacks."""
+    limit, _ = _clamp_page(limit, 0)
+    return (
+        runtime()
+        .analyzers(system)
+        .find_layer_violations(limit=limit, max_dso_depth=max(1, max_dso_depth))
+    )
+
+
+@_readonly_tool
+def bw_review_scenario(
+    system: str, scenario: str, limit: int = 50
+) -> ScenarioReport | UnsupportedResult:
+    """Run one risk scenario by id: 9.1-9.8 or "layer_violations" (mission Section 9)."""
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().analyzers(system).run_scenario(scenario, limit=limit)
+
+
+# --- prompts (analyst workflows composing the read-only tools) ---------------------------
+
+register_prompts(mcp)
 
 
 def main() -> None:

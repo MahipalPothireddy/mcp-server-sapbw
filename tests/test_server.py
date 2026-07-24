@@ -22,6 +22,7 @@ from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
+from mcp_server_sapbw.services.analyzers import Analyzers
 from mcp_server_sapbw.services.lineage import LineageService
 
 _TABLES = {
@@ -37,6 +38,7 @@ _TABLES = {
     "transformation_step_rout": "RSTRANSTEPROUT",
     "routine_source": "RSAABAP",
     "transformation_text": "RSTRANT",
+    "dtp": "RSBKDTP",
     "query_dir": "RSZCOMPDIR",
     "query_provider": "RSZCOMPIC",
     "element_dir": "RSZELTDIR",
@@ -82,7 +84,10 @@ class _Conn:
             return [("DAILY_LOAD", "FINANCE", "ACT")]
         if "RSPCCHAINT" in sql:
             return [("DAILY_LOAD", "Daily finance load")]
-        if "RSPCLOGCHAIN" in sql:  # run summary (GROUP BY): 30 runs across 30 days -> daily
+        if "RSPCLOGCHAIN" in sql:
+            if "ZEIT" in sql:  # median-start-times query (CHAIN_ID, ZEIT)
+                return [("DAILY_LOAD", "080000")]
+            # run summary (GROUP BY): 30 runs across 30 days -> daily
             return [("DAILY_LOAD", 30, "20260601", "20260630")]
         if "RSDODSOIOBJ" in sql:  # DSO fields
             return [("DOC", 1, "X"), ("AMOUNT", 2, "")]
@@ -141,6 +146,15 @@ class _Conn:
     def _rstran(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
         # Synthetic flow: DS_A --TR1--> ADSO_T (TR1 has start routine CODE1).
         name = str(params[-1]) if params else ""
+        # B9 analyzer query shapes -> empty here (analyzer data is covered in test_analyzers;
+        # these contract tests only prove the tool -> analyzer -> MCP-client path and shape).
+        if (
+            "COUNT(DISTINCT SOURCENAME)" in sql
+            or "STARTROUTINE <> ''" in sql
+            or "SOURCETYPE = ?" in sql
+            or "SOURCETYPE IN ('ODSO', 'ADSO')" in sql
+        ):
+            return []
         if "OBJSTAT" in sql:  # get_transformation / get_routine_code header (12 cols)
             return [("ACT", "RSDS", "", "DS_A", "ADSO", "", "ADSO_T", "CODE1", "", "", "", "")]
         if "STARTROUTINE IN" in sql or "TRANID IN" in sql:  # reverse impact search
@@ -190,6 +204,9 @@ class FakeRuntime:
 
     def hana(self, system: str) -> HanaRepository:
         return HanaRepository(_Conn(), self._cap)
+
+    def analyzers(self, system: str) -> Analyzers:
+        return Analyzers(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -342,3 +359,57 @@ async def _list_tool_names() -> list[str]:
     async with Client(server.mcp) as client:
         tools = await client.list_tools()
         return [t.name for t in tools]
+
+
+def _report_body(result: Any) -> Any:
+    payload = result.structured_content
+    return payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+
+
+def test_check_load_latency_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_check_load_latency", {"system": "qa"}))
+    body = _report_body(result)
+    assert body["scenario"] == "9.1"
+    assert "findings" in body and "caveats" in body
+
+
+def test_check_schedule_risk_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_check_schedule_risk", {"system": "qa"}))
+    body = _report_body(result)
+    assert body["scenario"] == "9.7"
+    assert body["connector_required"] == "Tableau/BOBJ"  # no BI connector configured
+    assert body["findings"][0]["unpopulated_reason"] is not None
+
+
+def test_find_layer_violations_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_find_layer_violations", {"system": "qa"}))
+    body = _report_body(result)
+    assert body["scenario"] == "layer_violations"
+
+
+def test_review_scenario_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_review_scenario", {"system": "qa", "scenario": "9.3"}))
+    body = _report_body(result)
+    assert body["scenario"] == "9.3"
+
+
+def test_prompts_registered() -> None:
+    names = asyncio.run(_list_prompt_names())
+    assert {
+        "analyze_impact",
+        "troubleshoot_missing_data",
+        "document_dataflow",
+        "review_scenario",
+        "onboard_analyst",
+        "pre_change_checklist",
+    } <= set(names)
+
+
+async def _list_prompt_names() -> list[str]:
+    async with Client(server.mcp) as client:
+        prompts = await client.list_prompts()
+        return [p.name for p in prompts]

@@ -129,6 +129,27 @@ All notable changes to this project are documented here. The format is based on
     and OBJVERS-free; the layer filters on the `_SYS_BIC` schema value rather than treating it as a
     table schema.
 
+- Risk-scenario analyzers (build prompt B9, mission Section 9), offline- and live-smoke-verified:
+  - Models (`models/findings.py`): `Finding` (scenario, severity, affected objects, evidence,
+    recommendation, metrics, `unpopulated_reason`) and `ScenarioReport` (severity-ordered findings
+    with scope/gap metadata).
+  - External-system connector interface (`connectors/`): `ExternalConnector` protocol, a
+    `NullConnector`, and a `ConnectorRegistry` that names the connector required when a kind is
+    absent; deferred `EccConnector` / `TableauConnector` / `BobjConnector` shapes. The BW HANA
+    connection never reaches ECC/Tableau/BOBJ.
+  - Latency math (`services/latency.py`): safety-margin computation (negative or sub-30-minute
+    margins flagged) and a refresh-frequency comparison for stale-master-data risk.
+  - `Analyzers` service (`services/analyzers.py`): the eight scenarios plus a layer-violation
+    finder — full-update routine lookups (9.1), deep DSO stacks (9.2), CompositeProvider->DSO (9.3),
+    InfoObject<-CompositeProvider (9.4), merged multi-stream DSOs with a field-collision matrix
+    (9.5), extractor-enhancement heuristic + ECC-gated logic (9.6), report-schedule risk (9.7) and
+    dashboards-on-calc-views (9.8) gated on Tableau/BOBJ connectors. Each is bounded and returns
+    `Finding`s with provenance; patterns are detected structurally, never from technical names.
+  - Tools: `bw_check_load_latency`, `bw_check_schedule_risk`, `bw_find_layer_violations`, and a
+    general `bw_review_scenario(system, scenario)` dispatcher.
+  - Prompts (`prompts/workflows.py`): `analyze_impact`, `troubleshoot_missing_data`,
+    `document_dataflow`, `review_scenario`, `onboard_analyst`, `pre_change_checklist`.
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).
@@ -152,3 +173,11 @@ All notable changes to this project are documented here. The format is based on
   their direct base tables resolved to BW objects (advisory). Calc-view XML-definition internals
   (`_SYS_REPO.ACTIVE_OBJECT`: joins, calculated columns, input parameters) are not parsed; the layer
   relies on the SYS catalog and dependency graph, which suffice for lineage and crossings.
+- Risk analyzers detect the mission's scenarios structurally (not from "ADM"/"EDW" naming). A general
+  `bw_review_scenario` dispatcher tool was added beyond mission Section 4's enumerated risk tools so
+  scenarios 9.2/9.5/9.6/9.8 (which have no dedicated tool) are invocable and back the
+  `review_scenario` prompt. Scenarios 9.6 (ECC), 9.7 and 9.8 (Tableau/BOBJ) are connector-gated:
+  their external-system side reports `connector_required` until a connector is configured (deferred);
+  the BW-derivable side (9.6 Z*/Y* field heuristic, 9.7 feeding-chain p95, 9.8 BW-consuming calc-view
+  count) is populated. Object -> loading-chain frequency mapping is not derivable on this landscape
+  (no RSPCVARIANT DTP_LOAD linkage), so 9.1/9.7 mark that as a documented gap rather than guessing.
