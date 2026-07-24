@@ -52,8 +52,8 @@ def render_markdown(record: CapabilityRecord) -> str:
         f"- BW release: **{record.bw_release}**",
         f"- ABAP schema: **{record.abap_schema}**",
         f"- HANA repository style: **{record.hana_repo_style}**",
-        f"- Log history: **{record.processlog_retention_days} days** "
-        "(earliest RSPCLOGCHAIN entry; usable RSPCPROCESSLOG window validated in B3)",
+        f"- Runtime analysis window: **{record.processlog_retention_days} days** "
+        "(capped at 1 year; bounded by RSPCLOGCHAIN.DATUM)",
         f"- Tables present: **{len(present)}** / {len(record.tables)}",
         "",
         "## Object-model variants",

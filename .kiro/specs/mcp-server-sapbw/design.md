@@ -344,16 +344,18 @@ class SourceSystemRef(BaseModel):
     Populated by an external connector (e.g. ECC) when the upstream is resolved; None until then.
     Identifiers only — never credentials.
     """
+
     system_type: Literal["ecc", "other", "unknown"] = "unknown"
-    system_id: str | None = None       # logical system / SID, filled by a connector
-    object_name: str | None = None     # the extract structure / source object, filled by a connector
+    system_id: str | None = None  # logical system / SID, filled by a connector
+    object_name: str | None = None  # the extract structure / source object, filled by a connector
 
 
 class UnresolvedRef(BaseModel):
     """An ABAP-layer dependency the routine parser could not follow (named, never dropped)."""
+
     call_kind: Literal["class_method", "function_module", "form", "dynamic", "unknown"]
-    object_name: str                   # the class / FM / method / subroutine as written in source
-    detail: str | None = None          # e.g. method name or raw call snippet (no secrets)
+    object_name: str  # the class / FM / method / subroutine as written in source
+    detail: str | None = None  # e.g. method name or raw call snippet (no secrets)
 
 
 class LineageNode(BaseModel):
@@ -371,14 +373,14 @@ class LineageNode(BaseModel):
         "calcview",
         "query",
         "report",
-        "source_object",          # a node in a source system (e.g. ECC extract structure)
+        "source_object",  # a node in a source system (e.g. ECC extract structure)
         "unresolved_dependency",  # a custom class/FM/method the parser could not resolve
     ]
     name: str
     # Boundary / extension fields (default so existing construction is unaffected):
-    upstream_resolved: bool = True     # False on a DataSource with no source-system parents yet
+    upstream_resolved: bool = True  # False on a DataSource with no source-system parents yet
     source_system: SourceSystemRef | None = None  # populated on DataSource nodes by a connector
-    unresolved_ref: UnresolvedRef | None = None    # populated on unresolved_dependency nodes
+    unresolved_ref: UnresolvedRef | None = None  # populated on unresolved_dependency nodes
     provenance: Provenance | list[Provenance]
 ```
 
@@ -402,7 +404,7 @@ class LineageEdge(BaseModel):
         "calcview_base",
         "query_provider",
         "routine_lookup",
-        "source_extract",   # source_object -> datasource (attached by an ECC connector / bundle)
+        "source_extract",  # source_object -> datasource (attached by an ECC connector / bundle)
         "unresolved_call",  # transformation/routine -> unresolved_dependency
     ]
     derivation: Literal["declared", "routine"]  # "routine" edges are advisory
@@ -496,7 +498,9 @@ class RoutineAnalysis(BaseModel):
     complexity: ComplexitySignals
     completeness: Literal["lower_bound"]  # always a lower bound
     caveats: list[str]  # freeform notes
-    unresolved: list[UnresolvedRef]  # named class/FM/method/dynamic calls the parser could not follow
+    unresolved: list[
+        UnresolvedRef
+    ]  # named class/FM/method/dynamic calls the parser could not follow
     provenance: Provenance  # RSAABAP:<code_id>
 ```
 

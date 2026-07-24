@@ -223,3 +223,15 @@ def test_schema_resolution_failure_raises() -> None:
 
     with pytest.raises(CapabilityError):
         CapabilityResolver().resolve(auto_profile(), ScriptedConnection(respond))
+
+
+def test_runtime_window_capped_at_one_year() -> None:
+    # Logs going back ~13.7 years must still report a 365-day analysis window (owner cap).
+    responder = make_responder(
+        release_rows=[("SAP_BW", "750")],
+        present_abap=ALL_ABAP,
+        discover={"RSOADSO%": [], "RSOHCPR%": [], "RSDDSTAT%": [], "RSTRAN%": ["RSTRAN"]},
+        min_datum=days_ago(5000),
+    )
+    record = CapabilityResolver().resolve(auto_profile(), ScriptedConnection(responder))
+    assert record.processlog_retention_days == 365

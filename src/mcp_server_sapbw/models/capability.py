@@ -61,6 +61,8 @@ class CapabilityRecord(BaseModel):
     abap_schema: str
     object_models: dict[str, bool] = Field(default_factory=dict)
     hana_repo_style: HanaRepoStyle = "none"
+    # Runtime analysis window in days: the usable span of process-chain log, capped at 1 year
+    # (owner decision); bounds runtime-statistics queries and reports the actual span when shorter.
     processlog_retention_days: int = 0
     tables: dict[str, TableStatus] = Field(default_factory=dict)
     discovered_at: datetime

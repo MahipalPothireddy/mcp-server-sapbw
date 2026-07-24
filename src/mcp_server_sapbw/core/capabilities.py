@@ -133,6 +133,12 @@ def _format_release(component: str, release: str) -> str:
     return f"{component} {rel}".strip()
 
 
+# One year of process-chain log is sufficient for analysis (owner decision). We do not track the
+# full historical span; the runtime analysis window is capped here and used to bound runtime
+# queries.
+MAX_RUNTIME_WINDOW_DAYS = 365
+
+
 def _days_since(yyyymmdd: str) -> int:
     try:
         parsed = datetime.strptime(yyyymmdd.strip(), "%Y%m%d").replace(tzinfo=UTC).date()
@@ -350,7 +356,9 @@ class CapabilityResolver:
             return 0
         if not rows or rows[0][0] is None:
             return 0
-        return _days_since(str(rows[0][0]))
+        # Cap at one year: analyze at most the last 365 days of process-chain log, regardless of
+        # how far back it actually goes (owner decision); reports the actual span when under a year.
+        return min(_days_since(str(rows[0][0])), MAX_RUNTIME_WINDOW_DAYS)
 
     def _populate_row_counts(
         self, schema: str, tables: dict[str, TableStatus], connection: SupportsSelect
