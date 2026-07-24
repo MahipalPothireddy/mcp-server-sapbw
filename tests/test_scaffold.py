@@ -32,8 +32,7 @@ def test_subpackages_import(module_name: str) -> None:
     assert importlib.import_module(module_name) is not None
 
 
-def test_server_entry_point_is_a_stub() -> None:
-    """The B0 entry point must exist but must not pretend to run a server."""
+def test_server_entry_point_exists() -> None:
+    """The console entry point and FastMCP instance exist (do not call main(); it blocks)."""
     assert callable(server.main)
-    with pytest.raises(SystemExit):
-        server.main()
+    assert server.mcp is not None

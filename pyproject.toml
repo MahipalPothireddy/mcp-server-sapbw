@@ -83,8 +83,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Magic values are fine in test assertions; dispatch-style test helpers may have many returns.
-"tests/**" = ["PLR2004", "PLR0911"]
+# Magic values are fine in test assertions; dispatch-style test helpers (fixture
+# query routers) may have many returns and branches.
+"tests/**" = ["PLR2004", "PLR0911", "PLR0912"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -98,8 +99,8 @@ show_error_codes = true
 files = ["src", "tests"]
 
 [[tool.mypy.overrides]]
-# hdbcli (SAP HANA driver) ships no type stubs.
-module = ["hdbcli.*"]
+# Third-party packages without (complete) type information for our usage.
+module = ["hdbcli.*", "fastmcp.*", "mcp.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

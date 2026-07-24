@@ -94,15 +94,17 @@ jobs:
       #   2. customer namespace: whole tokens starting Z or Y with 4+ upper/digit/underscore
       #      chars (e.g. custom DSO/chain/query technical names)
       # Documentation and source use the bare "/BIC/" or "/BIC/<...>" placeholder form, which
-      # pattern 1 does not match. ZZ_TEST is allow-listed: it is a generic throwaway marker the
-      # tool itself detects as a copy-artifact (it appears in the mission doc), not customer data.
+      # pattern 1 does not match. Allow-list holds generic non-customer tokens that happen to
+      # match pattern 2: ZZ_TEST (throwaway marker the tool detects as a copy-artifact), and
+      # YYYYMMDD / YYYYMMDDHHMMSS (SAP date/timestamp FORMAT placeholders documented in the
+      # process-log parser -- they start with 'Y' but are not object names).
       - name: Customer-metadata leak check (working tree + full history)
         run: |
           set -uo pipefail
           bic='/(BIC|BI0)/[A-Za-z0-9_]{3,}'
           zy='\b[ZY][A-Z0-9_]{4,}\b'
           combined="($bic)|($zy)"
-          allow='^(ZZ_TEST)$'   # generic non-customer placeholders / tool keywords
+          allow='^(ZZ_TEST|YYYYMMDD|YYYYMMDDHHMMSS)$'   # generic non-customer placeholders
           fail=0
 
           # 1) Working tree (git-ignored dirs and fixtures excluded).

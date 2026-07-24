@@ -75,6 +75,7 @@ class SqlDialect:
         from_logical: str,
         where: Sequence[str] | None = None,
         params: Sequence[Any] | None = None,
+        group_by: Sequence[str] | None = None,
         order_by: Sequence[str] | None = None,
         compare_versions: bool = False,
     ) -> SelectQuery:
@@ -94,6 +95,8 @@ class SqlDialect:
         parts = [f"SELECT {column_list} FROM {qualified}"]
         if conditions:
             parts.append("WHERE " + " AND ".join(conditions))
+        if group_by:
+            parts.append("GROUP BY " + ", ".join(group_by))
         if order_by:
             parts.append("ORDER BY " + ", ".join(order_by))
         return SelectQuery(sql=" ".join(parts), parameters=out_params)
