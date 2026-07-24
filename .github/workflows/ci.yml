@@ -86,63 +86,10 @@ jobs:
           print("Secret scan clean.")
           PY
 
-      # Customer-metadata leak check (mission Section 10). Fails if any customer object
-      # naming pattern appears outside tests/fixtures/, in the WORKING TREE or ANYWHERE IN
-      # GIT HISTORY (a clean tip commit is meaningless if an earlier commit leaked a name).
-      # Two patterns:
-      #   1. generated tables:  /BIC/<name> or /BI0/<name>  (3+ name chars)
-      #   2. customer namespace: whole tokens starting Z or Y with 4+ upper/digit/underscore
-      #      chars (e.g. custom DSO/chain/query technical names)
-      # Documentation and source use the bare "/BIC/" or "/BIC/<...>" placeholder form, which
-      # pattern 1 does not match. Allow-list holds generic non-customer tokens that happen to
-      # match pattern 2: ZZ_TEST (throwaway marker the tool detects as a copy-artifact), and
-      # YYYYMMDD / YYYYMMDDHHMMSS (SAP date/timestamp FORMAT placeholders documented in the
-      # process-log parser -- they start with 'Y' but are not object names).
+      # Customer-metadata leak check (mission Section 10): a single committed, cross-platform
+      # script is the source of truth (no CI/local drift). It scans the working tree AND full git
+      # history for /BIC//BI0/ generated tables and Z*/Y* customer-namespace tokens outside
+      # tests/fixtures/, with a documented allow-list of non-customer placeholders. Needs the full
+      # history (fetch-depth: 0, set on this job's checkout).
       - name: Customer-metadata leak check (working tree + full history)
-        run: |
-          set -uo pipefail
-          bic='/(BIC|BI0)/[A-Za-z0-9_]{3,}'
-          zy='\b[ZY][A-Z0-9_]{4,}\b'
-          combined="($bic)|($zy)"
-          # Generic non-customer tokens that match the Z/Y pattern: throwaway/date placeholders,
-          # plus ZY_FIELDS (a former internal SQL column alias, since renamed, that appears in one
-          # earlier commit's PROGRESS.md prose -- not a customer object).
-          allow='^(ZZ_TEST|YYYYMMDD|YYYYMMDDHHMMSS|ZY_FIELDS)$'
-          fail=0
-
-          # 1) Working tree (git-ignored dirs and fixtures excluded).
-          wt=$(grep -rhoPI "$combined" . \
-                 --exclude-dir=.git --exclude-dir=fixtures --exclude-dir=.venv \
-                 --exclude-dir=.mypy_cache --exclude-dir=.pytest_cache --exclude-dir=.ruff_cache \
-                 --exclude-dir=output --exclude-dir=extracts --exclude-dir=cache \
-               | sort -u | grep -vxE "$allow" || true)
-          if [ -n "$wt" ]; then
-            echo "Potential customer object tokens in the WORKING TREE:"
-            echo "$wt"
-            grep -rnPI "$combined" . \
-              --exclude-dir=.git --exclude-dir=fixtures --exclude-dir=.venv \
-              --exclude-dir=.mypy_cache --exclude-dir=.pytest_cache --exclude-dir=.ruff_cache \
-              --exclude-dir=output --exclude-dir=extracts --exclude-dir=cache || true
-            fail=1
-          fi
-
-          # 2) Full git history (all commits), excluding tests/fixtures.
-          revs=$(git rev-list --all)
-          if [ -n "$revs" ]; then
-            hist=$(git grep -hoPI "$combined" $revs -- . ':(exclude)tests/fixtures/*' 2>/dev/null \
-                   | sort -u | grep -vxE "$allow" || true)
-            if [ -n "$hist" ]; then
-              echo "Potential customer object tokens found in GIT HISTORY:"
-              echo "$hist"
-              fail=1
-            fi
-          fi
-
-          if [ "$fail" -ne 0 ]; then
-            echo ""
-            echo "Customer object names must never be committed (working tree or history)."
-            echo "Move synthetic examples into tests/fixtures/; use placeholder forms elsewhere."
-            echo "If a name reached history, it must be purged with git filter-repo, not just deleted."
-            exit 1
-          fi
-          echo "Customer-metadata leak check clean (working tree + history)."
+        run: python scripts/customer_metadata_scan.py

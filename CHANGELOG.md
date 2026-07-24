@@ -162,6 +162,16 @@ All notable changes to this project are documented here. The format is based on
   - Tool: `bw_generate_docs(system, output_dir, limit)` returning a manifest (files, page count,
     gaps count, truncation flag).
 
+- Hardening and publish preparation (build prompt B11):
+  - Reusable, cross-platform `scripts/customer_metadata_scan.py` (working tree + full git history)
+    is now the single source of truth for the customer-metadata leak check; CI runs it instead of
+    inline bash (no drift).
+  - README finalized: full 29-tool catalogue with parameters, the 6 prompts, supported-release
+    matrix (BW 7.50 validated live), quickstart, MCP client config, and the security /
+    no-customer-metadata model. Resources are documented as specified-but-not-yet-implemented.
+  - Regression tests: the profile password is never exposed in repr/str/model_dump/json (Rule 5);
+    all six workflow prompts render with the expected tool references and threaded arguments.
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).

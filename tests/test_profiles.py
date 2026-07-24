@@ -62,6 +62,18 @@ def test_abap_schema_auto_sentinel(tmp_path: Path) -> None:
     assert mgr.get("prd").resolve_schema_at_connect is False
 
 
+def test_password_never_exposed_in_representations(tmp_path: Path) -> None:
+    """The password value must not appear in repr/str/model_dump output (mission Rule 5)."""
+    qa = ProfileManager(_write(tmp_path, _GOOD_YAML), env=_ENV).get("qa")
+    secret = "s3cr3t-qa"
+    assert secret not in repr(qa)
+    assert secret not in str(qa)
+    assert secret not in str(qa.model_dump())
+    assert secret not in qa.model_dump_json()
+    # The value is still retrievable through the explicit accessor (used only by the driver).
+    assert qa.password.get_secret_value() == secret
+
+
 def test_literal_host_allowed(tmp_path: Path) -> None:
     mgr = ProfileManager(_write(tmp_path, _GOOD_YAML), env=_ENV)
     assert mgr.get("prd").host == "prd.example.invalid"
