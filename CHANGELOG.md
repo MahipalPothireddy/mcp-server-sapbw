@@ -114,6 +114,21 @@ All notable changes to this project are documented here. The format is based on
     filters RSZCOMPDIR to actual queries (root element DEFTP='REP', not reusable RKFs/structures).
   - Tools: `bw_list_queries`, `bw_get_query`, `bw_get_query_lineage`, `bw_get_query_usage`.
 
+- HANA layer (build prompt B8), offline- and live-smoke-verified:
+  - Models (`models/hana.py`): `CalcView`, `BaseTableRef`, `CalcViewLineage`, `HanaCrossing`,
+    `HanaCrossingReport`, with `CalcViewType` / `CrossingDirection` literals and provenance on every
+    fact.
+  - `HanaRepository`: lists `_SYS_BIC` calc views (VIEW_TYPE in CALC/JOIN/OLAP; HIERARCHY excluded)
+    with an optional BW-consuming-only filter; resolves calc-view -> direct base-table dependencies
+    from `SYS.OBJECT_DEPENDENCIES` (DEPENDENCY_TYPE=1), mapping `/BIC/` and `/BI0/` base tables back
+    to BW objects (advisory, reusing the routine parser's resolver); and builds the bidirectional
+    BW<->HANA crossing report (calc-view-reads-BW-table and BW-object-reads-calc-view) with exact
+    per-direction totals.
+  - Tools: `bw_list_calc_views`, `bw_get_calc_view_lineage`, `bw_get_hana_crossings`.
+  - Capability catalog HANA entries (OBJECT_DEPENDENCIES, VIEWS, ...) are schema-qualified as `SYS`
+    and OBJVERS-free; the layer filters on the `_SYS_BIC` schema value rather than treating it as a
+    table schema.
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).
@@ -131,3 +146,9 @@ All notable changes to this project are documented here. The format is based on
   deferred to the lineage build (B6). InfoObject attributes (RSDBCHATR/RSDATRNAV) are not yet
   resolved. Object descriptions are assessed on the long text (TXTLG) when present, since short
   texts are deliberately brief.
+- HANA calc-view analysis uses direct dependencies only (`SYS.OBJECT_DEPENDENCIES.DEPENDENCY_TYPE=1`);
+  transitive dependencies (type 2) are ~8.2M rows and are intentionally excluded. Calc-view ->
+  CompositeProvider precise mapping is deferred: calc views are exposed by `_SYS_BIC` view name with
+  their direct base tables resolved to BW objects (advisory). Calc-view XML-definition internals
+  (`_SYS_REPO.ACTIVE_OBJECT`: joins, calculated columns, input parameters) are not parsed; the layer
+  relies on the SYS catalog and dependency graph, which suffice for lineage and crossings.

@@ -25,6 +25,7 @@ from .core.connection import ReadOnlyConnectionPool
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
+from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
@@ -36,6 +37,7 @@ from .models.transformations import (
     TransformationSummary,
 )
 from .repositories.chains import ChainsRepository
+from .repositories.hana import HanaRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
@@ -131,6 +133,15 @@ class QueryListResult(BaseModel):
     offset: int
 
 
+class CalcViewListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[CalcView] = Field(default_factory=list)
+    total_count: int
+    limit: int
+    offset: int
+
+
 # --- runtime -----------------------------------------------------------------------------
 
 
@@ -147,6 +158,7 @@ class Runtime(Protocol):
     def transformations(self, system: str) -> TransformationsRepository: ...
     def lineage(self, system: str) -> LineageService: ...
     def queries(self, system: str) -> QueriesRepository: ...
+    def hana(self, system: str) -> HanaRepository: ...
 
 
 class ServerRuntime:
@@ -210,6 +222,12 @@ class ServerRuntime:
 
     def queries(self, system: str) -> QueriesRepository:
         return QueriesRepository(self._connection(system), self.capability(system))
+
+    def hana(self, system: str) -> HanaRepository:
+        return HanaRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+        )
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -529,6 +547,43 @@ def bw_get_query_usage(
 ) -> QueryUsage | UnsupportedResult:
     """Query usage from RSZCOMPDIR.LASTUSED, flagging decommission candidates (unused/stale)."""
     return runtime().queries(system).get_query_usage(query, stale_days=stale_days)
+
+
+# --- HANA-layer tools --------------------------------------------------------------------
+
+
+@_readonly_tool
+def bw_list_calc_views(
+    system: str, bw_consuming_only: bool = False, limit: int = _DEFAULT_PAGE, offset: int = 0
+) -> CalcViewListResult | UnsupportedResult:
+    """Calc views (_SYS_BIC), optionally only those reading BW /BIC/ tables, paginated."""
+    limit, offset = _clamp_page(limit, offset)
+    result = (
+        runtime()
+        .hana(system)
+        .list_calc_views(bw_consuming_only=bw_consuming_only, limit=limit, offset=offset)
+    )
+    if isinstance(result, UnsupportedResult):
+        return result
+    items, total = result
+    return CalcViewListResult(items=items, total_count=total, limit=limit, offset=offset)
+
+
+@_readonly_tool
+def bw_get_calc_view_lineage(system: str, view_name: str) -> CalcViewLineage | UnsupportedResult:
+    """A calc view's direct base tables (SYS.OBJECT_DEPENDENCIES), resolved to BW objects."""
+    return runtime().hana(system).get_calc_view_lineage(view_name)
+
+
+@_readonly_tool
+def bw_get_hana_crossings(
+    system: str, calc_view: str | None = None, limit: int = _DEFAULT_PAGE, offset: int = 0
+) -> HanaCrossingReport | UnsupportedResult:
+    """Every BW<->HANA boundary crossing, both directions (calc-view<->BW-object)."""
+    limit, offset = _clamp_page(limit, offset)
+    return (
+        runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
+    )
 
 
 def main() -> None:

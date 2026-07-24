@@ -16,6 +16,7 @@ from fastmcp import Client
 from mcp_server_sapbw import server
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.repositories.chains import ChainsRepository
+from mcp_server_sapbw.repositories.hana import HanaRepository
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
@@ -44,6 +45,8 @@ _TABLES = {
     "element_range": "RSZRANGE",
     "element_select": "RSZSELECT",
     "global_variable": "RSZGLOBV",
+    "object_dependencies": "OBJECT_DEPENDENCIES",
+    "hana_views": "VIEWS",
 }
 
 
@@ -67,6 +70,12 @@ class _Conn:
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
         params = list(parameters or [])
+        # HANA branches first: they answer their own count queries, so they must precede
+        # the generic TOTAL_COUNT interceptor below (which serves every other count query).
+        if '"VIEWS"' in sql:  # HANA calc-view list
+            return [(2,)] if "TOTAL_COUNT" in sql else [("CV1", "CALC"), ("CV2", "JOIN")]
+        if "OBJECT_DEPENDENCIES" in sql:
+            return [(0,)] if "TOTAL_COUNT" in sql else []
         if "TOTAL_COUNT" in sql:
             return [(1,)]
         if "RSPCCHAINATTR" in sql:
@@ -178,6 +187,9 @@ class FakeRuntime:
 
     def queries(self, system: str) -> QueriesRepository:
         return QueriesRepository(_Conn(), self._cap)
+
+    def hana(self, system: str) -> HanaRepository:
+        return HanaRepository(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -299,6 +311,23 @@ def test_get_query_usage_via_client() -> None:
     payload = result.structured_content
     body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
     assert body["last_used"] is not None
+
+
+def test_list_calc_views_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_list_calc_views", {"system": "qa"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["total_count"] == 2
+    assert {v["name"] for v in body["items"]} == {"CV1", "CV2"}
+
+
+def test_hana_crossings_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_get_hana_crossings", {"system": "qa"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["total_count"] == 0  # empty fixture; the tool path works end to end
 
 
 def test_registered_tool_names_are_valid() -> None:
