@@ -83,7 +83,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLR2004"] # magic values are fine in test assertions
+# Magic values are fine in test assertions; dispatch-style test helpers may have many returns.
+"tests/**" = ["PLR2004", "PLR0911"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -96,10 +97,10 @@ no_implicit_optional = true
 show_error_codes = true
 files = ["src", "tests"]
 
-# NOTE: a [[tool.mypy.overrides]] section with ignore_missing_imports for untyped
-# third-party libs (hdbcli, and fastmcp if it ships no stubs) is added in B1, when those
-# modules are first imported. It is omitted here because nothing imports them yet and
-# warn_unused_configs would flag it.
+[[tool.mypy.overrides]]
+# hdbcli (SAP HANA driver) ships no type stubs.
+module = ["hdbcli.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
