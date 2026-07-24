@@ -31,12 +31,14 @@ systems:
     read_only_user: true
 """
 
+# Synthetic test values only (not real credentials); the allowlist pragmas mark them so the
+# detect-secrets CI scan does not flag the password-keyword pattern.
 _ENV = {
     "BW_QA_HOST": "qa.example.invalid",
     "BW_QA_USER": "qa_ro",
-    "BW_QA_PASSWORD": "s3cr3t-qa",
+    "BW_QA_PASSWORD": "s3cr3t-qa",  # pragma: allowlist secret
     "BW_PRD_USER": "prd_ro",
-    "BW_PRD_PASSWORD": "s3cr3t-prd",
+    "BW_PRD_PASSWORD": "s3cr3t-prd",  # pragma: allowlist secret
 }
 
 
@@ -65,7 +67,7 @@ def test_abap_schema_auto_sentinel(tmp_path: Path) -> None:
 def test_password_never_exposed_in_representations(tmp_path: Path) -> None:
     """The password value must not appear in repr/str/model_dump output (mission Rule 5)."""
     qa = ProfileManager(_write(tmp_path, _GOOD_YAML), env=_ENV).get("qa")
-    secret = "s3cr3t-qa"
+    secret = "s3cr3t-qa"  # pragma: allowlist secret
     assert secret not in repr(qa)
     assert secret not in str(qa)
     assert secret not in str(qa.model_dump())
