@@ -33,6 +33,11 @@ systems:
     password: ${BW_PRD_PASSWORD}
     abap_schema: auto
     encrypt: true
+    # TLS certificate handling (optional; only when encrypt: true). Validation defaults to true.
+    # For internal/self-signed HANA certs, either point at the CA:
+    #   ssl_trust_store: /path/to/internal-ca.pem
+    # or, for non-production only, disable chain validation (channel stays encrypted):
+    #   ssl_validate_certificate: false
     read_only_user: true
 
 # Notes:

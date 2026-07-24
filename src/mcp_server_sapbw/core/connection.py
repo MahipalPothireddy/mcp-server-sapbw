@@ -230,13 +230,20 @@ def _default_factory(profile: Profile) -> RawConnection:
     """Open a real hdbcli connection. Imported lazily so tests need no driver/server."""
     import hdbcli.dbapi  # noqa: PLC0415 - lazy import keeps the module import-safe offline
 
-    connection: RawConnection = hdbcli.dbapi.connect(
-        address=profile.host,
-        port=profile.port,
-        user=profile.user,
-        password=profile.password.get_secret_value(),
-        encrypt=profile.encrypt,
-    )
+    kwargs: dict[str, Any] = {
+        "address": profile.host,
+        "port": profile.port,
+        "user": profile.user,
+        "password": profile.password.get_secret_value(),
+        "encrypt": profile.encrypt,
+    }
+    if profile.encrypt:
+        # Certificate validation is on by default; a trust store or explicit opt-out (for
+        # internal/self-signed hosts) is set per profile. The channel stays encrypted either way.
+        kwargs["sslValidateCertificate"] = profile.ssl_validate_certificate
+        if profile.ssl_trust_store:
+            kwargs["sslTrustStore"] = profile.ssl_trust_store
+    connection: RawConnection = hdbcli.dbapi.connect(**kwargs)
     return connection
 
 

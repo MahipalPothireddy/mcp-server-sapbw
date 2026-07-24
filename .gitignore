@@ -32,3 +32,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 *.swp
+
+# local landscape reference (internal endpoints; never commit)
+landscape.local.md

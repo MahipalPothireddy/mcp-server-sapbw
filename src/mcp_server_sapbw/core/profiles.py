@@ -49,6 +49,10 @@ class Profile(BaseModel):
     password: SecretStr = Field(repr=False)
     abap_schema: str = ABAP_SCHEMA_AUTO
     encrypt: bool = True
+    # TLS certificate handling (only relevant when encrypt is true). Validation defaults to ON;
+    # relax it (with a trust store, or explicitly disabling) only for internal/self-signed hosts.
+    ssl_validate_certificate: bool = True
+    ssl_trust_store: str | None = None
     read_only_user: bool = True
 
     @property
@@ -115,6 +119,8 @@ def _build_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]) ->
         password=SecretStr(password),
         abap_schema=abap_schema,
         encrypt=bool(raw.get("encrypt", True)),
+        ssl_validate_certificate=bool(raw.get("ssl_validate_certificate", True)),
+        ssl_trust_store=resolve_str("ssl_trust_store", required=False),
         read_only_user=bool(raw.get("read_only_user", True)),
     )
 

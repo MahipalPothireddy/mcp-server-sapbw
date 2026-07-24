@@ -130,3 +130,27 @@ def test_path_from_env(tmp_path: Path) -> None:
     env = {**_ENV, "BW_PROFILES_PATH": str(path)}
     mgr = ProfileManager(env=env)
     assert mgr.get("qa").host == "qa.example.invalid"
+
+
+def test_ssl_defaults_to_validation_on(tmp_path: Path) -> None:
+    mgr = ProfileManager(_write(tmp_path, _GOOD_YAML), env=_ENV)
+    qa = mgr.get("qa")
+    assert qa.ssl_validate_certificate is True
+    assert qa.ssl_trust_store is None
+
+
+def test_ssl_options_parsed(tmp_path: Path) -> None:
+    yaml_text = """
+systems:
+  qa:
+    host: ${BW_QA_HOST}
+    port: 30015
+    user: ${BW_QA_USER}
+    password: ${BW_QA_PASSWORD}
+    encrypt: true
+    ssl_validate_certificate: false
+    ssl_trust_store: /etc/ssl/internal-ca.pem
+"""
+    qa = ProfileManager(_write(tmp_path, yaml_text), env=_ENV).get("qa")
+    assert qa.ssl_validate_certificate is False
+    assert qa.ssl_trust_store == "/etc/ssl/internal-ca.pem"

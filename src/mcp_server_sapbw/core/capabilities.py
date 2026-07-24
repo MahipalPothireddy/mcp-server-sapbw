@@ -54,8 +54,10 @@ ABAP_TABLES: dict[str, str] = {
     "transformation": "RSTRAN",
     "transformation_field": "RSTRANFIELD",
     "transformation_rule": "RSTRANRULE",
-    "transformation_step": "RSTRANSTEP",
-    "transformation_step_rule": "RSTRANSTEPRULE",
+    # B2 finding (7.50): the mission's RSTRANSTEP/RSTRANSTEPRULE do not exist. The rule-to-step link
+    # is RSTRANRULESTEP; fine-grained step detail is a typed family (RSTRANSTEP<TYPE>: MAP, ROUT,
+    # MASTER, ODSO, ...) which B5 (transformations) will validate and read as needed.
+    "transformation_rule_step": "RSTRANRULESTEP",
     "routine_source": "RSAABAP",
     "dtp": "RSBKDTP",
     "dtp_request": "RSBKREQUEST",
@@ -166,6 +168,7 @@ class CapabilityResolver:
         tables.update(self._probe_hana_objects(connection))
         discovered = self._discover(schema, connection)
         tables.update(discovered.table_status)
+        self._populate_row_counts(schema, tables, connection)
         object_models = self._detect_object_models(tables, discovered)
         hana_repo = self._detect_hana_repo_style(connection)
         retention = self._measure_retention(schema, tables, connection)
@@ -348,6 +351,33 @@ class CapabilityResolver:
         if not rows or rows[0][0] is None:
             return 0
         return _days_since(str(rows[0][0]))
+
+    def _populate_row_counts(
+        self, schema: str, tables: dict[str, TableStatus], connection: SupportsSelect
+    ) -> None:
+        """Set row_estimate for present ABAP-schema tables via SYS.M_TABLES (cheap; no COUNT(*))."""
+        names = sorted(
+            {
+                ts.resolved_name
+                for ts in tables.values()
+                if ts.present and ts.resolved_name and ts.schema_name == schema
+            }
+        )
+        if not names:
+            return
+        placeholders = ", ".join("?" for _ in names)
+        query = (
+            "SELECT TABLE_NAME, RECORD_COUNT FROM SYS.M_TABLES "
+            f"WHERE SCHEMA_NAME = ? AND TABLE_NAME IN ({placeholders})"
+        )
+        try:
+            rows = connection.execute_select(query, [schema, *names])
+        except Exception:
+            return
+        counts = {str(row[0]).upper(): int(row[1]) for row in rows if row[1] is not None}
+        for status in tables.values():
+            if status.resolved_name and status.resolved_name.upper() in counts:
+                status.row_estimate = counts[status.resolved_name.upper()]
 
 
 class _Discovered:
