@@ -18,6 +18,7 @@ from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
+from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
 
 _TABLES = {
@@ -27,6 +28,12 @@ _TABLES = {
     "dso_header": "RSDODSO",
     "dso_field": "RSDODSOIOBJ",
     "dso_text": "RSDODSOT",
+    "transformation": "RSTRAN",
+    "transformation_rule": "RSTRANRULE",
+    "transformation_field": "RSTRANFIELD",
+    "transformation_step_rout": "RSTRANSTEPROUT",
+    "routine_source": "RSAABAP",
+    "transformation_text": "RSTRANT",
 }
 
 
@@ -67,6 +74,20 @@ class _Conn:
             if "ODSOTYPE" in sql:  # describe header
                 return [("", "SALES", "DEVUSER", "SD")]
             return [("SALES_DSO",)]  # search-by-name query (ODSOBJECT)
+        if "RSTRANSTEPROUT" in sql:  # no field routines in this fixture
+            return []
+        if "RSTRANFIELD" in sql:
+            return [(1, "1", "TARGETF"), (1, "0", "SOURCEF")]
+        if "RSTRANRULE" in sql:
+            return [(1, "DIRECT")]
+        if "RSTRANT" in sql:
+            return [("E", "Load one", "Load one target set")]
+        if "RSAABAP" in sql:
+            return [("METHOD start.",), ("  SELECT * FROM mara INTO TABLE lt.",), ("ENDMETHOD.",)]
+        if "RSTRAN" in sql:
+            if "OBJSTAT" in sql:  # get_transformation header (12 cols)
+                return [("ACT", "RSDS", "", "DS_A", "ADSO", "", "ADSO_T", "CODE1", "", "", "", "")]
+            return [("TR1", "RSDS", "DS_A", "ADSO", "ADSO_T", "CODE1", "", "")]  # list (8 cols)
         return []
 
 
@@ -94,6 +115,9 @@ class FakeRuntime:
 
     def search(self, system: str) -> SearchRepository:
         return SearchRepository(_Conn(), self._cap)
+
+    def transformations(self, system: str) -> TransformationsRepository:
+        return TransformationsRepository(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -151,6 +175,32 @@ def test_search_objects_via_client_returns_typed_hits() -> None:
     assert hit["object_type"] == "dso"
     assert hit["matched_on"] == "name"
     assert hit["provenance"]
+
+
+def test_get_transformation_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call("bw_get_transformation", {"system": "qa", "transformation_id": "TR1"})
+    )
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["source"]["kind"] == "datasource"
+    assert body["target"]["kind"] == "adso"
+    mapping = body["field_mappings"][0]
+    assert mapping["rule_type"] == "direct"
+    assert mapping["target_fields"] == ["TARGETF"]
+    assert body["has_start_routine"] is True
+
+
+def test_analyze_routine_via_client_is_lower_bound() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_analyze_routine", {"system": "qa", "transformation_id": "TR1"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    analyses = body["analyses"]
+    assert analyses
+    assert all(a["completeness"] == "lower_bound" for a in analyses)
+    assert analyses[0]["provenance"]["source_table"] == "RSAABAP"
 
 
 def test_registered_tool_names_are_valid() -> None:

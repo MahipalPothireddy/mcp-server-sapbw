@@ -58,7 +58,9 @@ ABAP_TABLES: dict[str, str] = {
     # is RSTRANRULESTEP; fine-grained step detail is a typed family (RSTRANSTEP<TYPE>: MAP, ROUT,
     # MASTER, ODSO, ...) which B5 (transformations) will validate and read as needed.
     "transformation_rule_step": "RSTRANRULESTEP",
-    "routine_source": "RSAABAP",
+    "transformation_step_rout": "RSTRANSTEPROUT",  # rule/step -> routine CODEID (field routines)
+    "transformation_seg": "RSTRANSEG",
+    "routine_source": "RSAABAP",  # ABAP source lines; NOTE prefix RSA -> no auto OBJVERS injection
     "dtp": "RSBKDTP",
     "dtp_request": "RSBKREQUEST",
     "infopackage": "RSLDPIO",

@@ -27,9 +27,16 @@ from .models.capability import CapabilityRecord
 from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
+from .models.transformations import (
+    RoutineAnalysis,
+    RoutineCode,
+    Transformation,
+    TransformationSummary,
+)
 from .repositories.chains import ChainsRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.search import SearchRepository
+from .repositories.transformations import TransformationsRepository
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 _MAX_TOOL_NAME = 40
@@ -88,6 +95,29 @@ class SearchResult(BaseModel):
     offset: int
 
 
+class TransformationListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[TransformationSummary] = Field(default_factory=list)
+    total_count: int
+    limit: int
+    offset: int
+
+
+class RoutineCodeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    transformation_id: str
+    routines: list[RoutineCode] = Field(default_factory=list)
+
+
+class RoutineAnalysisResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    transformation_id: str
+    analyses: list[RoutineAnalysis] = Field(default_factory=list)
+
+
 # --- runtime -----------------------------------------------------------------------------
 
 
@@ -101,6 +131,7 @@ class Runtime(Protocol):
     def chains(self, system: str) -> ChainsRepository: ...
     def providers(self, system: str) -> ProvidersRepository: ...
     def search(self, system: str) -> SearchRepository: ...
+    def transformations(self, system: str) -> TransformationsRepository: ...
 
 
 class ServerRuntime:
@@ -155,6 +186,9 @@ class ServerRuntime:
 
     def search(self, system: str) -> SearchRepository:
         return SearchRepository(self._connection(system), self.capability(system))  # type: ignore[arg-type]
+
+    def transformations(self, system: str) -> TransformationsRepository:
+        return TransformationsRepository(self._connection(system), self.capability(system))
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -327,6 +361,68 @@ def bw_search_objects(
         )
     )
     return SearchResult(items=items, total_count=total, limit=limit, offset=offset)
+
+
+# --- transformation / routine tools ------------------------------------------------------
+
+
+@_readonly_tool
+def bw_list_transformations(
+    system: str,
+    source_name: str | None = None,
+    target_name: str | None = None,
+    *,
+    with_routines_only: bool = False,
+    limit: int = _DEFAULT_PAGE,
+    offset: int = 0,
+) -> TransformationListResult | UnsupportedResult:
+    """Transformations filtered by source/target name or routine presence, paginated."""
+    limit, offset = _clamp_page(limit, offset)
+    result = (
+        runtime()
+        .transformations(system)
+        .list_transformations(
+            source_name=source_name,
+            target_name=target_name,
+            with_routines_only=with_routines_only,
+            limit=limit,
+            offset=offset,
+        )
+    )
+    if isinstance(result, UnsupportedResult):
+        return result
+    items, total = result
+    return TransformationListResult(items=items, total_count=total, limit=limit, offset=offset)
+
+
+@_readonly_tool
+def bw_get_transformation(
+    system: str, transformation_id: str
+) -> Transformation | UnsupportedResult:
+    """Transformation header, field-level rule mappings, and routine references."""
+    return runtime().transformations(system).get_transformation(transformation_id)
+
+
+@_readonly_tool
+def bw_get_routine_code(
+    system: str, transformation_id: str
+) -> RoutineCodeResult | UnsupportedResult:
+    """Full ABAP source for a transformation's start/end/expert/global and field routines."""
+    result = runtime().transformations(system).get_routine_code(transformation_id)
+    if isinstance(result, UnsupportedResult):
+        return result
+    return RoutineCodeResult(transformation_id=transformation_id, routines=result)
+
+
+@_readonly_tool
+def bw_analyze_routine(
+    system: str, transformation_id: str
+) -> RoutineAnalysisResult | UnsupportedResult:
+    """Heuristic (lower-bound) analysis of each routine: table deps, anti-patterns, complexity."""
+    result = runtime().transformations(system).analyze_routines(transformation_id)
+    if isinstance(result, UnsupportedResult):
+        return result
+    return RoutineAnalysisResult(transformation_id=transformation_id, analyses=result)
 
 
 def main() -> None:

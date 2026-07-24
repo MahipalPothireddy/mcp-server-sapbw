@@ -75,9 +75,26 @@ All notable changes to this project are documented here. The format is based on
     tables (runtime-confirmed); the SQL dialect skips OBJVERS injection for member tables that carry
     no OBJVERS column (RSOADSOKEYFIELDS, RSOADSOPART, RSOADSO_DTELNM).
 
+- Transformations and routine parser (build prompt B5), offline- and live-smoke-verified:
+  - Domain models (`models/transformations.py`): `Transformation` (source/target endpoints,
+    field-level rule mappings, routine references), `FieldMapping`, `RoutineCode`, and a heuristic
+    `RoutineAnalysis` fixed to `completeness='lower_bound'`.
+  - `TransformationsRepository`: header + field-level rule mappings (RSTRANRULE + RSTRANFIELD, with
+    PARAMTYPE 1=target / 0=source verified live), routine references (RSTRAN header code-ids +
+    RSTRANSTEPROUT), and full ABAP source from RSAABAP (join on CODEID, ordered by LINE_NO).
+  - `RoutineParser` (`services/routine_parser.py`): static regex analysis — table dependencies
+    (resolving `/BIC/` and `/BI0/` generated tables back to BW objects, advisory), anti-patterns
+    (SELECT-in-LOOP, missing FOR ALL ENTRIES guard, hardcoded values, record-set DELETE, DB
+    modification, nested loops), and named unresolved calls. Always a lower bound.
+  - Tools: `bw_list_transformations`, `bw_get_transformation`, `bw_get_routine_code`,
+    `bw_analyze_routine`.
+  - Capability catalog gained `RSTRANSTEPROUT` (field-routine code-ids) and `RSTRANSEG`.
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).
+- Routine analysis is a heuristic lower bound (mission Known Limitation 3): dynamic SQL,
+  function-module and class-method calls are not followed; `/BIC/`-to-object resolution is advisory.
 - Chain frequency is classified from observed run cadence (RSPCLOGCHAIN), not from chain names or
   scheduled periodicity; TBTCO periodicity corroboration is deferred.
 - CompositeProvider part-provider composition is stored as XML in RSOHCPR.XML_DEF; parsing it is
