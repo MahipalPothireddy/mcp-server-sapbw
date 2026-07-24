@@ -54,9 +54,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/OWNER/mcp-server-sapbw"
-Repository = "https://github.com/OWNER/mcp-server-sapbw"
-Changelog = "https://github.com/OWNER/mcp-server-sapbw/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/MahipalPothireddy/mcp-server-sapbw"
+Repository = "https://github.com/MahipalPothireddy/mcp-server-sapbw"
+Changelog = "https://github.com/MahipalPothireddy/mcp-server-sapbw/blob/main/CHANGELOG.md"
 
 [project.scripts]
 # Console entry point used by the Kiro MCP registration:
