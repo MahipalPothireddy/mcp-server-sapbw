@@ -1,0 +1,10 @@
+# secrets and customer metadata - never commit
+.env
+profiles.yaml
+output/
+extracts/
+cache/
+*.sqlite
+.kiro/settings/mcp.json
+__pycache__/
+.venv/
