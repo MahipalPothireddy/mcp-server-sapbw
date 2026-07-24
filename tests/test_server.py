@@ -17,6 +17,7 @@ from mcp_server_sapbw import server
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
+from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
@@ -35,6 +36,14 @@ _TABLES = {
     "transformation_step_rout": "RSTRANSTEPROUT",
     "routine_source": "RSAABAP",
     "transformation_text": "RSTRANT",
+    "query_dir": "RSZCOMPDIR",
+    "query_provider": "RSZCOMPIC",
+    "element_dir": "RSZELTDIR",
+    "element_xref": "RSZELTXREF",
+    "element_text": "RSZELTTXT",
+    "element_range": "RSZRANGE",
+    "element_select": "RSZSELECT",
+    "global_variable": "RSZGLOBV",
 }
 
 
@@ -86,6 +95,33 @@ class _Conn:
             return [("E", "Load one", "Load one target set")]
         if "RSAABAP" in sql:
             return [("METHOD start.",), ("  SELECT * FROM mara INTO TABLE lt.",), ("ENDMETHOD.",)]
+        if "RSZCOMPDIR" in sql:
+            if "TSTPNM" in sql:  # header
+                ident = str(params[-1])
+                return (
+                    [("Q1UID", "QRY1", "DEV", "DEVUSER", "20260101000000", "ACT")]
+                    if ident
+                    in (
+                        "QRY1",
+                        "Q1UID",
+                    )
+                    else []
+                )
+            return [("Q1UID", "QRY1", "DEV", "20260101000000")]  # list
+        if "RSZCOMPIC" in sql:
+            if "INFOCUBE = ?" in sql:
+                return []
+            if "COMPUID IN" in sql:
+                return [("Q1UID", "PROV1", "X")]
+            return [("PROV1", "X")]
+        if "RSZELTXREF" in sql:
+            return []  # root has no children in this fixture
+        if "RSZELTDIR" in sql:
+            return [("Q1UID", "REP", "QRY1", "X")]
+        if "RSZELTTXT" in sql:
+            return [("Q1UID", "Qry1", "Query one description")]
+        if "RSZRANGE" in sql or "RSZSELECT" in sql or "RSZGLOBV" in sql:
+            return []
         if "RSBKDTP" in sql:  # no DTP edges in this fixture
             return []
         if "RSTRAN" in sql:
@@ -139,6 +175,9 @@ class FakeRuntime:
 
     def lineage(self, system: str) -> LineageService:
         return LineageService(_Conn(), self._cap)
+
+    def queries(self, system: str) -> QueriesRepository:
+        return QueriesRepository(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -242,6 +281,24 @@ def test_trace_to_source_via_client() -> None:
     payload = result.structured_content
     body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
     assert "DS_A" in body["datasources_reached"]
+
+
+def test_get_query_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_get_query", {"system": "qa", "query": "QRY1"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["compid"] == "QRY1"
+    assert body["description"] == "Query one description"
+    assert body["provider"] == "PROV1"
+
+
+def test_get_query_usage_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_get_query_usage", {"system": "qa", "query": "QRY1"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["last_used"] is not None
 
 
 def test_registered_tool_names_are_valid() -> None:

@@ -102,9 +102,25 @@ All notable changes to this project are documented here. The format is based on
   - `bw_trace_to_source` walks upstream to the DataSource boundary.
   - Tools: `bw_get_lineage`, `bw_impact_analysis`, `bw_trace_to_source`.
 
+- BEx query subsystem (build prompt B7, mission Section 6), offline- and live-smoke-verified:
+  - Models (`models/queries.py`): `Query` (header + element tree + variables), `QueryElement` /
+    `QueryElementEdge`, `Restriction`, `QueryVariable`, `QueryLineage` / `FieldLineagePath`,
+    `QueryUsage`, `QuerySummary`.
+  - `QueriesRepository`: query description via the RSZELTTXT/COMPUID join, recursive element tree
+    (RSZELTXREF, cycle-guarded), restrictions (RSZRANGE, variable-reference detection),
+    variables (RSZGLOBV) with processing types decoded from DD07T (customer-exit flagged as a
+    lineage dead end), provider assignment (RSZCOMPIC), field-level lineage reusing the lineage
+    service, and usage from RSZCOMPDIR.LASTUSED (decommission-candidate flag). `bw_list_queries`
+    filters RSZCOMPDIR to actual queries (root element DEFTP='REP', not reusable RKFs/structures).
+  - Tools: `bw_list_queries`, `bw_get_query`, `bw_get_query_lineage`, `bw_get_query_usage`.
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).
+- Query code values (DEFTP / LAYTP / VPROCTP / VARTYP / RSZTYPEFLAG) were decoded from the data
+  dictionary (DD07T), not assumed. Customer-exit variables are a lineage dead end (values resolve
+  in ABAP at runtime, mission Known Limitation 4). Query field lineage is object-level; per-field
+  transformation-rule detail is available via the transformation tools.
 - Lineage node ids are object technical names (unique enough for lineage); routine-derived edges are
   advisory (heuristic lower bound). The DataSource is a boundary node (`upstream_resolved=False`).
 - Routine analysis is a heuristic lower bound (mission Known Limitation 3): dynamic SQL,

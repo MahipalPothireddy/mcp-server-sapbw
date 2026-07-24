@@ -28,6 +28,7 @@ from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEnt
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
+from .models.queries import Query, QueryLineage, QuerySummary, QueryUsage
 from .models.transformations import (
     RoutineAnalysis,
     RoutineCode,
@@ -36,6 +37,7 @@ from .models.transformations import (
 )
 from .repositories.chains import ChainsRepository
 from .repositories.providers import ProvidersRepository
+from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
 from .repositories.transformations import TransformationsRepository
 from .services.lineage import LineageService
@@ -120,6 +122,15 @@ class RoutineAnalysisResult(BaseModel):
     analyses: list[RoutineAnalysis] = Field(default_factory=list)
 
 
+class QueryListResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[QuerySummary] = Field(default_factory=list)
+    total_count: int
+    limit: int
+    offset: int
+
+
 # --- runtime -----------------------------------------------------------------------------
 
 
@@ -135,6 +146,7 @@ class Runtime(Protocol):
     def search(self, system: str) -> SearchRepository: ...
     def transformations(self, system: str) -> TransformationsRepository: ...
     def lineage(self, system: str) -> LineageService: ...
+    def queries(self, system: str) -> QueriesRepository: ...
 
 
 class ServerRuntime:
@@ -195,6 +207,9 @@ class ServerRuntime:
 
     def lineage(self, system: str) -> LineageService:
         return LineageService(self._connection(system), self.capability(system))
+
+    def queries(self, system: str) -> QueriesRepository:
+        return QueriesRepository(self._connection(system), self.capability(system))
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -462,6 +477,58 @@ def bw_impact_analysis(
 def bw_trace_to_source(system: str, name: str, depth: int = 8) -> TraceToSource | UnsupportedResult:
     """Trace an object upstream, hop by hop, to the originating DataSource boundary."""
     return runtime().lineage(system).trace_to_source(name, depth=depth)
+
+
+# --- BEx query tools ---------------------------------------------------------------------
+
+
+@_readonly_tool
+def bw_list_queries(
+    system: str,
+    provider: str | None = None,
+    owner: str | None = None,
+    limit: int = _DEFAULT_PAGE,
+    offset: int = 0,
+) -> QueryListResult | UnsupportedResult:
+    """BEx queries filtered by provider or owner, paginated with a total_count."""
+    limit, offset = _clamp_page(limit, offset)
+    result = (
+        runtime()
+        .queries(system)
+        .list_queries(provider=provider, owner=owner, limit=limit, offset=offset)
+    )
+    if isinstance(result, UnsupportedResult):
+        return result
+    items, total = result
+    return QueryListResult(items=items, total_count=total, limit=limit, offset=offset)
+
+
+@_readonly_tool
+def bw_get_query(system: str, query: str) -> Query | UnsupportedResult:
+    """Full query definition: description, element tree, restrictions, and variables.
+
+    ``query`` may be the technical name (COMPID) or the COMPUID. The description comes from the
+    RSZELTTXT/COMPUID join. Customer-exit variables are flagged (their values resolve in ABAP).
+    """
+    return runtime().queries(system).get_query(query)
+
+
+@_readonly_tool
+def bw_get_query_lineage(system: str, query: str) -> QueryLineage | UnsupportedResult:
+    """Field-level lineage: each InfoObject in the query traced toward its DataSource.
+
+    Object-level (InfoObject -> provider -> upstream trace); routine hops are advisory.
+    Customer-exit variables are reported as lineage dead ends.
+    """
+    return runtime().queries(system).get_query_lineage(query)
+
+
+@_readonly_tool
+def bw_get_query_usage(
+    system: str, query: str, stale_days: int = 365
+) -> QueryUsage | UnsupportedResult:
+    """Query usage from RSZCOMPDIR.LASTUSED, flagging decommission candidates (unused/stale)."""
+    return runtime().queries(system).get_query_usage(query, stale_days=stale_days)
 
 
 def main() -> None:
