@@ -23,6 +23,17 @@ from ..models.capability import CapabilityRecord
 # Tables in these families carry an OBJVERS column; active version is 'A'.
 _ACTIVE_VERSION_PREFIX = re.compile(r"^(RSD|RSO|RSZ|RSTRAN)", re.IGNORECASE)
 
+# Member tables that match the versioned prefixes but carry NO OBJVERS column (discovered live in
+# B4). Active-version injection must be skipped for these, or the generated SQL references a
+# non-existent column.
+_NO_OBJVERS_TABLES = frozenset(
+    {
+        "RSOADSOKEYFIELDS",
+        "RSOADSOPART",
+        "RSOADSO_DTELNM",
+    }
+)
+
 
 class DialectError(Exception):
     """A query could not be built (e.g. a table is unavailable on the connected release)."""
@@ -37,7 +48,13 @@ class SelectQuery:
 
 
 def needs_active_version(physical_table: str) -> bool:
-    """True when a physical table name belongs to an OBJVERS-versioned family."""
+    """True when a physical table name belongs to an OBJVERS-versioned family.
+
+    Member tables in ``_NO_OBJVERS_TABLES`` match the prefix but have no OBJVERS column, so they
+    are excluded (injecting ``OBJVERS = 'A'`` there would reference a non-existent column).
+    """
+    if physical_table.upper() in _NO_OBJVERS_TABLES:
+        return False
     return _ACTIVE_VERSION_PREFIX.match(physical_table) is not None
 
 

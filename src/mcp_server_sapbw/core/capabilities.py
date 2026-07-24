@@ -74,6 +74,16 @@ ABAP_TABLES: dict[str, str] = {
     "cube_text": "RSDCUBET",
     "cube_field": "RSDCUBEIOBJ",
     "multiprovider_part": "RSDCUBEMULTI",
+    # Advanced DSO (RSOADSO*) and CompositeProvider (RSOHCPR*): mission Appendix A flags these as
+    # discover-tier (names vary by release). Confirmed live in B4 on 7.50 and kept here as
+    # existence-tier (still runtime-confirmed via DD02L); the discover-tier families 'adso' /
+    # 'composite_provider' remain the object-model presence check, and require()/is_available()
+    # gate the repositories when a table is absent on some other release.
+    "adso_header": "RSOADSO",
+    "adso_text": "RSOADSOT",  # HANA-shape: DESCRIPTION/QUICK_INFO keyed by COLNAME
+    "adso_keyfields": "RSOADSOKEYFIELDS",  # NOTE: no OBJVERS column (see dialect no-OBJVERS set)
+    "composite_header": "RSOHCPR",  # composition/part-providers live in XML_DEF (LOB)
+    "composite_text": "RSOHCPRT",  # HANA-shape: DESCRIPTION/QUICK_INFO keyed by COLNAME
     "infoobject": "RSDIOBJ",
     "infoobject_text": "RSDIOBJT",
     "characteristic": "RSDCHA",

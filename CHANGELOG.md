@@ -55,8 +55,32 @@ All notable changes to this project are documented here. The format is based on
   - `SqlDialect` gained a `group_by` clause; CI customer-metadata allow-list extended with the
     `YYYYMMDD` / `YYYYMMDDHHMMSS` date-format placeholders.
 
+- Providers, texts, and descriptions (build prompt B4), offline- and live-smoke-verified:
+  - Domain models: a unified `Provider` spanning classic DSO / advanced DSO / InfoCube /
+    MultiProvider / virtual provider / CompositeProvider / InfoObject (`models/providers.py`), and
+    a `Description` labelled stored / generated / stored_augmented with a quality flag
+    (`models/description.py`).
+  - `TextsRepository` reads BW's two text-table shapes — classic `RSD*T` (TXTSH/TXTLG) and
+    HANA-object `RSO*T` (DESCRIPTION/QUICK_INFO keyed by COLNAME) — with language fallback.
+  - `DescriptionService`: quality assessment (missing / copy_artifact / generic / ok) and
+    evidence-based generation, always labelled by origin so a synthesized description is never
+    mistaken for a stored one (mission Rule 7).
+  - `ProvidersRepository`: universal deep-dive resolving any object by name (auto-detecting the
+    type), listing fields, resolving MultiProvider parts (RSDCUBEMULTI), and attaching a
+    description; CompositeProvider composition (RSOHCPR.XML_DEF) is flagged deferred, never guessed.
+  - `SearchRepository`: cross-object fuzzy search by technical name or description across chains,
+    providers, and InfoObjects, object-type-tagged with provenance.
+  - Tools: `bw_describe_object`, `bw_search_objects`.
+  - Capability catalog extended with the ADSO (RSOADSO*) and CompositeProvider (RSOHCPR*) member
+    tables (runtime-confirmed); the SQL dialect skips OBJVERS injection for member tables that carry
+    no OBJVERS column (RSOADSOKEYFIELDS, RSOADSOPART, RSOADSO_DTELNM).
+
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.
 - Scenario 9.6 reclassified as an ECC-connector capability (source lives in ECC, not BW).
 - Chain frequency is classified from observed run cadence (RSPCLOGCHAIN), not from chain names or
   scheduled periodicity; TBTCO periodicity corroboration is deferred.
+- CompositeProvider part-provider composition is stored as XML in RSOHCPR.XML_DEF; parsing it is
+  deferred to the lineage build (B6). InfoObject attributes (RSDBCHATR/RSDATRNAV) are not yet
+  resolved. Object descriptions are assessed on the long text (TXTLG) when present, since short
+  texts are deliberately brief.

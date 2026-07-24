@@ -16,9 +16,18 @@ from fastmcp import Client
 from mcp_server_sapbw import server
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.repositories.chains import ChainsRepository
+from mcp_server_sapbw.repositories.providers import ProvidersRepository
+from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
 
-_TABLES = {"chain_attr": "RSPCCHAINATTR", "chain_text": "RSPCCHAINT", "log_chain": "RSPCLOGCHAIN"}
+_TABLES = {
+    "chain_attr": "RSPCCHAINATTR",
+    "chain_text": "RSPCCHAINT",
+    "log_chain": "RSPCLOGCHAIN",
+    "dso_header": "RSDODSO",
+    "dso_field": "RSDODSOIOBJ",
+    "dso_text": "RSDODSOT",
+}
 
 
 def _capability() -> CapabilityRecord:
@@ -48,6 +57,16 @@ class _Conn:
             return [("DAILY_LOAD", "Daily finance load")]
         if "RSPCLOGCHAIN" in sql:  # run summary (GROUP BY): 30 runs across 30 days -> daily
             return [("DAILY_LOAD", 30, "20260601", "20260630")]
+        if "RSDODSOIOBJ" in sql:  # DSO fields
+            return [("DOC", 1, "X"), ("AMOUNT", 2, "")]
+        if "RSDODSOT" in sql:
+            if "UPPER(TXTLG)" in sql:  # search-by-description query
+                return []
+            return [("E", "Sales orders", "Daily sales order line items")]  # describe text
+        if "RSDODSO" in sql:
+            if "ODSOTYPE" in sql:  # describe header
+                return [("", "SALES", "DEVUSER", "SD")]
+            return [("SALES_DSO",)]  # search-by-name query (ODSOBJECT)
         return []
 
 
@@ -69,6 +88,12 @@ class FakeRuntime:
 
     def chains(self, system: str) -> ChainsRepository:
         return ChainsRepository(_Conn(), self._cap)
+
+    def providers(self, system: str) -> ProvidersRepository:
+        return ProvidersRepository(_Conn(), self._cap)
+
+    def search(self, system: str) -> SearchRepository:
+        return SearchRepository(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -99,6 +124,33 @@ def test_list_chains_via_client_has_provenance_and_total() -> None:
     # no secrets could appear (fake has none), but assert host/password strings are absent
     text = str(payload)
     assert "password" not in text.lower()
+
+
+def test_describe_object_via_client_has_description_and_provenance() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_describe_object", {"system": "qa", "name": "SALES_DSO"}))
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["object_type"] == "dso"
+    assert [f["name"] for f in body["fields"]] == ["DOC", "AMOUNT"]
+    assert body["key_field_names"] == ["DOC"]
+    assert body["description"]["origin"] == "stored"
+    assert body["provenance"]  # present
+
+
+def test_search_objects_via_client_returns_typed_hits() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call("bw_search_objects", {"system": "qa", "pattern": "SALES", "object_types": ["dso"]})
+    )
+    payload = result.structured_content
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    assert body["total_count"] == 1
+    hit = body["items"][0]
+    assert hit["name"] == "SALES_DSO"
+    assert hit["object_type"] == "dso"
+    assert hit["matched_on"] == "name"
+    assert hit["provenance"]
 
 
 def test_registered_tool_names_are_valid() -> None:

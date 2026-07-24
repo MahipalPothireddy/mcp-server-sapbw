@@ -26,7 +26,10 @@ from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
 from .models.provenance import UnsupportedResult
+from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
 from .repositories.chains import ChainsRepository
+from .repositories.providers import ProvidersRepository
+from .repositories.search import SearchRepository
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 _MAX_TOOL_NAME = 40
@@ -76,6 +79,15 @@ class ScheduleMatrixResult(BaseModel):
     offset: int
 
 
+class SearchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[SearchHit] = Field(default_factory=list)
+    total_count: int
+    limit: int
+    offset: int
+
+
 # --- runtime -----------------------------------------------------------------------------
 
 
@@ -87,6 +99,8 @@ class Runtime(Protocol):
     def refresh_capabilities(self, system: str) -> CapabilityRecord: ...
     def refresh_cache(self, system: str, scope: str) -> RefreshResult: ...
     def chains(self, system: str) -> ChainsRepository: ...
+    def providers(self, system: str) -> ProvidersRepository: ...
+    def search(self, system: str) -> SearchRepository: ...
 
 
 class ServerRuntime:
@@ -135,6 +149,12 @@ class ServerRuntime:
 
     def chains(self, system: str) -> ChainsRepository:
         return ChainsRepository(self._connection(system), self.capability(system))  # type: ignore[arg-type]
+
+    def providers(self, system: str) -> ProvidersRepository:
+        return ProvidersRepository(self._connection(system), self.capability(system))
+
+    def search(self, system: str) -> SearchRepository:
+        return SearchRepository(self._connection(system), self.capability(system))  # type: ignore[arg-type]
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -265,6 +285,48 @@ def bw_get_schedule_matrix(
         return result
     items, total = result
     return ScheduleMatrixResult(items=items, total_count=total, limit=limit, offset=offset)
+
+
+# --- object / provider tools -------------------------------------------------------------
+
+
+@_readonly_tool
+def bw_describe_object(
+    system: str, name: str, object_type: ProviderType | None = None
+) -> Provider | ObjectNotFound | UnsupportedResult:
+    """Universal deep-dive for any provider/InfoObject: definition, fields, parts, description.
+
+    Auto-detects the object type when ``object_type`` is omitted. The description is labelled
+    stored vs generated (origin) with a quality flag. ``ObjectNotFound`` when the name matches no
+    object; ``UnsupportedResult`` when the requested type's tables are absent on this release.
+    """
+    return runtime().providers(system).describe(name, object_type)
+
+
+@_readonly_tool
+def bw_search_objects(
+    system: str,
+    pattern: str,
+    object_types: list[str] | None = None,
+    *,
+    match_descriptions: bool = True,
+    limit: int = _DEFAULT_PAGE,
+    offset: int = 0,
+) -> SearchResult:
+    """Fuzzy search by technical name or description across chains, providers, and InfoObjects."""
+    limit, offset = _clamp_page(limit, offset)
+    items, total = (
+        runtime()
+        .search(system)
+        .search(
+            pattern,
+            object_types=object_types,
+            match_descriptions=match_descriptions,
+            limit=limit,
+            offset=offset,
+        )
+    )
+    return SearchResult(items=items, total_count=total, limit=limit, offset=offset)
 
 
 def main() -> None:
