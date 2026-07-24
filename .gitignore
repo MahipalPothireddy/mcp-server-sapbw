@@ -8,3 +8,27 @@ cache/
 .kiro/settings/mcp.json
 __pycache__/
 .venv/
+# Python build / tooling
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# secret-scan reports (the .secrets.baseline IS committed; ad-hoc reports are not)
+.secrets.report.json
+
+# generated knowledge base (rendered by bw_generate_docs) goes to output/, never committed
+# (output/ and extracts/ are already ignored above)
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp

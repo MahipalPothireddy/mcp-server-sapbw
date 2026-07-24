@@ -1,0 +1,43 @@
+# Example connection profiles for mcp-server-sapbw.
+#
+# Copy this file to `profiles.yaml` (git-ignored) and fill in per-system values.
+# Secrets are NEVER written here as literals — reference environment variables with
+# ${VAR} interpolation and set those in your shell or `.env` (also git-ignored).
+#
+# Every tool/resource/prompt takes a `system:` argument naming one of these profiles.
+# The server is stateless across calls; connections are pooled per profile.
+
+systems:
+  dev:
+    host: ${BW_DEV_HOST}
+    port: 30015                 # HANA SQL port, e.g. 3<instance>15
+    user: ${BW_DEV_USER}
+    password: ${BW_DEV_PASSWORD}
+    abap_schema: auto           # resolve at connect; do NOT hardcode SAPABAP1
+    encrypt: true
+    read_only_user: true        # assert no write grants; fail closed if any are found
+
+  qa:
+    host: ${BW_QA_HOST}
+    port: 30015
+    user: ${BW_QA_USER}
+    password: ${BW_QA_PASSWORD}
+    abap_schema: auto
+    encrypt: true
+    read_only_user: true
+
+  prd:
+    host: ${BW_PRD_HOST}
+    port: 30015
+    user: ${BW_PRD_USER}
+    password: ${BW_PRD_PASSWORD}
+    abap_schema: auto
+    encrypt: true
+    read_only_user: true
+
+# Notes:
+# - Capability discovery (release, ABAP schema, object-model variants, log-retention
+#   window) runs on first connect and is cached per profile.
+# - Runtime statistics (RSPCPROCESSLOG chain runtimes, RSDDSTAT* query usage) are only
+#   meaningful in PRD; non-production values for those are not representative.
+# - Do not commit `profiles.yaml`. It is git-ignored for a reason.

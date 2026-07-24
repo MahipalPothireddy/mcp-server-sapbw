@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-type-test:
+    name: lint + type + test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Ruff format check
+        run: ruff format --check .
+
+      - name: Mypy (strict)
+        run: mypy src tests
+
+      - name: Pytest (offline only)
+        run: pytest
+
+  security:
+    name: secret scan + customer-metadata leak check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the leak check can scan every commit
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install detect-secrets
+        run: |
+          python -m pip install --upgrade pip
+          pip install "detect-secrets>=1.5"
+
+      # Secret scanning. Example/template files use placeholders and ${VAR} references
+      # only, so they are excluded to avoid false positives on documented placeholders.
+      # No --all-files: scan git-tracked files only, so git-ignored caches/venv/extracts
+      # are never scanned (avoids false positives on tool cache signatures).
+      - name: Secret scan (detect-secrets)
+        run: |
+          detect-secrets scan \
+            --exclude-files '(\.env\.example|profiles\.example\.yaml|\.secrets\.report\.json)$' \
+            > .secrets.report.json
+          python - <<'PY'
+          import json, sys
+          with open(".secrets.report.json") as fh:
+              report = json.load(fh)
+          results = report.get("results", {})
+          if results:
+              print("Potential secrets detected in:")
+              for path in results:
+                  print(f"  - {path}")
+              sys.exit(1)
+          print("Secret scan clean.")
+          PY
+
+      # Customer-metadata leak check (mission Section 10). Fails if any customer object
+      # naming pattern appears outside tests/fixtures/, in the WORKING TREE or ANYWHERE IN
+      # GIT HISTORY (a clean tip commit is meaningless if an earlier commit leaked a name).
+      # Two patterns:
+      #   1. generated tables:  /BIC/<name> or /BI0/<name>  (3+ name chars)
+      #   2. customer namespace: whole tokens starting Z or Y with 4+ upper/digit/underscore
+      #      chars (e.g. custom DSO/chain/query technical names)
+      # Documentation and source use the bare "/BIC/" or "/BIC/<...>" placeholder form, which
+      # pattern 1 does not match. ZZ_TEST is allow-listed: it is a generic throwaway marker the
+      # tool itself detects as a copy-artifact (it appears in the mission doc), not customer data.
+      - name: Customer-metadata leak check (working tree + full history)
+        run: |
+          set -uo pipefail
+          bic='/(BIC|BI0)/[A-Za-z0-9_]{3,}'
+          zy='\b[ZY][A-Z0-9_]{4,}\b'
+          combined="($bic)|($zy)"
+          allow='^(ZZ_TEST)$'   # generic non-customer placeholders / tool keywords
+          fail=0
+
+          # 1) Working tree (git-ignored dirs and fixtures excluded).
+          wt=$(grep -rhoPI "$combined" . \
+                 --exclude-dir=.git --exclude-dir=fixtures --exclude-dir=.venv \
+                 --exclude-dir=.mypy_cache --exclude-dir=.pytest_cache --exclude-dir=.ruff_cache \
+                 --exclude-dir=output --exclude-dir=extracts --exclude-dir=cache \
+               | sort -u | grep -vxE "$allow" || true)
+          if [ -n "$wt" ]; then
+            echo "Potential customer object tokens in the WORKING TREE:"
+            echo "$wt"
+            grep -rnPI "$combined" . \
+              --exclude-dir=.git --exclude-dir=fixtures --exclude-dir=.venv \
+              --exclude-dir=.mypy_cache --exclude-dir=.pytest_cache --exclude-dir=.ruff_cache \
+              --exclude-dir=output --exclude-dir=extracts --exclude-dir=cache || true
+            fail=1
+          fi
+
+          # 2) Full git history (all commits), excluding tests/fixtures.
+          revs=$(git rev-list --all)
+          if [ -n "$revs" ]; then
+            hist=$(git grep -hoPI "$combined" $revs -- . ':(exclude)tests/fixtures/*' 2>/dev/null \
+                   | sort -u | grep -vxE "$allow" || true)
+            if [ -n "$hist" ]; then
+              echo "Potential customer object tokens found in GIT HISTORY:"
+              echo "$hist"
+              fail=1
+            fi
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo ""
+            echo "Customer object names must never be committed (working tree or history)."
+            echo "Move synthetic examples into tests/fixtures/; use placeholder forms elsewhere."
+            echo "If a name reached history, it must be purged with git filter-repo, not just deleted."
+            exit 1
+          fi
+          echo "Customer-metadata leak check clean (working tree + history)."
