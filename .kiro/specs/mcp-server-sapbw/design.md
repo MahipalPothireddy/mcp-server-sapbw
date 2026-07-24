@@ -51,15 +51,16 @@ src/mcp_server_sapbw/
 │   └── texts.py              # DD02T/DD04T + object text tables; language fallback
 ├── services/
 │   ├── lineage.py            # LineageGraph builder + traversal
-│   ├── routine_parser.py     # ABAP SELECT/anti-pattern parser (heuristic)
+│   ├── routine_parser.py     # ABAP SELECT/anti-pattern parser (heuristic); consumes RSAABAP or a bundle
+│   ├── source_bundle.py      # offline ABAP source-file ingestion (extension point, deferred)
 │   ├── descriptions.py       # read → assess → generate → label
 │   ├── latency.py            # scenario 9.1 / 9.7 timing math
 │   ├── analyzers.py          # the eight risk analyzers (9.1–9.8) + layer violations
 │   └── docgen.py             # markdown knowledge base renderer
 ├── connectors/                # pluggable external-system connectors (separate from BW core)
 │   ├── base.py               # ExternalConnector interface + NullConnector
-│   ├── ecc.py                # ECC source-system connector (9.6 extractor enhancements)
-│   └── external_bi.py        # Tableau / BOBJ connector (9.7 / 9.8)
+│   ├── ecc.py                # ECC connector — SQL Server via pyodbc; inventory-only (9.6); deferred
+│   └── external_bi.py        # Tableau / BOBJ connector (9.7 / 9.8); deferred
 ├── models/
 │   ├── provenance.py         # Provenance, UnsupportedResult
 │   ├── description.py        # Description
@@ -310,9 +311,32 @@ Key per-domain notes:
 The lineage service builds a single directed multigraph over BW/HANA objects and traverses it for
 `bw_get_lineage`, `bw_impact_analysis`, and `bw_trace_to_source`.
 
+**Scope boundary (intentional sequencing).** The current build resolves lineage from the
+**DataSource down to reports** — not from ECC down to reports. That is a sequencing decision, not a
+permanent boundary, so the graph model carries the extension points *now* and an ECC connector (or
+an offline source bundle) can later attach parent nodes **without changing any node or edge type**.
+
 **Node.**
 
 ```python
+class SourceSystemRef(BaseModel):
+    """Slot on a boundary (DataSource) node for source-system detail.
+
+    Populated by an external connector (e.g. ECC) when the upstream is resolved; None until then.
+    Identifiers only — never credentials.
+    """
+    system_type: Literal["ecc", "other", "unknown"] = "unknown"
+    system_id: str | None = None       # logical system / SID, filled by a connector
+    object_name: str | None = None     # the extract structure / source object, filled by a connector
+
+
+class UnresolvedRef(BaseModel):
+    """An ABAP-layer dependency the routine parser could not follow (named, never dropped)."""
+    call_kind: Literal["class_method", "function_module", "form", "dynamic", "unknown"]
+    object_name: str                   # the class / FM / method / subroutine as written in source
+    detail: str | None = None          # e.g. method name or raw call snippet (no secrets)
+
+
 class LineageNode(BaseModel):
     id: str  # canonical "TYPE:NAME" e.g. "dso:<technical_name>"
     object_type: Literal[
@@ -328,10 +352,22 @@ class LineageNode(BaseModel):
         "calcview",
         "query",
         "report",
+        "source_object",          # a node in a source system (e.g. ECC extract structure)
+        "unresolved_dependency",  # a custom class/FM/method the parser could not resolve
     ]
     name: str
+    # Boundary / extension fields (default so existing construction is unaffected):
+    upstream_resolved: bool = True     # False on a DataSource with no source-system parents yet
+    source_system: SourceSystemRef | None = None  # populated on DataSource nodes by a connector
+    unresolved_ref: UnresolvedRef | None = None    # populated on unresolved_dependency nodes
     provenance: Provenance | list[Provenance]
 ```
+
+The **DataSource is an explicit boundary node**: in the BW-only build it is created with
+`upstream_resolved = False` (there *is* an upstream — the source system — we simply have not resolved
+it), and `source_system` left `None`. An ECC connector, or the offline source-bundle path, later adds
+`source_object` parent nodes joined by `source_extract` edges, fills `source_system`, and flips
+`upstream_resolved = True` — reusing existing types only.
 
 **Edge.**
 
@@ -347,6 +383,8 @@ class LineageEdge(BaseModel):
         "calcview_base",
         "query_provider",
         "routine_lookup",
+        "source_extract",   # source_object -> datasource (attached by an ECC connector / bundle)
+        "unresolved_call",  # transformation/routine -> unresolved_dependency
     ]
     derivation: Literal["declared", "routine"]  # "routine" edges are advisory
     update_mode: Literal["F", "D", None] = None  # from RSBKDTP for dtp edges
@@ -366,6 +404,13 @@ class LineageEdge(BaseModel):
    table read becomes a `routine_lookup` edge into the routine's transformation target, with
    `derivation = "routine"`, `confidence = "advisory"`, and the routine ID in `note`. These are the
    dependencies invisible to BW's own where-used list.
+3. **Boundary + unresolved nodes** — every DataSource reached during construction is created as a
+   boundary node (`upstream_resolved = False`). Every custom class / function module / method the
+   routine parser cannot follow becomes an `unresolved_dependency` node (named, carrying an
+   `UnresolvedRef`) joined by an `unresolved_call` edge from the routine's transformation. These
+   nodes are never dropped, so the ABAP-layer gaps are **countable and visible** (surfaced in the
+   generated docs and the gaps register). They also carry the called object name, so a later ECC
+   connector or source bundle can match and resolve them.
 
 Each edge is annotated with the executing chain's ID and classified frequency by joining the
 transformation/DTP to the chains that run it.
@@ -409,9 +454,12 @@ bound**.
      row-count-changing `MODIFY`.
 4. **Complexity signals.** Statement count, nesting depth, number of distinct tables, count of
    dynamic constructs seen.
-5. **Honesty flags.** Detect and count constructs the parser cannot follow — dynamic SQL
-   (`(lv_tabname)`), `CALL FUNCTION`, `CALL METHOD`/`->`/`=>` — and set
-   `completeness = "lower_bound"` with an explicit `caveats` list in the payload.
+5. **Unresolved dependencies (named, never dropped).** For every construct the parser cannot follow
+   — dynamic SQL (`(lv_tabname)`), `CALL FUNCTION`, `CALL METHOD` / `->` / `=>`, `PERFORM` of an
+   external form — emit a structured `UnresolvedRef` naming the called object, and set
+   `completeness = "lower_bound"`. The lineage service turns each `UnresolvedRef` into an
+   `unresolved_dependency` node (see above), so these ABAP-layer gaps are countable and visible
+   rather than silently dropped.
 
 **Output.**
 
@@ -424,13 +472,22 @@ class RoutineAnalysis(BaseModel):
     anti_patterns: list[AntiPattern]  # type, line, snippet, severity
     complexity: ComplexitySignals
     completeness: Literal["lower_bound"]  # always a lower bound
-    caveats: list[str]  # dynamic SQL / FM / method calls seen
+    caveats: list[str]  # freeform notes
+    unresolved: list[UnresolvedRef]  # named class/FM/method/dynamic calls the parser could not follow
     provenance: Provenance  # RSAABAP:<code_id>
 ```
 
-The lineage service consumes `table_dependencies` to synthesize advisory `routine_lookup` edges; the
-description service consumes `leading_comment` + a behavior summary for routine descriptions; the
-9.1 latency analyzer consumes the resolved lookup targets.
+The lineage service consumes `table_dependencies` to synthesize advisory `routine_lookup` edges and
+`unresolved` to create `unresolved_dependency` nodes; the description service consumes
+`leading_comment` + a behavior summary for routine descriptions; the 9.1 latency analyzer consumes
+the resolved lookup targets.
+
+**Source-bundle resolution (extension point, deferred).** The same parser is designed to consume
+ABAP source from a **local directory of exported files** (a "source bundle"), not just `RSAABAP`.
+Because `unresolved_dependency` nodes carry the called object name, a bundle can be matched to them
+offline — with no live connection and no RFC — resolving them from both sides: BW routines that call
+custom classes/FMs, and (once exported) ECC extractor-exit source. This is an extension point in the
+design; the implementation is deferred.
 
 ### Description subsystem (Requirement 13 / Section 7)
 
@@ -470,7 +527,31 @@ unreachable over the BW HANA connection: 9.6 needs the ECC extractor-enhancement
 (CMOD/BAdI, `ROOSOURCE`/`ROOSFIELD`) via an ECC connector; 9.7/9.8 need Tableau/BOBJ metadata. When
 the required connector is not configured, the analyzer still emits its template with
 `unpopulated_reason` naming the connector (Requirement 30). Only the parts derivable from BW itself
-(e.g. the replicated DataSource for 9.6) are populated in that case.
+are populated in that case.
+
+**9.6 from BW alone (heuristic).** Even with no ECC connector, the analyzer flags *likely* extractor
+enhancements by comparing a DataSource's `RSDSSEGFD` fields against its standard extract-structure
+field set and detecting customer-namespace fields (`Z*` / `Y*` / `ZZ*`). The result is labelled
+`heuristic`: it establishes *that* an enhancement probably exists, never *what it does*.
+
+### External-system connectors & source bundle (deferred extension points)
+
+These are designed now and built later; the point is that the graph and parser already accommodate
+them (boundary nodes, `unresolved_dependency` nodes, a bundle-consuming parser).
+
+- **ECC connector — separate driver, reduced scope.** ECC runs on **SQL Server, not HANA**, so this
+  is a distinct driver: `pyodbc` with *ODBC Driver 18 for SQL Server*, schema typically `SAP<SID>`.
+  Scope is the enhancement **inventory only** — `ROOSOURCE`, `ROOSFIELD`, `DD02L`/`DD03L` append
+  structures, `MODSAP`/`MODACT`, `SXS_ATTR`/`SXC_EXIT`, `ENHHEADER`/`ENHOBJ` — with every name
+  validated at connect time exactly as the BW capability resolver does. It **cannot read ABAP
+  source**: `REPOSRC.DATA` is compressed on every platform. It attaches `source_object` parents to
+  DataSource boundary nodes via `source_extract` edges.
+- **Source-bundle ingestion — the higher-value path.** A local directory of exported ABAP source
+  files (the `ZXRSAU0x` extractor user-exit include family, numbers 01–04; plus custom BW classes
+  and function modules), parsed **offline** by the existing routine parser — no live connection, no
+  RFC. Because `unresolved_dependency` nodes carry the called object name, a bundle resolves them
+  from both sides: BW routines calling custom classes/FMs, and ECC extractor-exit source once
+  exported. Modeled as a filesystem source the parser consumes.
 
 ### Documentation generator (Requirement 25 / Section 8)
 

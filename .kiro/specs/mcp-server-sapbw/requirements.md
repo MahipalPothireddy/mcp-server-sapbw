@@ -188,6 +188,8 @@ and anti-patterns, so that lineage sees dependencies BW's where-used misses.
 3. The parser SHALL extract the leading comment block from `RSAABAP` as candidate documentation.
 4. Every routine dependency result SHALL state, in its response payload, that parsing is heuristic and produces a lower bound (dynamic SQL, function-module calls, and class methods are not captured).
 5. WHERE a routine dependency is emitted as a lineage edge THEN the system SHALL mark the edge `derivation: routine` and attach the routine ID.
+6. WHERE the parser encounters a custom class, function module, method, external `PERFORM`, or dynamic call it cannot resolve THEN the system SHALL emit a structured unresolved-dependency naming the called object (never silently dropping it), so ABAP-layer gaps are countable and visible.
+7. The parser SHALL be able to consume ABAP source from an offline source bundle (a local directory of exported files) using the same logic as `RSAABAP`, so unresolved dependencies can be resolved later without a live connection (see Requirement 31).
 
 ### Requirement 12 — Lineage graph (Service layer)
 
@@ -201,6 +203,9 @@ layers including routine-derived edges, so that I can see the complete blast rad
 3. WHEN `bw_get_lineage(system, object, direction, depth)` is invoked THEN the system SHALL return upstream, downstream, or both to the requested depth as graph JSON (nodes + edges).
 4. WHEN `bw_impact_analysis(system, object)` is invoked THEN the system SHALL return the complete downstream blast radius including routine lookups, calc views, queries, and reports, and SHALL include at least one routine-embedded lookup invisible to BW's own where-used list where such a lookup exists.
 5. WHEN `bw_trace_to_source(system, object)` is invoked THEN the system SHALL trace the object back to its originating DataSources hop by hop.
+6. The system SHALL model the DataSource as an explicit boundary node carrying an `upstream_resolved` flag and a slot for source-system detail. The current build resolves DataSource-to-report lineage and SHALL set `upstream_resolved = false` on DataSource nodes (source-system parents not yet resolved).
+7. An external connector or offline source bundle SHALL be able to attach source-system parent nodes to a DataSource boundary node WITHOUT altering existing node or edge types (extension point).
+8. WHERE a routine has an ABAP-layer call the parser cannot resolve (Requirement 11.6) THEN the graph SHALL contain a named `unresolved_dependency` node for it, so the gap is countable and visible in generated documentation.
 
 ### Requirement 13 — Descriptions for all objects (Service layer, Section 7)
 
@@ -320,6 +325,7 @@ itself is invisible from BW.
 2. WHERE an ECC connector is configured AND an enhancement reads another team's data THEN the system SHALL flag it as a coordination-risk item.
 3. WHERE an ECC connector is configured AND an exit performs per-record `SELECT`s THEN the system SHALL flag it as a performance risk.
 4. WHERE no ECC connector is configured THEN the system SHALL produce the 9.6 template, populate whatever is derivable from the BW-side DataSource replica alone, and explicitly report the enhancement-side data as unpopulated, naming the required connector.
+5. WHERE no ECC connector is configured THEN the system SHALL nonetheless flag *likely* enhancements from BW alone by detecting customer-namespace fields (`Z*` / `Y*` / `ZZ*`) in `RSDSSEGFD` against the DataSource's standard extract-structure field set, and SHALL label this result `heuristic` — it identifies that an enhancement exists, never what it does.
 
 ### Requirement 22 — Risk analyzer 9.7: report schedules vs. chain completion
 
@@ -426,6 +432,20 @@ the BW core.
 1. The system SHALL define external-system metadata access behind a connector interface separate from the BW core, covering at least: the **ECC source system** (extractor enhancement source / `ROOSOURCE`/`ROOSFIELD`, for 9.6), **Tableau** (Metadata API / `workgroup` repository, for 9.7/9.8), and **BOBJ** (BOE Query Builder / RESTful RaaS, for 9.7).
 2. WHERE a required connector is not configured THEN the system SHALL still produce the corresponding scenario template (9.6/9.7/9.8) and SHALL report the externally-sourced data as unpopulated, naming the required connector.
 3. The BW HANA connection SHALL never be assumed to reach ECC, Tableau, or BOBJ; those are distinct systems with distinct credentials.
+4. WHERE the ECC connector is implemented THEN it SHALL use a SQL Server driver (`pyodbc` with ODBC Driver 18 for SQL Server), target the `SAP<SID>` schema, validate every object name at connect time (as the BW capability resolver does), and be scoped to the enhancement **inventory** only (`ROOSOURCE`, `ROOSFIELD`, `DD02L`/`DD03L` append structures, `MODSAP`/`MODACT`, `SXS_ATTR`/`SXC_EXIT`, `ENHHEADER`/`ENHOBJ`); it SHALL NOT attempt to read ABAP source (`REPOSRC.DATA` is compressed on every platform).
+
+### Requirement 31 — Offline ABAP source-bundle ingestion (extension point)
+
+**User Story:** As a maintainer, I want the routine parser to be able to consume exported ABAP
+source files from a local directory, so that unresolved ABAP-layer dependencies can be resolved
+offline — without a live connection or RFC — from both the BW and ECC sides.
+
+#### Acceptance Criteria
+
+1. The system SHALL define a filesystem "source bundle" (a local directory of exported ABAP source files, e.g. the `ZXRSAU0x` extractor user-exit include family and custom BW classes/function modules) that the existing routine parser can consume with the same logic it applies to `RSAABAP`.
+2. WHERE a source bundle is provided THEN the system SHALL match its files to `unresolved_dependency` nodes by the called object name and resolve them, updating the affected lineage edges/nodes.
+3. The source-bundle path SHALL require no live connection and no RFC, and SHALL be git-ignored (customer source is customer IP).
+4. This is an extension point: the interface is designed now; the implementation is deferred.
 
 ---
 

@@ -193,18 +193,22 @@ build prompt.
 ## Phase 5 — Service layer (B4, B5, B6, B7, B9)
 
 - [ ] 18. Routine parser service
-  - Implement the heuristic ABAP pipeline: normalize + capture leading comment; extract table reads (`SELECT`, `SELECT SINGLE`, `INTO TABLE`, `FOR ALL ENTRIES`); resolve `/BIC/`,`/BI0/` to BW objects; detect anti-patterns (`SELECT` in `LOOP`, missing `FOR ALL ENTRIES` guard, hardcoded values, record-set-altering `DELETE`); compute complexity; set `completeness = "lower_bound"` with caveats for dynamic SQL / FM / method calls.
-  - Return `RoutineAnalysis`. Unit tests: one fixture per anti-pattern, `/BIC/` resolution, lower-bound caveat presence.
+  - Implement the heuristic ABAP pipeline: normalize + capture leading comment; extract table reads (`SELECT`, `SELECT SINGLE`, `INTO TABLE`, `FOR ALL ENTRIES`); resolve `/BIC/`,`/BI0/` to BW objects; detect anti-patterns (`SELECT` in `LOOP`, missing `FOR ALL ENTRIES` guard, hardcoded values, record-set-altering `DELETE`); compute complexity; set `completeness = "lower_bound"`.
+  - **Emit named unresolved dependencies:** for each custom class / function module / method / external `PERFORM` / dynamic call it cannot follow, produce a structured `UnresolvedRef` (call kind + object name) in `RoutineAnalysis.unresolved` — never silently dropped.
+  - **Bundle-consumable input:** design the parser to read from either `RSAABAP` or a filesystem source bundle (same logic), so it can later resolve unresolved refs offline (task 37 / Requirement 31).
+  - Return `RoutineAnalysis`. Unit tests: one fixture per anti-pattern, `/BIC/` resolution, lower-bound caveat, and one structured `UnresolvedRef` for an unfollowable call.
   - _Depends on: 15_
-  - _Requirements: R11.1, R11.2, R11.3, R11.4, R11.5_
+  - _Requirements: R11.1, R11.2, R11.3, R11.4, R11.5, R11.6, R11.7_
   - _Build prompt: B5_
 
 - [ ] 19. Lineage graph service
+  - Define the graph models (`models/graph.py`): `LineageNode` (incl. `source_object` and `unresolved_dependency` types, plus `upstream_resolved`, `source_system: SourceSystemRef`, `unresolved_ref: UnresolvedRef`), `LineageEdge` (incl. `source_extract` and `unresolved_call` kinds). These extension types/fields exist from the start so an ECC connector / source bundle attaches parents **without a later refactor**.
   - Build the directed multigraph: declared edges from `RSTRAN`/`RSBKDTP`(with `UPDMODE`)/`RSDCUBEMULTI`/CompositeProvider parts/`SYS.OBJECT_DEPENDENCIES`/`RSZCOMPIC`; advisory `routine_lookup` edges merged from the routine parser (`derivation=routine`, `confidence=advisory`, routine ID in note). Annotate edges with executing chain ID + frequency.
-  - Implement traversals: `get_lineage(direction, depth)` with cycle handling, `impact_analysis` (separates exact vs advisory, surfaces routine-embedded lookups), `trace_to_source` (terminates at DataSources).
-  - Unit tests: declared + advisory merge, cycle handling, impact analysis surfacing a routine-only lookup.
+  - **DataSource boundary nodes:** create each DataSource with `upstream_resolved=False` and an empty `source_system` slot (DataSource-to-report scope). **Unresolved nodes:** turn each parser `UnresolvedRef` into a named `unresolved_dependency` node + `unresolved_call` edge, so ABAP-layer gaps are countable.
+  - Implement traversals: `get_lineage(direction, depth)` with cycle handling, `impact_analysis` (separates exact vs advisory, surfaces routine-embedded lookups), `trace_to_source` (terminates at DataSource boundary nodes).
+  - Unit tests: declared + advisory merge, cycle handling, impact analysis surfacing a routine-only lookup, a DataSource node with `upstream_resolved=False`, and an `unresolved_dependency` node named after an unfollowable call.
   - _Depends on: 14, 15, 17, 18_
-  - _Requirements: R12.1, R12.2, R12.3, R12.4, R12.5_
+  - _Requirements: R12.1, R12.2, R12.3, R12.4, R12.5, R12.6, R12.7, R12.8_
   - _Build prompt: B6_
 
 - [ ] 20. Description service
@@ -223,11 +227,12 @@ build prompt.
   - _Build prompt: B7_
 
 - [ ] 22. External-system connector interface
-  - Define the pluggable connector interface (`connectors/base.py`) separate from the BW core, with a `NullConnector` returning "connector not configured", covering: **ECC** (`connectors/ecc.py`, extractor-enhancement source / `ROOSOURCE`/`ROOSFIELD`, for 9.6); **Tableau** (Metadata API / `workgroup`, for 9.7/9.8); **BOBJ** (Query Builder / RESTful RaaS, for 9.7).
+  - Define the pluggable connector interface (`connectors/base.py`) separate from the BW core, with a `NullConnector` returning "connector not configured", covering: **ECC** (`connectors/ecc.py`, for 9.6); **Tableau** (Metadata API / `workgroup`, for 9.7/9.8); **BOBJ** (Query Builder / RESTful RaaS, for 9.7).
   - The BW HANA connection is never assumed to reach ECC/Tableau/BOBJ — those are distinct systems with distinct credentials.
+  - **ECC connector shape (interface now, implementation deferred to task 38):** ECC is on **SQL Server, not HANA** → a separate driver (`pyodbc` + ODBC Driver 18), schema `SAP<SID>`, name-validated at connect, scoped to the enhancement **inventory** only (`ROOSOURCE`, `ROOSFIELD`, `DD02L`/`DD03L` appends, `MODSAP`/`MODACT`, `SXS_ATTR`/`SXC_EXIT`, `ENHHEADER`/`ENHOBJ`); it cannot read ABAP source (`REPOSRC.DATA` compressed).
   - Unit tests: null connector present; analyzers detect "no connector configured" for each of 9.6/9.7/9.8.
   - _Depends on: 2_
-  - _Requirements: R30.1, R30.2, R30.3_
+  - _Requirements: R30.1, R30.2, R30.3, R30.4_
   - _Build prompt: B9_
 
 - [ ] 23. Latency service
@@ -244,7 +249,7 @@ build prompt.
     - 24.3 — 9.3 CompositeProvider→DSO transformations; calc-view vs BW calc split; activation-order warning.
     - 24.4 — 9.4 InfoObjects loaded from CompositeProviders; sequencing requirement; violating chains.
     - 24.5 — 9.5 merged Orders/Billing/Shipments/Deliveries DSO; per-stream keys/collision; per-layer field-lineage matrix.
-    - 24.6 — 9.6 ECC extractor enhancements (`ROOSFIELD` vs `DD03L`); cross-team + per-record `SELECT` flags. **Connector-dependent** (needs the ECC connector from task 22; the enhancement source is in ECC, unreachable from BW HANA). Without it, emit the template + `unpopulated_reason`, populating only the BW-side DataSource replica.
+    - 24.6 — 9.6 ECC extractor enhancements. **Connector-dependent** for the enhancement *logic* (needs the ECC connector from task 22 or a source bundle; source is in ECC, unreachable from BW HANA) — without it, emit the template + `unpopulated_reason`. **BW-alone heuristic (always available):** flag *likely* enhancements by detecting customer-namespace fields (`Z*`/`Y*`/`ZZ*`) in `RSDSSEGFD` vs the standard field set, labelled `heuristic` (identifies that an enhancement exists, never what it does).
     - 24.7 — 9.7 report schedule vs chain p95 (uses latency service + connector). → `bw_check_schedule_risk` data.
     - 24.8 — 9.8 Tableau dashboards directly on calc views; shared vs separate view finding.
     - 24.9 — layer-violation finder (CP→DSO, CP→InfoObject, deep DSO stacks). → `bw_find_layer_violations` data.
@@ -367,3 +372,26 @@ build prompt.
 - **B3 (9–12) is a vertical slice**: repository base + chains repository + FastMCP bootstrap + chain tools, ending with `bw_list_chains` callable from a real MCP client — validating the full pattern before B4–B9.
 - **B4–B9 use the repository/tool split**: repositories (13–17) and services (18–24) precede their MCP-surface registration (25–32); each surface task depends on the layers beneath it.
 - Docs (33) and hardening/publish (34–36) come last.
+
+---
+
+## Deferred extension points (designed now, not scheduled)
+
+These are **not** part of the B0–B11 sequence. The graph model (task 19), routine parser (task 18),
+and connector interface (task 22) already carry the extension points so these can be added later
+**without refactoring** existing node/edge types. Each needs its own owner approval and credentials
+or inputs when scheduled.
+
+- [ ] 37. Source-bundle ingestion (offline) — extension of the routine parser
+  - Implement a filesystem `SourceBundle` (`services/source_bundle.py`): a local, git-ignored directory of exported ABAP source (the `ZXRSAU0x` extractor user-exit include family 01–04; custom BW classes / function modules) parsed by the existing routine parser with no live connection and no RFC.
+  - Match bundle files to `unresolved_dependency` nodes by object name and resolve them from both sides (BW routines calling custom classes/FMs; ECC extractor-exit source once exported).
+  - _Depends on: 18, 19_
+  - _Requirements: R31.1, R31.2, R31.3, R31.4, R11.7_
+  - _Build prompt: deferred (post-B11)_
+
+- [ ] 38. ECC connector (SQL Server) — enhancement inventory only
+  - Implement `connectors/ecc.py` behind the task-22 interface: `pyodbc` + ODBC Driver 18 for SQL Server, schema `SAP<SID>`, names validated at connect. Read the enhancement **inventory** (`ROOSOURCE`, `ROOSFIELD`, `DD02L`/`DD03L` appends, `MODSAP`/`MODACT`, `SXS_ATTR`/`SXC_EXIT`, `ENHHEADER`/`ENHOBJ`). Attach `source_object` parents to DataSource boundary nodes via `source_extract` edges and flip `upstream_resolved=True`.
+  - Does **not** read ABAP source (`REPOSRC.DATA` compressed) — the enhancement *logic* comes from the source bundle (task 37), not this connector.
+  - _Depends on: 22, 19_
+  - _Requirements: R30.4, R21.1, R21.2, R21.3_
+  - _Build prompt: deferred (post-B11)_
