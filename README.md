@@ -80,6 +80,13 @@ Local **stdio** transport. Example (Kiro `mcp.json`):
 Auto-approve only cheap, read-only tools. Leave long-running queries and file generation subject to
 prompting.
 
+**Running from source (before a PyPI release):** point `command` at the console script in the
+project venv (e.g. `.../mcp-server-sapbw/.venv/Scripts/mcp-server-sapbw.exe` on Windows), or use
+`uvx --from <path-to-checkout> mcp-server-sapbw`. On startup the server loads a git-ignored `.env`
+from `BW_DOTENV_PATH`, else next to `BW_PROFILES_PATH`, else `./.env` (existing environment
+variables always win). So a client only needs `BW_PROFILES_PATH` set — the connection secrets stay
+in `.env` and are picked up automatically; they are never written to the MCP config.
+
 ## Tool catalog
 
 Every tool takes a `system: str` naming a configured profile; the server stays stateless across

@@ -171,6 +171,10 @@ All notable changes to this project are documented here. The format is based on
     no-customer-metadata model. Resources are documented as specified-but-not-yet-implemented.
   - Regression tests: the profile password is never exposed in repr/str/model_dump/json (Rule 5);
     all six workflow prompts render with the expected tool references and threaded arguments.
+  - Startup `.env` loading: when launched by an MCP client, the server loads a git-ignored `.env`
+    (`BW_DOTENV_PATH`, else beside `BW_PROFILES_PATH`, else `./.env`) into the environment without
+    overriding existing variables, so a client config only needs `BW_PROFILES_PATH` and secrets stay
+    out of the MCP config. README updated with the run-from-source registration form.
 
 ### Notes
 - Live capability discovery (B2) is a hard gate before any repository or tool code.

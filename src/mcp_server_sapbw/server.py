@@ -11,6 +11,7 @@ Conventions enforced here:
 - Every tool takes ``system: str``; the server stays stateless across calls (connections pooled).
 """
 
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -672,8 +673,42 @@ def bw_generate_docs(system: str, output_dir: str | None = None, limit: int = 15
 register_prompts(mcp)
 
 
+def _load_local_dotenv() -> None:
+    """Load ``KEY=VALUE`` pairs from a local ``.env`` into the environment (never overriding).
+
+    Lets an MCP client launch the server with only ``BW_PROFILES_PATH`` set while the connection
+    secrets stay in a git-ignored ``.env``. Looked up in order: ``BW_DOTENV_PATH``, then a ``.env``
+    beside ``BW_PROFILES_PATH``, then ``./.env`` (first that exists wins). Existing environment
+    variables always take precedence (``setdefault``), so nothing already provided is clobbered.
+    """
+    candidates: list[Path] = []
+    explicit = os.environ.get("BW_DOTENV_PATH")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    profiles = os.environ.get("BW_PROFILES_PATH")
+    if profiles:
+        candidates.append(Path(profiles).expanduser().resolve().parent / ".env")
+    candidates.append(Path.cwd() / ".env")
+
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        return  # first existing .env wins
+
+
 def main() -> None:
     """Console entry point: run the MCP server over stdio."""
+    _load_local_dotenv()
     mcp.run()
 
 
