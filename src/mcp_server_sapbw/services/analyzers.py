@@ -29,6 +29,7 @@ from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
 from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
+from ..repositories.sources import SourcesRepository
 from ..repositories.transformations import TransformationsRepository
 from . import latency
 from .load_closure import LoadClosureService, cadence_of
@@ -56,6 +57,7 @@ SCENARIO_TITLES: dict[str, str] = {
 _SCAN_CAP = 5000  # hard cap on rows pulled for bulk edge scans
 _MERGED_INBOUND_CAP = 20  # inbound transformations examined per merged DSO for the field matrix
 _CADENCE_CHECK_CAP = 12  # looked-up objects whose cadence is resolved per finding
+_MANY_ENH_FIELDS = 5  # appended fields at/above which an enhancement is substantial
 _DEEP_STACK_MIN = 2  # >= this many DSO->DSO hops (3+ layers) is the 9.2 "deep stack" shape
 _HIGH_STACK_DEPTH = 3  # >= this many hops escalates a deep-stack finding to high severity
 # 9.1 parses routine source per candidate (RSAABAP), so scanning is budgeted rather than unbounded:
@@ -82,6 +84,7 @@ class Analyzers(Repository):
         self._chains = ChainsRepository(connection, capability, cache)
         self._hana = HanaRepository(connection, capability, cache)
         self._closure = LoadClosureService(connection, capability, cache)
+        self._sources = SourcesRepository(connection, capability, cache)
         self._registry: ConnectorRegistry = registry or ConnectorRegistry()
         # Cadence lookups repeat across findings (many loads read the same master data).
         self._frequency_cache: dict[str, FrequencyClass] = {}
@@ -691,66 +694,66 @@ class Analyzers(Repository):
     # --- 9.6 ECC extractor enhancements (BW heuristic + connector-gated) -----------------
 
     def extractor_enhancements(self, *, limit: int = 50) -> ScenarioReport | UnsupportedResult:
-        unsupported = self.require("datasource_field")
-        if unsupported is not None:
-            return unsupported
-        rows = self.select(
-            self.dialect.paginate(
-                self.dialect.build_select(
-                    columns=["DATASOURCE", "COUNT(*) AS FIELD_COUNT"],
-                    from_logical="datasource_field",
-                    where=["(FIELDNM LIKE 'Z%' OR FIELDNM LIKE 'Y%')"],
-                    group_by=["DATASOURCE"],
-                ),
-                limit=_SCAN_CAP,
-            )
-        )
-        enhanced = sorted(
-            ((str(ds).strip(), int(n)) for ds, n in rows if _clean(ds)),
-            key=lambda pair: pair[1],
-            reverse=True,
-        )
-        truncated = len(enhanced) > limit
+        """Scenario 9.6, backed by the enhancement inventory rather than a field count alone.
+
+        Each finding now carries the delta method, extractor program and extraction method alongside
+        the customer-namespace fields, so the coordination risk is described with evidence. The exit
+        *logic* still requires a source-system connector, which each finding names.
+        """
+        inventory = self._sources.enhancement_inventory(limit=limit)
+        if isinstance(inventory, UnsupportedResult):
+            return inventory
         reason = self._registry.unpopulated_reason("ecc")
         findings = [
-            self._enhancement_finding(datasource, field_count, reason)
-            for datasource, field_count in enhanced[:limit]
+            Finding(
+                scenario="9.6",
+                # More appended fields means more custom logic to re-verify on any upgrade.
+                severity="medium" if item.customer_field_count >= _MANY_ENH_FIELDS else "low",
+                title="DataSource carries an extractor enhancement",
+                affected_objects=[item.datasource],
+                evidence=(
+                    list(item.provenance)
+                    if isinstance(item.provenance, list)
+                    else [item.provenance]
+                ),
+                recommendation=(
+                    "Review the source-system exit for this DataSource: confirm which tables it "
+                    "reads (a read into another team's data is a coordination risk) and whether it "
+                    "does per-record SELECTs (a performance risk that scales with extract volume). "
+                    "Re-verify after any source-system upgrade."
+                ),
+                detail=(
+                    f"{item.customer_field_count} customer-namespace field(s) appended to the "
+                    f"extract structure. Delta method: {item.delta_method or 'unknown'}; "
+                    f"extraction method: {item.extraction_method or 'unknown'}; "
+                    f"request type: {item.request_type or 'unknown'}."
+                ),
+                metrics={
+                    "datasource": item.datasource,
+                    "logical_system": item.logical_system,
+                    "customer_field_count": item.customer_field_count,
+                    "customer_fields": item.customer_fields,
+                    "delta_method": item.delta_method,
+                    "extraction_method": item.extraction_method,
+                    "extractor": item.extractor,
+                    "application": item.application,
+                },
+                unpopulated_reason=reason,
+            )
+            for item in inventory.enhanced
         ]
         return ScenarioReport(
             scenario="9.6",
             title=SCENARIO_TITLES["9.6"],
             findings=findings,
-            analyzed_count=len(enhanced[:limit]),
-            truncated=truncated,
-            connector_required="ECC" if reason else None,
+            analyzed_count=inventory.total_datasources,
+            truncated=inventory.truncated,
+            connector_required=inventory.connector_required if reason else None,
             caveats=[
-                "HEURISTIC: customer-namespace (Z*/Y*) fields in the DataSource replica indicate "
-                "an enhancement likely exists; they do not reveal what the exit code does, which "
-                "tables it reads, or whether it performs per-record SELECTs.",
-                "The enhancement logic lives in the ECC source system (ABAP, unreachable over the "
-                "BW HANA connection); populate it via an ECC connector or a source bundle.",
+                *inventory.caveats,
+                f"{inventory.enhanced_count} of {inventory.total_datasources} DataSources carry "
+                "customer-namespace fields; the most heavily enhanced are reported first.",
             ],
-        )
-
-    def _enhancement_finding(
-        self, datasource: str, field_count: int, reason: str | None
-    ) -> Finding:
-        return Finding(
-            scenario="9.6",
-            severity="low",
-            title="DataSource likely carries an extractor enhancement (heuristic)",
-            affected_objects=[datasource],
-            evidence=[
-                self.provenance("datasource_field", {"DATASOURCE": datasource, "OBJVERS": "A"})
-            ],
-            recommendation=(
-                "Review the ECC extractor exit for this DataSource: confirm which tables it reads "
-                "(cross-team coordination risk) and whether it does per-record SELECTs "
-                "(performance risk). Provide an ECC connector or exported exit source to analyze."
-            ),
-            detail=f"{field_count} customer-namespace (Z*/Y*) field(s) in the DataSource replica.",
-            metrics={"datasource": datasource, "zy_field_count": field_count},
-            unpopulated_reason=reason,
         )
 
     # --- 9.7 report schedules vs. chain completion (connector-gated) ---------------------

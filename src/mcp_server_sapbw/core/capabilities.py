@@ -73,6 +73,8 @@ ABAP_TABLES: dict[str, str] = {
     "infopackage_selection": "RSLDPSEL",
     "datasource": "RSDS",
     "datasource_field": "RSDSSEGFD",
+    # Source-system registry. NOTE: keyed by SLOGSYS (sender) and carrying OBJSTAT, not OBJVERS.
+    "source_system": "RSBASIDOC",
     "request_status": "RSSTATMANPART",
     # providers and descriptions
     "dso_header": "RSDODSO",

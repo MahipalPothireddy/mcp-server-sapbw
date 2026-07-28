@@ -43,6 +43,7 @@ from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, Trac
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
 from .models.queries import Query, QueryLineage, QuerySummary, QueryUsage
+from .models.sources import EnhancementInventory, SourceTopology
 from .models.transformations import (
     RoutineAnalysis,
     RoutineCode,
@@ -56,6 +57,7 @@ from .repositories.health import HealthRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
+from .repositories.sources import SourcesRepository
 from .repositories.transformations import TransformationsRepository
 from .services.analyzers import Analyzers
 from .services.diagram import build_layout, png_available, render_png, render_svg
@@ -193,6 +195,7 @@ class Runtime(Protocol):
     def docgen(self, system: str) -> DocGenerator: ...
     def load_closure(self, system: str) -> LoadClosureService: ...
     def health(self, system: str) -> HealthRepository: ...
+    def sources(self, system: str) -> SourcesRepository: ...
 
 
 class ServerRuntime:
@@ -284,6 +287,12 @@ class ServerRuntime:
 
     def health(self, system: str) -> HealthRepository:
         return HealthRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+        )
+
+    def sources(self, system: str) -> SourcesRepository:
+        return SourcesRepository(
             self._connection(system),  # type: ignore[arg-type]
             self.capability(system),
         )
@@ -666,6 +675,34 @@ def bw_get_hana_crossings(
     return (
         runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
     )
+
+
+@_readonly_tool
+def bw_get_source_systems(system: str) -> SourceTopology | UnsupportedResult:
+    """Which systems feed this BW system, and of what kind.
+
+    Built from the logical systems the DataSources actually extract from, compared against the
+    source-system registry — so it also surfaces logical systems that DataSources reference but the
+    registry does not know, the usual signature of a system copy where BDLS was not run. System
+    kinds decoded from the ABAP dictionary are marked as such; codes the dictionary does not
+    document carry a conventional reading labelled advisory.
+    """
+    return runtime().sources(system).get_topology()
+
+
+@_readonly_tool
+def bw_list_extractor_enhancements(
+    system: str, limit: int = 50
+) -> EnhancementInventory | UnsupportedResult:
+    """DataSources whose extract structure carries customer-namespace (appended) fields.
+
+    The fields are metadata-confirmed evidence that an enhancement exists, joined to the delta
+    method, extractor program and extraction method. What the exit code actually does lives in the
+    source system's ABAP and needs a connector — the inventory says so rather than guessing, and it
+    does not infer risk from DataSource naming.
+    """
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().sources(system).enhancement_inventory(limit=limit)
 
 
 @_readonly_tool

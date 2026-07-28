@@ -32,6 +32,7 @@ _TABLES = {
     "transformation_step_rout": "RSTRANSTEPROUT",
     "routine_source": "RSAABAP",
     "dtp": "RSBKDTP",
+    "datasource": "RSDS",
     "datasource_field": "RSDSSEGFD",
     "extractor": "ROOSOURCE",
     "chain_attr": "RSPCCHAINATTR",
@@ -101,8 +102,14 @@ class ScriptedConnection:
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
         params = list(parameters or [])
-        if "RSDSSEGFD" in sql:  # 9.6 group by DataSource
-            return [("DS_ENH", 5)]
+        if "RSDSSEGFD" in sql:  # 9.6 enhancement inventory
+            if "TOTAL_COUNT" in sql:
+                return [(3,)]  # 3 DataSources in total
+            if "FIELDNM" in sql and "COUNT(*)" not in sql:  # the appended field names
+                return [("DS_ENH", "ZZ_A"), ("DS_ENH", "ZZ_B")]
+            return [("DS_ENH", 5)]  # DATASOURCE, count of customer-namespace fields
+        if '"RSDS"' in sql:  # DataSource detail: DATASOURCE, LOGSYS, TYPE, DELTA, APPLNM
+            return [("DS_ENH", "SRCCLNT100", "D", "ADD", "SD")]
         if "ROOSOURCE" in sql:  # 9.1 extractor delta method
             return [("ADD",)] if params and str(params[0]) == "DS_SRC" else []
         if "RSBKDTP" in sql:
@@ -257,16 +264,19 @@ def test_deep_layer_stacks() -> None:
     assert finding.metrics["depth"] == 3
 
 
-def test_extractor_enhancements_heuristic_and_connector_gated() -> None:
+def test_extractor_enhancements_are_evidence_backed_and_connector_gated() -> None:
+    """Findings carry the appended fields plus delta/extractor detail, not just a count."""
     report = _analyzers().extractor_enhancements()
     assert not isinstance(report, UnsupportedResult)
     assert report.scenario == "9.6"
     assert report.connector_required == "ECC"
     finding = report.findings[0]
     assert finding.affected_objects == ["DS_ENH"]
-    assert finding.metrics["zy_field_count"] == 5
+    assert finding.metrics["customer_field_count"] == 5
+    assert finding.metrics["customer_fields"]  # the actual appended field names
+    # The exit logic still needs a source-system connector, and the finding says so.
     assert finding.unpopulated_reason is not None
-    assert any("HEURISTIC" in c for c in report.caveats)
+    assert any("do not reveal what the exit code does" in c for c in report.caveats)
 
 
 def test_schedule_risk_connector_gated() -> None:
