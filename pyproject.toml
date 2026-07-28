@@ -43,6 +43,13 @@ viz = [
     "pillow>=10.4,<12",
 ]
 
+# Reading extractor-exit ABAP from a source system over ADT (SAP's own HTTP source service).
+# Optional because it targets a second system with separate credentials: a BW-only install never
+# needs it, and httpx is imported lazily so its absence costs nothing until the connector is used.
+ecc = [
+    "httpx>=0.27,<0.29",
+]
+
 # NOTE: mission Section 10 lists an optional "pyrfc" extra for RFC-based query resolution.
 # It is intentionally NOT declared here: SAP PyRFC is no longer supported and every
 # pyrfc>=2.5 release is yanked on PyPI (see https://github.com/SAP/PyRFC/issues/372), which

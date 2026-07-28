@@ -34,8 +34,11 @@ RuleType = Literal[
     "unknown",
 ]
 
-# Which routine slot the ABAP belongs to.
-RoutineKind = Literal["start", "end", "expert", "global", "field", "formula", "unit", "unknown"]
+# Which routine slot the ABAP belongs to. "exit" is not a BW transformation slot: it marks ABAP
+# read from a source system's extractor exit, which the same parser analyses for the same signals.
+RoutineKind = Literal[
+    "start", "end", "expert", "global", "field", "formula", "unit", "exit", "unknown"
+]
 
 # Aggregation behaviour of a rule (RSTRANRULE.AGGR). Decoded from the ABAP dictionary domain
 # RSTRAN_AGGREGATION (verified live), NOT assumed: MOV/SUM/MIN/MAX/NOP.

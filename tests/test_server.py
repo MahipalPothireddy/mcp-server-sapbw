@@ -13,9 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import Client
+from pydantic import SecretStr
 
 from mcp_server_sapbw import server
+from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
+from mcp_server_sapbw.core.profiles import EccProfile
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from mcp_server_sapbw.models.ecc import ConnectorUnavailable
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.hana import HanaRepository
 from mcp_server_sapbw.repositories.health import HealthRepository
@@ -27,6 +31,7 @@ from mcp_server_sapbw.repositories.transformations import TransformationsReposit
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
 from mcp_server_sapbw.services.analyzers import Analyzers
 from mcp_server_sapbw.services.docgen import DocGenerator
+from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
 from mcp_server_sapbw.services.lineage import LineageService
 from mcp_server_sapbw.services.load_closure import LoadClosureService
 
@@ -224,6 +229,13 @@ class FakeRuntime:
 
     def sources(self, system: str) -> SourcesRepository:
         return SourcesRepository(_Conn(), self._cap)
+
+    def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
+        """No source system is configured in the fixture, mirroring a BW-only install."""
+        return ConnectorUnavailable(
+            configured_profiles=[],
+            detail="no ABAP source system is configured; add an 'ecc_systems' entry",
+        )
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
@@ -473,3 +485,55 @@ def test_render_lineage_rejects_absurd_depth() -> None:
     )
     body = _report_body(result)
     assert body["depth"] <= 8
+
+
+def test_extractor_exit_code_reports_an_unconfigured_connector() -> None:
+    """With no source system configured the tool says how to configure it, and does not guess."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(asyncio.run(_call("bw_get_extractor_exit_code", {})))
+    assert body["status"] == "connector_not_configured"
+    assert body["connector"] == "ecc"
+    assert body["configured_profiles"] == []
+    assert "ecc_systems" in body["detail"]
+
+
+def test_extractor_exit_code_returns_the_inventory_when_configured() -> None:
+    """A configured source system yields all four slots with per-branch risk attribution."""
+    abap = (
+        "FUNCTION EXIT_SAPLRSAP_001.\n"
+        "  CASE i_datasource.\n"
+        "    WHEN 'DS_A'.\n"
+        "      SELECT f FROM tbl_a INTO lv.\n"
+        "  ENDCASE.\n"
+        "ENDFUNCTION.\n"
+    )
+
+    class Fetcher:
+        def get_text(self, path: str, params: Any) -> AdtResponse:
+            return AdtResponse(200, abap) if "zxrsau01" in path else AdtResponse(404, "")
+
+    class EccRuntime(FakeRuntime):
+        def exit_analysis(
+            self, ecc_system: str | None
+        ) -> ExitAnalysisService | ConnectorUnavailable:
+            profile = EccProfile(
+                name="src",
+                host="src.example.invalid",
+                port=44300,
+                client="300",
+                user="reader",
+                password=SecretStr("pw"),  # pragma: allowlist secret
+            )
+            return ExitAnalysisService(EccConnector(profile, Fetcher()))
+
+    server.set_runtime(EccRuntime())
+    body = _report_body(asyncio.run(_call("bw_get_extractor_exit_code", {"ecc_system": "src"})))
+    assert body["profile"] == "src"
+    assert body["client"] == "300"
+    assert len(body["exits"]) == 4
+    assert body["available_count"] == 1
+    assert body["handled_datasources"] == ["DS_A"]
+    # No host anywhere in the payload (mission Rule 5).
+    assert "src.example.invalid" not in str(body)
+    # Source text is opt-in.
+    assert body["exits"][0]["source"] is None

@@ -37,7 +37,20 @@ _COMBINED = re.compile(PATTERN)
 #   YYYYMMDD / YYYYMMDDHHMMSS   - SAP date/timestamp FORMAT placeholders (process-log parser)
 #   ZY_FIELDS                  - a former internal SQL column alias (since renamed) mentioned once
 #                                in an earlier commit's PROGRESS.md prose
-ALLOW = {"ZZ_TEST", "YYYYMMDD", "YYYYMMDDHHMMSS", "ZY_FIELDS"}
+#   ZXRSAU01..04               - SAP-DEFINED customer includes of enhancement RSAP0001 (the four BW
+#                                extractor exits). Named by SAP's own ZXnnnU01 convention, identical
+#                                on every ABAP system, and carrying no customer information. They
+#                                sit in the customer namespace only because SAP put them there.
+ALLOW = {
+    "ZZ_TEST",
+    "YYYYMMDD",
+    "YYYYMMDDHHMMSS",
+    "ZY_FIELDS",
+    "ZXRSAU01",
+    "ZXRSAU02",
+    "ZXRSAU03",
+    "ZXRSAU04",
+}
 
 # Working-tree directories never scanned (git-ignored artefacts, caches, and the fixtures dir where
 # synthetic sample names deliberately live).

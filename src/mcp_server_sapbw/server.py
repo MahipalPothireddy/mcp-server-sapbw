@@ -23,6 +23,7 @@ from fastmcp.utilities.types import Image
 from pydantic import BaseModel, ConfigDict, Field
 
 from .connectors.base import ConnectorRegistry
+from .connectors.ecc import EccConnector
 from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnectionPool
@@ -36,6 +37,7 @@ from .models.chains import (
     ScheduleMatrixEntry,
 )
 from .models.diagram import DiagramFormat, DiagramResult
+from .models.ecc import ConnectorUnavailable, ExitInventory
 from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
 from .models.health import ProviderHealth
@@ -62,6 +64,7 @@ from .repositories.transformations import TransformationsRepository
 from .services.analyzers import Analyzers
 from .services.diagram import build_layout, png_available, render_png, render_svg
 from .services.docgen import DocGenerator, DocGenResult
+from .services.exit_analysis import ExitAnalysisService
 from .services.lineage import LineageService
 from .services.load_closure import LoadClosureService
 
@@ -196,6 +199,9 @@ class Runtime(Protocol):
     def load_closure(self, system: str) -> LoadClosureService: ...
     def health(self, system: str) -> HealthRepository: ...
     def sources(self, system: str) -> SourcesRepository: ...
+    def exit_analysis(
+        self, ecc_system: str | None
+    ) -> ExitAnalysisService | ConnectorUnavailable: ...
 
 
 class ServerRuntime:
@@ -266,21 +272,57 @@ class ServerRuntime:
             self.capability(system),
         )
 
+    def _ecc_connector(self, name: str | None = None) -> EccConnector:
+        """Build the ECC connector for a named profile, or the sole one if only one is configured.
+
+        With several ECC profiles and no name, no connector is returned: which source system feeds a
+        given BW system is not derivable from the profiles file, and picking one would be a guess.
+        """
+        names = self._profiles.ecc_names()
+        chosen = name or (names[0] if len(names) == 1 else None)
+        if chosen is None:
+            return EccConnector()
+        return EccConnector(self._profiles.get_ecc(chosen))
+
+    def _registry(self) -> ConnectorRegistry:
+        """Connector registry for the analyzers.
+
+        The ECC connector appears only when an ``ecc_systems`` profile is configured; otherwise the
+        connector-gated scenarios (9.6/9.7/9.8) report "not configured" rather than guessing.
+        Tableau/BOBJ connectors remain deferred.
+        """
+        connector = self._ecc_connector()
+        return ConnectorRegistry([connector] if connector.is_configured() else [])
+
     def analyzers(self, system: str) -> Analyzers:
-        # An empty connector registry: ECC/Tableau/BOBJ connectors are deferred, so the
-        # connector-gated scenarios (9.6/9.7/9.8) report "not configured" rather than guessing.
         return Analyzers(
             self._connection(system),
             self.capability(system),
-            registry=ConnectorRegistry(),
+            registry=self._registry(),
         )
 
     def docgen(self, system: str) -> DocGenerator:
         return DocGenerator(
             self._connection(system),
             self.capability(system),
-            registry=ConnectorRegistry(),
+            registry=self._registry(),
         )
+
+    def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
+        names = self._profiles.ecc_names()
+        connector = self._ecc_connector(ecc_system)
+        if not connector.is_configured():
+            detail = (
+                "no ABAP source system is configured; add an 'ecc_systems' entry to profiles.yaml "
+                "to read extractor-exit ABAP over ADT"
+                if not names
+                else (
+                    f"{len(names)} source systems are configured; name one in 'ecc_system' "
+                    "(which source system feeds a BW system is not recorded in the profiles file)"
+                )
+            )
+            return ConnectorUnavailable(configured_profiles=names, detail=detail)
+        return ExitAnalysisService(connector)
 
     def load_closure(self, system: str) -> LoadClosureService:
         return LoadClosureService(self._connection(system), self.capability(system))
@@ -703,6 +745,29 @@ def bw_list_extractor_enhancements(
     """
     limit, _ = _clamp_page(limit, 0)
     return runtime().sources(system).enhancement_inventory(limit=limit)
+
+
+@_readonly_tool
+def bw_get_extractor_exit_code(
+    ecc_system: str | None = None, include_source: bool = False
+) -> ExitInventory | ConnectorUnavailable:
+    """The ABAP behind extractor enhancements, read from the source system over ADT.
+
+    BW proves *that* a DataSource was enhanced but holds none of the logic. This reads the four
+    extractor-exit slots of enhancement RSAP0001 from the source system and reports, per slot, the
+    DataSources its CASE dispatches on, the tables it reads, and anti-patterns including per-record
+    SELECTs — the questions scenario 9.6 asks and BW cannot answer. A slot whose include does not
+    exist is reported as absent, which means no enhancement of that DataSource kind is implemented;
+    a slot that could not be read is reported as unknown rather than absent.
+
+    The connection is GET-only and takes no ADT locks. ``ecc_system`` names an ``ecc_systems``
+    profile and may be omitted when exactly one is configured. Full ABAP is opt-in via
+    ``include_source`` and is capped; the analysis always covers the whole include.
+    """
+    service = runtime().exit_analysis(ecc_system)
+    if isinstance(service, ConnectorUnavailable):
+        return service
+    return service.inventory(include_source=include_source)
 
 
 @_readonly_tool

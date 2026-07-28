@@ -23,7 +23,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..connectors.base import ConnectorRegistry
+from ..connectors.ecc import EccConnector
 from ..models.chains import FrequencyClass
+from ..models.ecc import ExitInventory
 from ..models.findings import Finding, ScenarioReport, Severity
 from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
@@ -32,6 +34,7 @@ from ..repositories.hana import HanaRepository
 from ..repositories.sources import SourcesRepository
 from ..repositories.transformations import TransformationsRepository
 from . import latency
+from .exit_analysis import ExitAnalysisService
 from .load_closure import LoadClosureService, cadence_of
 
 # RSTLOGO endpoint type codes (verified live, B5).
@@ -71,6 +74,37 @@ def _clean(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _exit_index(exits: Any) -> dict[str, list[Any]]:
+    """``{datasource: [branch, ...]}`` across every readable exit slot.
+
+    Keyed on the branch rather than the slot so a finding's risk reflects only the code that runs
+    for that DataSource. ``exit_include`` is carried on the branch tuple for citation.
+    """
+    index: dict[str, list[Any]] = {}
+    if exits is None:
+        return index
+    for slot in exits.exits:
+        if not slot.available:
+            continue
+        for branch in slot.branches:
+            index.setdefault(branch.datasource, []).append((slot.include_name, branch))
+    return index
+
+
+def _exit_risk(entries: list[Any]) -> tuple[list[str], int, bool]:
+    """Aggregate a DataSource's branches: tables read, per-record SELECTs, every branch resolved."""
+    tables: list[str] = []
+    per_record = 0
+    resolved = True
+    for _include, branch in entries:
+        if not branch.resolved:
+            resolved = False
+            continue
+        tables.extend(table for table in branch.table_reads if table not in tables)
+        per_record += branch.per_record_selects
+    return tables, per_record, resolved
 
 
 class Analyzers(Repository):
@@ -704,44 +738,26 @@ class Analyzers(Repository):
         if isinstance(inventory, UnsupportedResult):
             return inventory
         reason = self._registry.unpopulated_reason("ecc")
+        exits = None if reason else self._exit_evidence()
+        exit_index = _exit_index(exits)
+
         findings = [
-            Finding(
-                scenario="9.6",
-                # More appended fields means more custom logic to re-verify on any upgrade.
-                severity="medium" if item.customer_field_count >= _MANY_ENH_FIELDS else "low",
-                title="DataSource carries an extractor enhancement",
-                affected_objects=[item.datasource],
-                evidence=(
-                    list(item.provenance)
-                    if isinstance(item.provenance, list)
-                    else [item.provenance]
-                ),
-                recommendation=(
-                    "Review the source-system exit for this DataSource: confirm which tables it "
-                    "reads (a read into another team's data is a coordination risk) and whether it "
-                    "does per-record SELECTs (a performance risk that scales with extract volume). "
-                    "Re-verify after any source-system upgrade."
-                ),
-                detail=(
-                    f"{item.customer_field_count} customer-namespace field(s) appended to the "
-                    f"extract structure. Delta method: {item.delta_method or 'unknown'}; "
-                    f"extraction method: {item.extraction_method or 'unknown'}; "
-                    f"request type: {item.request_type or 'unknown'}."
-                ),
-                metrics={
-                    "datasource": item.datasource,
-                    "logical_system": item.logical_system,
-                    "customer_field_count": item.customer_field_count,
-                    "customer_fields": item.customer_fields,
-                    "delta_method": item.delta_method,
-                    "extraction_method": item.extraction_method,
-                    "extractor": item.extractor,
-                    "application": item.application,
-                },
-                unpopulated_reason=reason,
-            )
-            for item in inventory.enhanced
+            self._enhancement_finding(item, exit_index, reason) for item in inventory.enhanced
         ]
+        caveats = [
+            *inventory.caveats,
+            f"{inventory.enhanced_count} of {inventory.total_datasources} DataSources carry "
+            "customer-namespace fields; the most heavily enhanced are reported first.",
+        ]
+        if exits is not None:
+            declared = {item.datasource for item in inventory.enhanced}
+            findings.extend(self._exit_only_findings(exits, declared))
+            caveats.extend(exits.caveats)
+            caveats.append(
+                f"Exit ABAP read from source-system profile '{exits.profile}' client "
+                f"{exits.client}: {exits.available_count} of 4 slot(s) implemented, dispatching on "
+                f"{len(exits.handled_datasources)} DataSource(s)."
+            )
         return ScenarioReport(
             scenario="9.6",
             title=SCENARIO_TITLES["9.6"],
@@ -749,12 +765,151 @@ class Analyzers(Repository):
             analyzed_count=inventory.total_datasources,
             truncated=inventory.truncated,
             connector_required=inventory.connector_required if reason else None,
-            caveats=[
-                *inventory.caveats,
-                f"{inventory.enhanced_count} of {inventory.total_datasources} DataSources carry "
-                "customer-namespace fields; the most heavily enhanced are reported first.",
-            ],
+            caveats=caveats,
         )
+
+    def _exit_evidence(self) -> ExitInventory | None:
+        """Read the extractor-exit ABAP, or ``None`` when the connector cannot supply it."""
+        connector = self._registry.get("ecc")
+        if not isinstance(connector, EccConnector):
+            return None
+        try:
+            return ExitAnalysisService(connector).inventory()
+        except Exception:
+            # A source-system outage must not fail a BW scenario; the finding degrades to the
+            # BW-only evidence instead, and the caveat list simply omits the exit summary.
+            return None
+
+    def _enhancement_finding(
+        self, item: Any, exit_index: dict[str, list[Any]], reason: str | None
+    ) -> Finding:
+        entries = exit_index.get(item.datasource, [])
+        confirmed = bool(entries)
+        detail = (
+            f"{item.customer_field_count} customer-namespace field(s) appended to the "
+            f"extract structure. Delta method: {item.delta_method or 'unknown'}; "
+            f"extraction method: {item.extraction_method or 'unknown'}; "
+            f"request type: {item.request_type or 'unknown'}."
+        )
+        metrics: dict[str, Any] = {
+            "datasource": item.datasource,
+            "logical_system": item.logical_system,
+            "customer_field_count": item.customer_field_count,
+            "customer_fields": item.customer_fields,
+            "delta_method": item.delta_method,
+            "extraction_method": item.extraction_method,
+            "extractor": item.extractor,
+            "application": item.application,
+        }
+        severity: Severity = "medium" if item.customer_field_count >= _MANY_ENH_FIELDS else "low"
+        recommendation = (
+            "Review the source-system exit for this DataSource: confirm which tables it "
+            "reads (a read into another team's data is a coordination risk) and whether it "
+            "does per-record SELECTs (a performance risk that scales with extract volume). "
+            "Re-verify after any source-system upgrade."
+        )
+        if confirmed:
+            reads, per_record, resolved = _exit_risk(entries)
+            includes = sorted({include for include, _ in entries})
+            metrics["exit_confirmed"] = True
+            metrics["exit_includes"] = includes
+            metrics["exit_branch_resolved"] = resolved
+            metrics["exit_table_reads"] = reads
+            metrics["exit_per_record_selects"] = per_record
+            detail += (
+                f" The exit code was read: {', '.join(includes)} dispatches on this DataSource"
+            )
+            if resolved:
+                detail += f" and its branch reads {len(reads)} table(s)."
+            else:
+                detail += (
+                    ", but its branch could not be delimited, so no table read is attributed to it."
+                )
+            if per_record:
+                severity = "high"
+                detail += (
+                    f" {per_record} SELECT(s) sit inside a LOOP in that branch, so the read cost "
+                    "scales with extract volume."
+                )
+                recommendation = (
+                    "Rework the per-record SELECT(s) in the exit into a single set-based read "
+                    "before the loop (FOR ALL ENTRIES or a sorted buffer table). Confirm the "
+                    f"table(s) read belong to this functional area: {', '.join(reads) or 'none'}."
+                )
+            elif resolved:
+                recommendation = (
+                    "Confirm the table(s) the exit branch reads belong to this functional area — a "
+                    f"read into another team's data is a coordination risk: "
+                    f"{', '.join(reads) or 'none'}."
+                )
+        elif reason is None:
+            metrics["exit_confirmed"] = False
+            detail += (
+                " The exit code was read but does not dispatch on this DataSource, so the "
+                "enhancement is implemented elsewhere (a BAdI, a different include, or a dynamic "
+                "dispatch this parser cannot follow)."
+            )
+        return Finding(
+            scenario="9.6",
+            severity=severity,
+            title="DataSource carries an extractor enhancement",
+            affected_objects=[item.datasource],
+            evidence=(
+                list(item.provenance) if isinstance(item.provenance, list) else [item.provenance]
+            ),
+            recommendation=recommendation,
+            detail=detail,
+            metrics=metrics,
+            unpopulated_reason=reason,
+        )
+
+    def _exit_only_findings(self, exits: Any, declared: set[str]) -> list[Finding]:
+        """DataSources the exit handles that BW's appended-field evidence does not reveal.
+
+        An enhancement that overwrites an existing field adds no field to the extract structure, so
+        BW shows nothing. Only the exit source exposes it.
+        """
+        findings: list[Finding] = []
+        for slot in exits.exits:
+            if not slot.available or slot.provenance is None:
+                continue
+            missed = [name for name in slot.handled_datasources if name not in declared]
+            for name in sorted(missed):
+                findings.append(
+                    Finding(
+                        scenario="9.6",
+                        severity="medium",
+                        title="DataSource enhanced in the exit with no appended fields",
+                        affected_objects=[name],
+                        evidence=[
+                            Provenance(
+                                source_table="ADT",
+                                source_key={
+                                    "INCLUDE": slot.include_name,
+                                    "CLIENT": exits.client,
+                                    "PROFILE": exits.profile,
+                                },
+                            )
+                        ],
+                        recommendation=(
+                            "Confirm what this exit branch changes. Because no field was appended "
+                            "to the extract structure, it most likely overwrites a standard "
+                            "field's value — a change invisible to every BW-side check."
+                        ),
+                        detail=(
+                            f"The {slot.data_kind.replace('_', ' ')} exit ({slot.include_name}) "
+                            "dispatches on this DataSource, but its extract structure carries no "
+                            "customer-namespace field."
+                        ),
+                        metrics={
+                            "datasource": name,
+                            "exit_include": slot.include_name,
+                            "exit_data_kind": slot.data_kind,
+                            "detected_from": "exit_source",
+                        },
+                    )
+                )
+        return findings
 
     # --- 9.7 report schedules vs. chain completion (connector-gated) ---------------------
 

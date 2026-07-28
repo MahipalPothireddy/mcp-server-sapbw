@@ -40,6 +40,30 @@ systems:
     #   ssl_validate_certificate: false
     read_only_user: true
 
+# OPTIONAL: ABAP source systems, reached over ADT (SAP's own HTTP source service).
+#
+# Only needed to read extractor-exit ABAP, which exists in the source system and not in BW.
+# Omit this block entirely and the ECC-gated analysis reports "connector not configured"
+# instead of guessing. The connection is GET-only and takes no ADT locks.
+#
+# ecc_systems:
+#   eq3:
+#     host: ${ECC_EQ3_HOST}
+#     port: 44300               # ICM HTTPS port, e.g. 443<instance>
+#     client: "300"             # sap-client; a wrong client silently reads other code
+#     user: ${ECC_EQ3_USER}
+#     password: ${ECC_EQ3_PASSWORD}
+#     use_tls: true             # leave true: Basic auth over plain HTTP exposes the password
+#     ssl_validate_certificate: true
+#     timeout_seconds: 30
+#     # For an internal-only system with no TLS listener, plain HTTP needs a second,
+#     # deliberate opt-in - use_tls: false alone is rejected:
+#     #   use_tls: false
+#     #   allow_plain_http: true
+#
+# Requires the optional extra:  pip install 'mcp-server-sapbw[ecc]'
+# The ADT user needs source-display authorisation and an active ADT ICF node.
+
 # Notes:
 # - Capability discovery (release, ABAP schema, object-model variants, log-retention
 #   window) runs on first connect and is cached per profile.

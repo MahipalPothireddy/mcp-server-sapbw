@@ -47,9 +47,15 @@ class ConnectorStatus(BaseModel):
 
 @runtime_checkable
 class ExternalConnector(Protocol):
-    """Structural interface every external connector satisfies."""
+    """Structural interface every external connector satisfies.
 
-    kind: ConnectorKind
+    ``kind`` is declared read-only so an implementation may narrow it to its own literal (a
+    connector's kind is fixed at class level); a mutable attribute would force every implementation
+    to widen it back to :data:`ConnectorKind`.
+    """
+
+    @property
+    def kind(self) -> ConnectorKind: ...
 
     def is_configured(self) -> bool: ...
 

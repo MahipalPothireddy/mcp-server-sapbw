@@ -20,6 +20,11 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import SecretStr
+
+from mcp_server_sapbw.connectors.base import ConnectorRegistry
+from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
+from mcp_server_sapbw.core.profiles import EccProfile
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
 from mcp_server_sapbw.services.analyzers import Analyzers
@@ -320,3 +325,120 @@ def test_run_scenario_dispatch_and_unknown() -> None:
 def test_unsupported_without_transformation() -> None:
     result = _analyzers(present={"dtp"}).composite_provider_to_dso()
     assert isinstance(result, UnsupportedResult)
+
+
+# --- 9.6 with a configured source-system connector --------------------------------------------
+# The BW landscape above says DS_ENH carries 5 appended fields. These tests add exit ABAP so the
+# scenario can answer what BW cannot: which tables that enhancement reads, and at what cost.
+
+_EXIT_WITH_LOOP = """\
+FUNCTION EXIT_SAPLRSAP_001.
+  CASE i_datasource.
+    WHEN 'DS_ENH'.
+      LOOP AT c_t_data INTO ls_data.
+        SELECT single f FROM tbl_foreign INTO lv WHERE k = ls_data-k.
+      ENDLOOP.
+    WHEN 'DS_HIDDEN'.
+      SELECT f FROM tbl_local INTO TABLE lt.
+  ENDCASE.
+ENDFUNCTION.
+"""
+
+
+def _ecc_profile() -> EccProfile:
+    return EccProfile(
+        name="src",
+        host="src.example.invalid",
+        port=44300,
+        client="300",
+        user="reader",
+        password=SecretStr("pw"),  # pragma: allowlist secret
+    )
+
+
+def _ecc_analyzers(body: str = _EXIT_WITH_LOOP) -> Analyzers:
+    """Analyzers with a scripted ADT connector registered for the 'ecc' kind."""
+
+    class Fetcher:
+        def get_text(self, path: str, params: Any) -> AdtResponse:
+            # Only the transaction-data slot exists; the other three are absent.
+            return AdtResponse(200, body) if "zxrsau01" in path else AdtResponse(404, "")
+
+    registry = ConnectorRegistry([EccConnector(_ecc_profile(), Fetcher())])
+    return Analyzers(ScriptedConnection(), _capability(), registry=registry)
+
+
+def _finding_for(report: Any, datasource: str) -> Any:
+    return next(f for f in report.findings if f.affected_objects == [datasource])
+
+
+def test_configured_connector_drops_the_unpopulated_reason() -> None:
+    report = _ecc_analyzers().extractor_enhancements()
+    assert not isinstance(report, UnsupportedResult)
+    assert report.connector_required is None
+    assert _finding_for(report, "DS_ENH").unpopulated_reason is None
+
+
+def test_exit_evidence_names_the_table_the_enhancement_reads() -> None:
+    finding = _finding_for(_ecc_analyzers().extractor_enhancements(), "DS_ENH")
+    assert finding.metrics["exit_confirmed"] is True
+    assert finding.metrics["exit_includes"] == ["ZXRSAU01"]
+    assert finding.metrics["exit_table_reads"] == ["tbl_foreign"]
+
+
+def test_per_record_select_in_the_exit_escalates_severity() -> None:
+    finding = _finding_for(_ecc_analyzers().extractor_enhancements(), "DS_ENH")
+    assert finding.metrics["exit_per_record_selects"] == 1
+    assert finding.severity == "high"
+    assert "scales with extract volume" in finding.detail
+    assert "set-based read" in finding.recommendation
+
+
+def test_risk_is_not_borrowed_from_another_branch() -> None:
+    """DS_ENH's LOOP must not escalate the DataSource handled by the *next* branch of that CASE."""
+    report = _ecc_analyzers().extractor_enhancements()
+    hidden = _finding_for(report, "DS_HIDDEN")
+    assert hidden.severity == "medium"
+    assert "scales with extract volume" not in hidden.detail
+    assert "tbl_foreign" not in str(hidden.metrics)
+
+
+def test_datasource_enhanced_only_in_the_exit_is_reported() -> None:
+    """An enhancement that overwrites a standard field appends no field, so BW shows nothing."""
+    report = _ecc_analyzers().extractor_enhancements()
+    hidden = _finding_for(report, "DS_HIDDEN")
+    assert hidden.title == "DataSource enhanced in the exit with no appended fields"
+    assert hidden.metrics["detected_from"] == "exit_source"
+    assert hidden.evidence[0].source_table == "ADT"
+    assert hidden.evidence[0].source_key["INCLUDE"] == "ZXRSAU01"
+
+
+def test_exit_summary_is_added_to_the_caveats() -> None:
+    report = _ecc_analyzers().extractor_enhancements()
+    assert not isinstance(report, UnsupportedResult)
+    joined = " ".join(report.caveats)
+    assert "1 of 4 slot(s) implemented" in joined
+    assert "src.example.invalid" not in joined  # never the host
+
+
+def test_exit_that_does_not_mention_the_datasource_says_so() -> None:
+    other = "FUNCTION f.\n  CASE i_datasource.\n    WHEN 'DS_OTHER'.\n  ENDCASE.\nENDFUNCTION."
+    finding = _finding_for(_ecc_analyzers(other).extractor_enhancements(), "DS_ENH")
+    assert finding.metrics["exit_confirmed"] is False
+    assert "implemented elsewhere" in finding.detail
+
+
+def test_source_system_outage_degrades_to_bw_only_evidence() -> None:
+    class Exploding:
+        def get_text(self, path: str, params: Any) -> AdtResponse:
+            raise RuntimeError("transport blew up")
+
+    analyzers = Analyzers(
+        ScriptedConnection(),
+        _capability(),
+        registry=ConnectorRegistry([EccConnector(_ecc_profile(), Exploding())]),
+    )
+    report = analyzers.extractor_enhancements()
+    assert not isinstance(report, UnsupportedResult)
+    # The BW-side finding still stands; it simply carries no exit evidence.
+    assert _finding_for(report, "DS_ENH").metrics["customer_field_count"] == 5

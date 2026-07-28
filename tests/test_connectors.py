@@ -46,7 +46,15 @@ def test_registry_returns_configured_connector() -> None:
     assert registry.unpopulated_reason("ecc") is not None
 
 
-def test_deferred_connectors_are_not_configured() -> None:
-    for connector in (EccConnector(), TableauConnector(), BobjConnector()):
+def test_deferred_bi_connectors_are_not_configured() -> None:
+    for connector in (TableauConnector(), BobjConnector()):
         assert connector.is_configured() is False
         assert "deferred" in connector.status().detail
+
+
+def test_ecc_connector_without_a_profile_is_unconfigured_not_deferred() -> None:
+    """ECC is implemented; with no profile it says how to configure it, not that it is deferred."""
+    status = EccConnector().status()
+    assert status.configured is False
+    assert "deferred" not in status.detail
+    assert "ecc_systems" in status.detail

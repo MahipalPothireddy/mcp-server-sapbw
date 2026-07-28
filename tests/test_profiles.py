@@ -168,3 +168,84 @@ systems:
     qa = ProfileManager(_write(tmp_path, yaml_text), env=_ENV).get("qa")
     assert qa.ssl_validate_certificate is False
     assert qa.ssl_trust_store == "/etc/ssl/internal-ca.pem"
+
+
+# --- optional ABAP source systems (ecc_systems) -----------------------------------------------
+
+_ECC_YAML = """
+systems:
+  qa:
+    host: ${BW_QA_HOST}
+    port: 30015
+    user: ${BW_QA_USER}
+    password: ${BW_QA_PASSWORD}
+ecc_systems:
+  src:
+    host: ${ECC_HOST}
+    port: 44300
+    client: "300"
+    user: ${ECC_USER}
+    password: ${ECC_PASSWORD}
+"""
+
+_ECC_ENV = {
+    **_ENV,
+    "ECC_HOST": "src.example.invalid",
+    "ECC_USER": "src_ro",
+    "ECC_PASSWORD": "s3cr3t-src",  # pragma: allowlist secret
+}
+
+
+def test_ecc_systems_is_optional(tmp_path: Path) -> None:
+    """A profiles file with no ecc_systems block is valid and simply has no source systems."""
+    mgr = ProfileManager(_write(tmp_path, _GOOD_YAML), env=_ENV)
+    assert mgr.ecc_names() == []
+
+
+def test_ecc_profile_is_loaded_and_interpolated(tmp_path: Path) -> None:
+    mgr = ProfileManager(_write(tmp_path, _ECC_YAML), env=_ECC_ENV)
+    assert mgr.ecc_names() == ["src"]
+    src = mgr.get_ecc("src")
+    assert src.host == "src.example.invalid"
+    assert src.client == "300"
+    assert src.password.get_secret_value() == "s3cr3t-src"
+    assert src.use_tls is True  # secure by default
+    assert src.base_url == "https://src.example.invalid:44300"
+
+
+def test_unknown_ecc_profile_lists_the_configured_ones(tmp_path: Path) -> None:
+    mgr = ProfileManager(_write(tmp_path, _ECC_YAML), env=_ECC_ENV)
+    with pytest.raises(ProfileNotFoundError) as excinfo:
+        mgr.get_ecc("nope")
+    assert "src" in str(excinfo.value)
+
+
+def test_ecc_inline_password_is_rejected(tmp_path: Path) -> None:
+    bad = _ECC_YAML.replace("password: ${ECC_PASSWORD}", "password: literal-not-allowed")
+    with pytest.raises(ProfileConfigError, match="environment-variable reference"):
+        ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)
+
+
+def test_ecc_plain_http_without_opt_in_is_rejected(tmp_path: Path) -> None:
+    bad = _ECC_YAML + "    use_tls: false\n"
+    with pytest.raises(ProfileConfigError, match="allow_plain_http"):
+        ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)
+
+
+def test_ecc_plain_http_with_opt_in_is_accepted(tmp_path: Path) -> None:
+    ok = _ECC_YAML + "    use_tls: false\n    allow_plain_http: true\n"
+    mgr = ProfileManager(_write(tmp_path, ok), env=_ECC_ENV)
+    assert mgr.get_ecc("src").base_url.startswith("http://")
+
+
+def test_ecc_client_must_be_three_digits(tmp_path: Path) -> None:
+    bad = _ECC_YAML.replace('client: "300"', 'client: "3000"')
+    with pytest.raises(ProfileConfigError, match="invalid"):
+        ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)
+
+
+def test_ecc_error_never_echoes_the_password(tmp_path: Path) -> None:
+    bad = _ECC_YAML.replace('client: "300"', 'client: "bad"')
+    with pytest.raises(ProfileConfigError) as excinfo:
+        ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)
+    assert "s3cr3t-src" not in str(excinfo.value)
