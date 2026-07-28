@@ -190,7 +190,7 @@ def test_infoobject_from_composite_provider() -> None:
     assert report.scenario == "9.4"
     assert report.finding_count == 1
     assert report.findings[0].affected_objects == ["CP_MAT", "MATERIAL"]
-    assert any("sequenc" in c.lower() for c in report.caveats)
+    assert any("bw_get_load_closure" in c for c in report.caveats)
 
 
 def test_merged_stream_dso_detects_collision() -> None:

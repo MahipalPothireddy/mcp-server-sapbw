@@ -26,6 +26,7 @@ from mcp_server_sapbw.server import RefreshResult, SystemStatus
 from mcp_server_sapbw.services.analyzers import Analyzers
 from mcp_server_sapbw.services.docgen import DocGenerator
 from mcp_server_sapbw.services.lineage import LineageService
+from mcp_server_sapbw.services.load_closure import LoadClosureService
 
 _TABLES = {
     "chain_attr": "RSPCCHAINATTR",
@@ -212,6 +213,9 @@ class FakeRuntime:
 
     def docgen(self, system: str) -> DocGenerator:
         return DocGenerator(_Conn(), self._cap)
+
+    def load_closure(self, system: str) -> LoadClosureService:
+        return LoadClosureService(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:

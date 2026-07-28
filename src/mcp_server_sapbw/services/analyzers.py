@@ -13,9 +13,9 @@ Design constraints honoured here:
   multi-stream DSOs, deep DSO stacks). Nothing is inferred from a technical name (Rule 2).
 * **Bounded.** Every analyzer caps how many candidate objects it examines and reports ``truncated``
   so an on-demand call never scans an entire large system.
-* **Honest gaps.** Where BW alone cannot answer (object -> loading-chain frequency mapping is not
-  cleanly derivable on this landscape; ECC/Tableau/BOBJ metadata lives outside BW), the analyzer
-  records a caveat or an ``unpopulated_reason`` rather than guessing (Rules 2/3).
+* **Honest gaps.** Where BW alone cannot answer (ECC/Tableau/BOBJ metadata lives outside BW; a
+  provider with no resolvable loading chain has no knowable cadence), the analyzer records a caveat
+  or an ``unpopulated_reason`` rather than guessing (Rules 2/3).
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..connectors.base import ConnectorRegistry
+from ..models.chains import FrequencyClass
 from ..models.findings import Finding, ScenarioReport, Severity
 from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
@@ -30,6 +31,7 @@ from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
 from ..repositories.transformations import TransformationsRepository
 from . import latency
+from .load_closure import LoadClosureService, cadence_of
 
 # RSTLOGO endpoint type codes (verified live, B5).
 _CP = "HCPR"  # CompositeProvider
@@ -53,6 +55,7 @@ SCENARIO_TITLES: dict[str, str] = {
 
 _SCAN_CAP = 5000  # hard cap on rows pulled for bulk edge scans
 _MERGED_INBOUND_CAP = 20  # inbound transformations examined per merged DSO for the field matrix
+_CADENCE_CHECK_CAP = 12  # looked-up objects whose cadence is resolved per finding
 _DEEP_STACK_MIN = 2  # >= this many DSO->DSO hops (3+ layers) is the 9.2 "deep stack" shape
 _HIGH_STACK_DEPTH = 3  # >= this many hops escalates a deep-stack finding to high severity
 # 9.1 parses routine source per candidate (RSAABAP), so scanning is budgeted rather than unbounded:
@@ -78,7 +81,10 @@ class Analyzers(Repository):
         self._transformations = TransformationsRepository(connection, capability, cache)
         self._chains = ChainsRepository(connection, capability, cache)
         self._hana = HanaRepository(connection, capability, cache)
+        self._closure = LoadClosureService(connection, capability, cache)
         self._registry: ConnectorRegistry = registry or ConnectorRegistry()
+        # Cadence lookups repeat across findings (many loads read the same master data).
+        self._frequency_cache: dict[str, FrequencyClass] = {}
 
     # --- dispatch ------------------------------------------------------------------------
 
@@ -240,9 +246,9 @@ class Analyzers(Repository):
             target_kind="infoobject",
             limit=limit,
             caveats=[
-                "Sequencing violations by chain are not derivable: on this landscape RSPCVARIANT "
-                "carries no DTP_LOAD linkage, so object -> loading-chain mapping is unavailable. "
-                "Verify load order manually against the chains that load these objects.",
+                "Which chains violate the master-before-transaction order is not asserted here: "
+                "use bw_get_load_closure on each object to compare the loading chains' observed "
+                "cadence and position.",
             ],
             extra_params=[_IOBJ],
         )
@@ -374,12 +380,10 @@ class Analyzers(Repository):
         truncated = evaluated < len(candidates)
         caveats = [
             "Routine table dependencies are a heuristic lower bound (dynamic SQL / FM / method "
-            "calls are not followed).",
-            "The looked-up object's refresh frequency vs. this load's run frequency cannot be "
-            "auto-verified: object -> loading-chain mapping is not derivable on this landscape "
-            "(RSPCVARIANT has no DTP_LOAD linkage). Verify cadence manually per looked-up "
-            "object; the risk is that a load running more than once daily enriches new data "
-            "against master data refreshed less often.",
+            "calls are not followed). Declared lookups are exact.",
+            "Cadence is compared from observed run history (RSPCLOGCHAIN) through the chain -> "
+            "provider closure. A provider whose loading chain cannot be resolved is reported as "
+            "cadence unknown rather than assumed safe.",
         ]
         if no_lookup_count:
             caveats.append(
@@ -463,14 +467,25 @@ class Analyzers(Repository):
             return None  # no resolvable lookup -> no latency contract to evaluate
         all_lookups = declared + [obj for obj in looked_up if obj not in declared]
         delta = self._extractor_constraint(target)
+        cadence = self._cadence_contract(target, all_lookups)
         # A lookup that substitutes a constant on a miss changes data silently instead of failing.
         silent_miss = [
             item["object"] for item in declared_detail if item["miss_behaviour"] == "constant"
         ]
+        stale = cadence["stale_risk_objects"]
+        severity: Severity = "medium"
+        if stale:
+            severity = "high"  # substantiated: consumer runs more often than its input refreshes
+        elif len(all_lookups) >= _MANY_LOOKUPS:
+            severity = "high"
         return Finding(
             scenario="9.1",
-            severity="high" if len(all_lookups) >= _MANY_LOOKUPS else "medium",
-            title="Full-update load reads other objects while loading",
+            severity=severity,
+            title=(
+                "Full-update load enriches against less-frequently-refreshed data"
+                if stale
+                else "Full-update load reads other objects while loading"
+            ),
             affected_objects=[target, *all_lookups],
             evidence=evidence,
             recommendation=(
@@ -501,8 +516,48 @@ class Analyzers(Repository):
                 "silent_miss_lookups": silent_miss,
                 "update_mode": "F",
                 "extractor_delta_method": delta,
+                **cadence,
             },
         )
+
+    def _cadence_contract(self, target: str, lookups: list[str]) -> dict[str, Any]:
+        """Compare the load's observed cadence against each looked-up object's.
+
+        This is the latency contract the scenario is actually about: if the consuming load runs more
+        often than an object it reads is refreshed, the later run enriches new data against stale
+        data. Both cadences come from run history via the chain -> provider closure; an object whose
+        loading chain cannot be resolved is reported ``unknown``, never assumed safe.
+        """
+        consumer = self._governing_frequency(target)
+        stale: list[str] = []
+        unknown: list[str] = []
+        per_object: dict[str, str] = {}
+        for name in lookups[:_CADENCE_CHECK_CAP]:
+            frequency = self._governing_frequency(name)
+            per_object[name] = frequency
+            if frequency == "unknown" or consumer == "unknown":
+                unknown.append(name)
+            elif latency.is_stale_master_risk(consumer, frequency):
+                stale.append(name)
+        return {
+            "consumer_frequency": consumer,
+            "lookup_frequency": per_object,
+            "stale_risk_objects": stale,
+            "cadence_unknown_objects": unknown,
+        }
+
+    def _governing_frequency(self, provider: str) -> FrequencyClass:
+        """Observed cadence of the most frequent chain loading ``provider`` (cached per run)."""
+        if provider in self._frequency_cache:
+            return self._frequency_cache[provider]
+        frequency: FrequencyClass = "unknown"
+        closure = self._closure.provider_to_chains(provider)
+        if not isinstance(closure, UnsupportedResult):
+            governing = cadence_of(closure.loading_chains)
+            if governing is not None:
+                frequency = governing.frequency
+        self._frequency_cache[provider] = frequency
+        return frequency
 
     def _extractor_constraint(self, target: str) -> str | None:
         """Best-effort delta method of the DataSource feeding a full-update target (9.1 case)."""

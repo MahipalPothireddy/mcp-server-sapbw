@@ -28,7 +28,13 @@ from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnectionPool
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
-from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
+from .models.chains import (
+    Chain,
+    ChainRuntimes,
+    ChainSummary,
+    LoadClosure,
+    ScheduleMatrixEntry,
+)
 from .models.diagram import DiagramFormat, DiagramResult
 from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
@@ -53,6 +59,7 @@ from .services.analyzers import Analyzers
 from .services.diagram import build_layout, png_available, render_png, render_svg
 from .services.docgen import DocGenerator, DocGenResult
 from .services.lineage import LineageService
+from .services.load_closure import LoadClosureService
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
@@ -182,6 +189,7 @@ class Runtime(Protocol):
     def hana(self, system: str) -> HanaRepository: ...
     def analyzers(self, system: str) -> Analyzers: ...
     def docgen(self, system: str) -> DocGenerator: ...
+    def load_closure(self, system: str) -> LoadClosureService: ...
 
 
 class ServerRuntime:
@@ -267,6 +275,9 @@ class ServerRuntime:
             self.capability(system),
             registry=ConnectorRegistry(),
         )
+
+    def load_closure(self, system: str) -> LoadClosureService:
+        return LoadClosureService(self._connection(system), self.capability(system))
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -646,6 +657,31 @@ def bw_get_hana_crossings(
     return (
         runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
     )
+
+
+@_readonly_tool
+def bw_get_load_closure(
+    system: str, chain_id: str | None = None, provider: str | None = None
+) -> LoadClosure | UnsupportedResult:
+    """Resolve what a chain loads, or which chains load a provider (with observed cadence).
+
+    Pass exactly one of ``chain_id`` or ``provider``. A chain's loads are walked recursively through
+    its nested sub-chains, since most loads live there rather than in the top-level step list.
+    Provider lookups return each loading chain's observed cadence — including parent chains, whose
+    schedule is what actually governs the load — so "when is this object's data current?" is
+    answerable in one call.
+    """
+    named = [value for value in (chain_id, provider) if value]
+    if len(named) != 1:
+        return UnsupportedResult(
+            missing=[],
+            release=runtime().capability(system).bw_release,
+            detail="pass exactly one of chain_id or provider",
+        )
+    service = runtime().load_closure(system)
+    if chain_id:
+        return service.chain_to_providers(chain_id)
+    return service.provider_to_chains(str(provider))
 
 
 # --- diagram rendering -------------------------------------------------------------------

@@ -17,12 +17,14 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from math import ceil, floor
-from typing import Any
+from statistics import median
+from typing import Any, Literal
 
 from ..core.capabilities import MAX_RUNTIME_WINDOW_DAYS
 from ..core.dialect import like_term
 from ..models.chains import (
     Chain,
+    ChainCadence,
     ChainEdge,
     ChainProcess,
     ChainRuntimes,
@@ -57,6 +59,32 @@ _FREQUENCY_BUCKETS: tuple[tuple[float, FrequencyClass], ...] = (
     (_WEEKLY_RPD, "weekly"),
     (_MONTHLY_RPD, "monthly"),
 )
+
+# Median-gap bands: (inclusive_max_gap_days, label). More robust than runs-per-day for sparse
+# cadences, where a couple of runs in a long window skews the average.
+_GAP_BANDS: tuple[tuple[float, FrequencyClass], ...] = (
+    (1.5, "daily"),
+    (4.0, "irregular"),  # between daily and weekly: no standard cadence
+    (10.0, "weekly"),
+    (24.0, "irregular"),
+    (35.0, "monthly"),
+)
+_LONG_GAP_DAYS = 180.0  # a gap beyond this is effectively annual
+
+# How long a chain may go unrun before it is presumed dormant, per band. A monthly chain needs a
+# far longer window than a daily one, or every monthly chain reads as dead.
+_LIVENESS_WINDOW_DAYS: dict[FrequencyClass, int] = {
+    "hourly": 30,
+    "multiple_daily": 90,
+    "daily": 180,
+    "weekly": 180,
+    "monthly": 395,  # ~13 months, so a yearly-ish monthly chain is not misjudged
+    "irregular": 395,
+    "unknown": 395,
+}
+_INTRADAY_RPD = 1.5  # more than this many runs per run-day means it runs more than once a day
+_MIN_RUNS_FOR_GAP = 2  # a single run yields no gap at all
+_MAX_RUN_DAY_ROWS = 200000  # cap on (chain, run-day) rows pulled for median-gap computation
 
 
 def _parse_bw_timestamp(value: Any) -> datetime | None:
@@ -103,6 +131,44 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     if low == high:
         return ordered[int(rank)]
     return ordered[low] * (high - rank) + ordered[high] * (rank - low)
+
+
+def _classify_cadence(
+    *,
+    median_gap: float | None,
+    runs_per_day: float | None,
+    run_count: int,
+    run_days: int,
+) -> tuple[FrequencyClass, str | None, Literal["high", "low"]]:
+    """Classify observed cadence, returning ``(frequency, note, confidence)``.
+
+    The median gap between run days is the primary signal; runs-per-day only promotes a daily band
+    to ``multiple_daily``/``hourly``. A chain with too few runs to establish a gap is reported as
+    low confidence rather than being forced into a band.
+    """
+    if run_days <= 1:
+        return "unknown", "single run day - too little history to establish a cadence", "low"
+    if median_gap is None or run_count < _MIN_RUNS_FOR_GAP:
+        return "unknown", "insufficient run history to establish a cadence", "low"
+
+    band: FrequencyClass = "irregular"
+    for max_gap, label in _GAP_BANDS:
+        if median_gap <= max_gap:
+            band = label
+            break
+    else:
+        band = "monthly" if median_gap <= _LONG_GAP_DAYS else "irregular"
+
+    note: str | None = None
+    if band == "daily" and runs_per_day is not None:
+        for threshold, label in _FREQUENCY_BUCKETS[:2]:  # hourly, multiple_daily
+            if runs_per_day >= threshold:
+                band = label
+                break
+    if band == "irregular":
+        note = f"median gap {median_gap:.1f}d does not match a standard cadence band"
+    confidence: Literal["high", "low"] = "high" if run_count >= _MIN_RUNS_FOR_FREQ else "low"
+    return band, note, confidence
 
 
 def _classify_frequency(runs_per_day: float | None, run_count: int) -> FrequencyClass:
@@ -580,3 +646,119 @@ class ChainsRepository(Repository):
         runs_per_day = count / span_days if span_days else None
         frequency = _classify_frequency(runs_per_day, count)
         return (round(runs_per_day, 2) if runs_per_day is not None else None), frequency, last
+
+    # --- observed cadence ------------------------------------------------------------------
+
+    def get_cadence(self, chain_ids: list[str] | None = None) -> dict[str, ChainCadence]:
+        """Observed cadence per chain, keyed by chain id.
+
+        Derived entirely from run history (``RSPCLOGCHAIN``): chain *names* are not evidence of
+        schedule, and on real systems they contradict it. Reads one aggregate row per chain plus the
+        distinct run days needed for the median gap.
+        """
+        if not self.capability.is_available("log_chain"):
+            return {}
+        reference = self._reference_date()
+        summaries = self._run_day_summary(chain_ids)
+        run_days = self._distinct_run_days(chain_ids)
+
+        result: dict[str, ChainCadence] = {}
+        for chain_id, (run_count, day_count, first_run, last_run) in summaries.items():
+            days = sorted(run_days.get(chain_id, []))
+            gaps = [(days[i] - days[i - 1]).days for i in range(1, len(days))]
+            median_gap = median(gaps) if gaps else None
+            runs_per_day = (run_count / day_count) if day_count else None
+            frequency, note, confidence = _classify_cadence(
+                median_gap=median_gap,
+                runs_per_day=runs_per_day,
+                run_count=run_count,
+                run_days=day_count,
+            )
+            window = _LIVENESS_WINDOW_DAYS.get(frequency, 395)
+            days_since = (reference - last_run).days if (reference and last_run) else None
+            result[chain_id] = ChainCadence(
+                chain_id=chain_id,
+                frequency=frequency,
+                median_gap_days=round(median_gap, 1) if median_gap is not None else None,
+                runs_per_day=round(runs_per_day, 2) if runs_per_day is not None else None,
+                intraday=bool(runs_per_day and runs_per_day > _INTRADAY_RPD),
+                run_count=run_count,
+                run_days=day_count,
+                first_run=first_run,
+                last_run=last_run,
+                reference_date=reference,
+                days_since_last_run=days_since,
+                liveness_window_days=window,
+                active=(days_since <= window) if days_since is not None else None,
+                confidence=confidence,
+                note=note,
+                provenance=self.provenance("log_chain", {"CHAIN_ID": chain_id}),
+            )
+        return result
+
+    def _reference_date(self) -> date | None:
+        """Latest run date in the system - the only honest 'now' for a copied or frozen system."""
+        rows = self.select(
+            self.dialect.build_select(columns=["MAX(DATUM)"], from_logical="log_chain")
+        )
+        return _date_from_datum(rows[0][0]) if rows and rows[0][0] is not None else None
+
+    def _run_day_summary(
+        self, chain_ids: list[str] | None
+    ) -> dict[str, tuple[int, int, date | None, date | None]]:
+        where, params = self._chain_filter(chain_ids)
+        rows = self.select(
+            self.dialect.build_select(
+                columns=[
+                    "CHAIN_ID",
+                    "COUNT(DISTINCT LOG_ID)",
+                    "COUNT(DISTINCT DATUM)",
+                    "MIN(DATUM)",
+                    "MAX(DATUM)",
+                ],
+                from_logical="log_chain",
+                where=where,
+                params=params,
+                group_by=["CHAIN_ID"],
+            )
+        )
+        out: dict[str, tuple[int, int, date | None, date | None]] = {}
+        for chain_id, run_count, day_count, first_run, last_run in rows:
+            key = str(chain_id).strip()
+            if key:
+                out[key] = (
+                    int(run_count or 0),
+                    int(day_count or 0),
+                    _date_from_datum(first_run),
+                    _date_from_datum(last_run),
+                )
+        return out
+
+    def _distinct_run_days(self, chain_ids: list[str] | None) -> dict[str, list[date]]:
+        where, params = self._chain_filter(chain_ids)
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["CHAIN_ID", "DATUM"],
+                    from_logical="log_chain",
+                    where=where,
+                    params=params,
+                    group_by=["CHAIN_ID", "DATUM"],
+                    order_by=["CHAIN_ID", "DATUM"],
+                ),
+                limit=_MAX_RUN_DAY_ROWS,
+            )
+        )
+        out: dict[str, list[date]] = defaultdict(list)
+        for chain_id, datum in rows:
+            parsed = _date_from_datum(datum)
+            key = str(chain_id).strip()
+            if key and parsed is not None:
+                out[key].append(parsed)
+        return dict(out)
+
+    def _chain_filter(self, chain_ids: list[str] | None) -> tuple[list[str], list[Any]]:
+        if not chain_ids:
+            return [], []
+        placeholders = ", ".join("?" for _ in chain_ids)
+        return [f"CHAIN_ID IN ({placeholders})"], list(chain_ids)
