@@ -184,7 +184,9 @@ class LineageService(Repository):
         nodes: dict[str, LineageNode] = {}
         edges: list[LineageEdge] = []
         edge_keys: set[tuple[str, str, str]] = set()
-        self._ensure_node(nodes, root, "unknown", self.provenance("transformation", {}))
+        self._ensure_node(
+            nodes, root, self._node_type_of(root), self.provenance("transformation", {})
+        )
         visited: set[str] = set()
         queue: deque[tuple[str, int]] = deque([(root, 0)])
         truncated = False
@@ -222,6 +224,47 @@ class LineageService(Repository):
             if include_routine:
                 hops.extend(self._routine_lookup_hops(name))
         return hops
+
+    def _node_type_of(self, name: str) -> LineageNodeType:
+        """The root's own object type, so the graph's centre is never labelled 'unknown'.
+
+        Neighbour types come free with each hop (RSTRAN carries the *other* endpoint's RSTLOGO
+        code), but the root has no inbound hop to learn from. One bounded lookup asks RSTRAN for a
+        row where the object is an endpoint and reads its own type code from that side.
+        """
+        for own_type_col, key_col in (("SOURCETYPE", "SOURCENAME"), ("TARGETTYPE", "TARGETNAME")):
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=[own_type_col],
+                        from_logical="transformation",
+                        where=[f"{key_col} = ?"],
+                        params=[name],
+                    ),
+                    limit=1,
+                )
+            )
+            if rows:
+                code = str(rows[0][0]).strip()
+                resolved = _RSTLOGO_TO_NODE.get(code)
+                if resolved is not None:
+                    return resolved
+        # A CompositeProvider is often an endpoint of nothing (it has no transformations at all).
+        if self.capability.is_available("composite_header"):
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=["HCPRNM"],
+                        from_logical="composite_header",
+                        where=["HCPRNM = ?"],
+                        params=[name],
+                    ),
+                    limit=1,
+                )
+            )
+            if rows:
+                return "compositeprovider"
+        return "unknown"
 
     # --- CompositeProvider part edges (via the generated HANA calc view) ------------------
 

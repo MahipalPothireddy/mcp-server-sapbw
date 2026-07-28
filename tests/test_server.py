@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastmcp import Client
@@ -429,3 +430,34 @@ def test_generate_docs_via_client(tmp_path: Any) -> None:
     assert body["gaps_count"] > 0
     assert (tmp_path / "kb" / "index.md").is_file()
     assert (tmp_path / "kb" / "99-gaps-and-risks.md").is_file()
+
+
+def test_render_lineage_via_client(tmp_path: Any) -> None:
+    """The tool returns displayable image content plus structured completeness metadata."""
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call(
+            "bw_render_lineage",
+            {"system": "qa", "name": "ADSO_T", "depth": 2, "output_dir": str(tmp_path)},
+        )
+    )
+    body = _report_body(result)
+    assert body["root"] == "ADSO_T"
+    assert body["node_count"] >= 1
+    assert body["image_format"] in ("png", "svg")
+    # A vector copy was written where asked.
+    assert body["svg_path"] and Path(body["svg_path"]).is_file()
+    svg = Path(body["svg_path"]).read_text(encoding="utf-8")
+    assert svg.startswith("<svg")
+    # Image content is present for inline display.
+    assert result.content, "no content blocks returned"
+
+
+def test_render_lineage_rejects_absurd_depth() -> None:
+    """Depth is clamped so a diagram request can never fan out without bound."""
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call("bw_render_lineage", {"system": "qa", "name": "ADSO_T", "depth": 9999})
+    )
+    body = _report_body(result)
+    assert body["depth"] <= 8

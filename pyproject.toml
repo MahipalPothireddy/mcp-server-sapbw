@@ -36,6 +36,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Diagram rasterisation. SVG rendering is built in and needs nothing; this extra only adds PNG
+# output for MCP clients that render raster images but not SVG. Pillow draws locally - no diagram
+# content ever leaves the machine (a hosted renderer would exfiltrate customer object names).
+viz = [
+    "pillow>=10.4,<12",
+]
+
 # NOTE: mission Section 10 lists an optional "pyrfc" extra for RFC-based query resolution.
 # It is intentionally NOT declared here: SAP PyRFC is no longer supported and every
 # pyrfc>=2.5 release is yanked on PyPI (see https://github.com/SAP/PyRFC/issues/372), which

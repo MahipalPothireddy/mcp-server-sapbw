@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from fastmcp.utilities.types import Image
 from pydantic import BaseModel, ConfigDict, Field
 
 from .connectors.base import ConnectorRegistry
@@ -27,6 +29,7 @@ from .core.connection import ReadOnlyConnectionPool
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import Chain, ChainRuntimes, ChainSummary, ScheduleMatrixEntry
+from .models.diagram import DiagramFormat, DiagramResult
 from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
@@ -47,10 +50,22 @@ from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
 from .repositories.transformations import TransformationsRepository
 from .services.analyzers import Analyzers
+from .services.diagram import build_layout, png_available, render_png, render_svg
 from .services.docgen import DocGenerator, DocGenResult
 from .services.lineage import LineageService
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
+
+# A diagram deeper than this stops being readable, whatever the lineage service would return.
+_MAX_DIAGRAM_DEPTH = 8
+
+
+def _slug_for_file(name: str) -> str:
+    """Filesystem-safe stem for a written diagram file."""
+    stem = "".join(c if c.isalnum() else "_" for c in name).strip("_")
+    return stem or "object"
+
+
 _MAX_TOOL_NAME = 40
 _MAX_PAGE = 500
 _DEFAULT_PAGE = 100
@@ -631,6 +646,72 @@ def bw_get_hana_crossings(
     return (
         runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
     )
+
+
+# --- diagram rendering -------------------------------------------------------------------
+
+
+@_readonly_tool
+def bw_render_lineage(
+    system: str,
+    name: str,
+    *,
+    direction: LineageDirection = "both",
+    depth: int = 4,
+    image_format: DiagramFormat = "png",
+    output_dir: str | None = None,
+) -> ToolResult:
+    """Render an object's data flow as an image (PNG by default, or SVG).
+
+    Nodes are laid out left-to-right by dependency depth and colour-coded by BW object type;
+    advisory edges (routine-derived, or resolved by naming convention) are dashed so a heuristic
+    never looks like a declared fact, and a truncated graph says so on the canvas. Rendering is
+    entirely local — diagram content never leaves the machine. Returns the image for inline display
+    plus structured metadata; pass ``output_dir`` to also write a vector (SVG) copy.
+    """
+    depth = max(1, min(depth, _MAX_DIAGRAM_DEPTH))
+    graph = runtime().lineage(system).get_lineage(name, direction=direction, depth=depth)
+    if isinstance(graph, UnsupportedResult):
+        return ToolResult(structured_content=graph.model_dump())
+
+    subtitle = f"{direction}, depth {depth} — generated read-only from BW metadata"
+    layout = build_layout(graph, subtitle=subtitle)
+    svg = render_svg(layout)
+    advisory = sum(1 for e in graph.edges if e.confidence == "advisory")
+    caveats = list(graph.caveats)
+
+    svg_path: str | None = None
+    if output_dir:
+        target = Path(output_dir).expanduser() / f"lineage-{_slug_for_file(name)}.svg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(svg, encoding="utf-8")
+        svg_path = str(target)
+
+    png_bytes = render_png(layout) if image_format == "png" else None
+    if image_format == "png" and png_bytes is None:
+        caveats.append(
+            "PNG rendering needs the optional 'viz' extra (pillow); returned SVG markup instead"
+        )
+    result = DiagramResult(
+        root=graph.root_id,
+        direction=direction,
+        depth=depth,
+        image_format="png" if png_bytes else "svg",
+        node_count=graph.node_count,
+        edge_count=graph.edge_count,
+        layer_count=layout.layer_count,
+        advisory_edge_count=advisory,
+        width=layout.width,
+        height=layout.height,
+        truncated=graph.truncated,
+        svg_path=svg_path,
+        png_available=png_available(),
+        caveats=caveats,
+    )
+    content: list[Any] = (
+        [Image(data=png_bytes, format="png")] if png_bytes else [svg]  # SVG travels as text
+    )
+    return ToolResult(content=content, structured_content=result.model_dump())
 
 
 # --- risk-analyzer tools (mission Section 9) ---------------------------------------------
