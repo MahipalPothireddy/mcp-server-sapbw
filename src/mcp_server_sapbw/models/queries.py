@@ -68,6 +68,22 @@ VariableKind = Literal[
     "unknown",
 ]
 
+# How a query came into existence, read from the shape of its technical name (RSZCOMPDIR.COMPID).
+#
+#   designed - authored in Query Designer and given a technical name. A maintained report.
+#   ad_hoc   - COMPID begins "!!". SAP generates that name for a query created directly in the BEx
+#              Analyzer against a provider, without Query Designer; the common case is someone
+#              wanting a quick look at the data. It is a navigation artefact, not a curated report,
+#              so it should not be counted as a consumer when judging whether a provider is used.
+#
+# This is a NAME-SHAPE reading, not a stored flag: BW records no "is this a real report" column. It
+# is therefore reported with its basis so a caller can discount it, and it is never the sole ground
+# for a destructive recommendation.
+QueryOrigin = Literal["designed", "ad_hoc"]
+
+# Filter selector for list operations. "all" preserves the unfiltered result.
+QueryOriginFilter = Literal["all", "designed", "ad_hoc"]
+
 
 class Restriction(BaseModel):
     """A single restriction (RSZRANGE) on an element's InfoObject."""
@@ -159,6 +175,8 @@ class QuerySummary(BaseModel):
     provider: str | None = None
     owner: str | None = None
     last_used: date | None = None
+    # Read from the technical-name shape, not from a stored flag - see QueryOrigin.
+    origin: QueryOrigin = "designed"
     provenance: Provenance | list[Provenance]
 
 

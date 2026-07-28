@@ -15,7 +15,7 @@ from typing import Any
 
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
-from mcp_server_sapbw.repositories.queries import QueriesRepository
+from mcp_server_sapbw.repositories.queries import QueriesRepository, classify_origin
 
 SCHEMA = "TESTSCHEMA"
 _TABLES = {
@@ -98,8 +98,17 @@ class ScriptedConnection:
         if "TSTPNM" in sql:  # header (6 cols)
             ident = str(params[-1])
             return [_HEADER] if ident in (_HEADER[0], _HEADER[1]) else []
-        # list (4 cols): COMPUID, COMPID, OWNER, LASTUSED
-        return [(_HEADER[0], _HEADER[1], _HEADER[2], _HEADER[4])]
+        # list (4 cols): COMPUID, COMPID, OWNER, LASTUSED. Both a Query-Designer query and an
+        # ad-hoc one, so origin classification and the SQL-level filter are both exercised.
+        rows = [
+            (_HEADER[0], _HEADER[1], _HEADER[2], _HEADER[4]),
+            ("Q2UID", "!!1ADHOC", "ANALYST", _HEADER[4]),
+        ]
+        pattern = next((str(p) for p in params if str(p).startswith("!!")), None)
+        if pattern is None:
+            return rows
+        wants_designed = "NOT LIKE" in sql
+        return [r for r in rows if str(r[1]).startswith("!!") is not wants_designed]
 
     @staticmethod
     def _compic(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
@@ -206,6 +215,48 @@ def test_list_queries_and_provider_filter() -> None:
     filtered = repo.list_queries(provider="SALES_CUBE")
     assert not isinstance(filtered, UnsupportedResult)
     assert filtered[1] == 1
+
+
+# --- origin: designed report vs ad-hoc BEx-Analyzer navigation ---------------------------------
+
+
+def _summaries(**kwargs: object) -> list[Any]:
+    result = _repo().list_queries(**kwargs)  # type: ignore[arg-type]
+    assert not isinstance(result, UnsupportedResult)
+    return result[0]
+
+
+def test_designed_query_is_classified_as_designed() -> None:
+    designed = next(s for s in _summaries() if s.compid == "QUERY_SALES")
+    assert designed.origin == "designed"
+
+
+def test_double_bang_prefix_is_classified_as_ad_hoc() -> None:
+    """SAP generates the '!!' name for a query created straight in the BEx Analyzer."""
+    ad_hoc = next(s for s in _summaries() if s.compid == "!!1ADHOC")
+    assert ad_hoc.origin == "ad_hoc"
+
+
+def test_origin_defaults_to_unfiltered() -> None:
+    assert len(_summaries()) == 2
+
+
+def test_designed_filter_excludes_ad_hoc() -> None:
+    names = {s.compid for s in _summaries(origin="designed")}
+    assert names == {"QUERY_SALES"}
+
+
+def test_ad_hoc_filter_returns_only_ad_hoc() -> None:
+    names = {s.compid for s in _summaries(origin="ad_hoc")}
+    assert names == {"!!1ADHOC"}
+
+
+def test_classify_origin_is_a_pure_name_reading() -> None:
+    assert classify_origin("!!ANY") == "ad_hoc"
+    assert classify_origin("NORMAL") == "designed"
+    # A single "!" is not the marker, and a missing name is not evidence of ad-hoc creation.
+    assert classify_origin("!ONE") == "designed"
+    assert classify_origin(None) == "designed"
 
 
 def test_unsupported_without_query_dir() -> None:

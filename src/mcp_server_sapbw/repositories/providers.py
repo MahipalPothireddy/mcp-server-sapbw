@@ -666,7 +666,7 @@ class ProvidersRepository(Repository):
                 limit=_MAX_PART_TABLES,
             )
         )
-        catalog = self._provider_catalog()
+        catalog = self.provider_catalog()
         parts: list[PartProviderRef] = []
         seen: set[str] = set()
         for (base_table,) in rows:
@@ -715,8 +715,12 @@ class ProvidersRepository(Repository):
                     return candidate
         return None
 
-    def _provider_catalog(self) -> dict[str, list[str]]:
-        """Known object names per kind, used to confirm table -> object readings."""
+    def provider_catalog(self) -> dict[str, list[str]]:
+        """Known object names per kind, used to confirm table -> object readings.
+
+        Also the candidate set for consumer analysis, which needs "every persisted provider" rather
+        than one named object. Cached per repository instance.
+        """
         if self._catalog_cache is not None:
             return self._catalog_cache
         catalog: dict[str, list[str]] = {}

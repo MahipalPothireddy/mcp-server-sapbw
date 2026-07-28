@@ -44,7 +44,8 @@ from .models.health import ProviderHealth
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
-from .models.queries import Query, QueryLineage, QuerySummary, QueryUsage
+from .models.queries import Query, QueryLineage, QueryOriginFilter, QuerySummary, QueryUsage
+from .models.register import RoutineRegister
 from .models.sources import EnhancementInventory, SourceTopology
 from .models.transformations import (
     RoutineAnalysis,
@@ -67,6 +68,7 @@ from .services.docgen import DocGenerator, DocGenResult
 from .services.exit_analysis import ExitAnalysisService
 from .services.lineage import LineageService
 from .services.load_closure import LoadClosureService
+from .services.routine_register import RoutineRegisterService
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
@@ -199,6 +201,7 @@ class Runtime(Protocol):
     def load_closure(self, system: str) -> LoadClosureService: ...
     def health(self, system: str) -> HealthRepository: ...
     def sources(self, system: str) -> SourcesRepository: ...
+    def routine_register(self, system: str) -> RoutineRegisterService: ...
     def exit_analysis(
         self, ecc_system: str | None
     ) -> ExitAnalysisService | ConnectorUnavailable: ...
@@ -338,6 +341,9 @@ class ServerRuntime:
             self._connection(system),  # type: ignore[arg-type]
             self.capability(system),
         )
+
+    def routine_register(self, system: str) -> RoutineRegisterService:
+        return RoutineRegisterService(self._connection(system), self.capability(system))
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -628,15 +634,24 @@ def bw_list_queries(
     system: str,
     provider: str | None = None,
     owner: str | None = None,
+    *,
+    origin: QueryOriginFilter = "all",
     limit: int = _DEFAULT_PAGE,
     offset: int = 0,
 ) -> QueryListResult | UnsupportedResult:
-    """BEx queries filtered by provider or owner, paginated with a total_count."""
+    """BEx queries filtered by provider, owner, or origin, paginated with a total_count.
+
+    Every entry carries ``origin``. ``designed`` means authored in Query Designer - a maintained
+    report. ``ad_hoc`` means the technical name is prefixed ``!!``, which SAP generates for a query
+    created straight in the BEx Analyzer; it is a navigation artefact rather than a report, so
+    ``origin="designed"`` is the filter to use when counting real reports. That reading comes from
+    the name's shape, since BW stores no flag for it.
+    """
     limit, offset = _clamp_page(limit, offset)
     result = (
         runtime()
         .queries(system)
-        .list_queries(provider=provider, owner=owner, limit=limit, offset=offset)
+        .list_queries(provider=provider, owner=owner, origin=origin, limit=limit, offset=offset)
     )
     if isinstance(result, UnsupportedResult):
         return result
@@ -908,7 +923,12 @@ def bw_check_schedule_risk(
 def bw_find_layer_violations(
     system: str, max_dso_depth: int = 3, limit: int = _DEFAULT_PAGE
 ) -> ScenarioReport | UnsupportedResult:
-    """Structural anti-patterns: CP->DSO, CP->InfoObject, and over-deep DSO stacks."""
+    """Structural anti-patterns: CP->DSO, CP->InfoObject, deep DSO stacks, and write-back loops.
+
+    Write-back loops are the severe ones: a transformation whose source and target are the same
+    object, or two objects that each feed the other. Both make the loaded result depend on load
+    order, so a failed request cannot simply be re-run, and a cycle has no correct order at all.
+    """
     limit, _ = _clamp_page(limit, 0)
     return (
         runtime()
@@ -918,10 +938,47 @@ def bw_find_layer_violations(
 
 
 @_readonly_tool
+def bw_find_unused_providers(
+    system: str, limit: int = _DEFAULT_PAGE
+) -> ScenarioReport | UnsupportedResult:
+    """Providers nothing maintained depends on - decommission candidates, stated as candidates.
+
+    A provider is reported only when three consumer routes all come up empty: it feeds no
+    transformation, no Query-Designer query reads it, and it is no CompositeProvider part (a
+    CompositeProvider consumes its parts through a generated calc view, not a transformation, so
+    ignoring that route would flag every DSO beneath one). Ad-hoc ``!!`` queries are counted and
+    reported but do not qualify as maintained consumers.
+
+    Consumption from outside BW is not covered here - check ``bw_get_hana_crossings`` before acting.
+    """
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().analyzers(system).find_unused_providers(limit=limit)
+
+
+@_readonly_tool
+def bw_get_routine_register(
+    system: str, limit: int = 50, offset: int = 0, parse_budget: int = 100
+) -> RoutineRegister | UnsupportedResult:
+    """Every transformation routine in the system, ranked by anti-pattern count then size.
+
+    The portfolio view that per-transformation analysis cannot give: the list you work down before
+    an upgrade, or when deciding where a rewrite pays for itself. Line counts and totals cover every
+    routine; pattern detection covers the largest ``parse_budget`` routines, because parsing means
+    reading source. An entry with ``analyzed=false`` has unknown patterns, not none.
+    """
+    limit, offset = _clamp_page(limit, offset)
+    return (
+        runtime()
+        .routine_register(system)
+        .build(limit=limit, offset=offset, parse_budget=parse_budget)
+    )
+
+
+@_readonly_tool
 def bw_review_scenario(
     system: str, scenario: str, limit: int = 50
 ) -> ScenarioReport | UnsupportedResult:
-    """Run one risk scenario by id: 9.1-9.8 or "layer_violations" (mission Section 9)."""
+    """Run one analysis by id: 9.1-9.8, "layer_violations", or "unused_providers"."""
     limit, _ = _clamp_page(limit, 0)
     return runtime().analyzers(system).run_scenario(scenario, limit=limit)
 

@@ -31,6 +31,8 @@ from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
 from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
+from ..repositories.providers import ProvidersRepository
+from ..repositories.queries import QueriesRepository
 from ..repositories.sources import SourcesRepository
 from ..repositories.transformations import TransformationsRepository
 from . import latency
@@ -54,7 +56,10 @@ SCENARIO_TITLES: dict[str, str] = {
     "9.6": "ECC extractor enhancements",
     "9.7": "Downstream report schedules vs. feeding-chain completion",
     "9.8": "Dashboards reading calc views directly (bypassing BW)",
-    "layer_violations": "Structural layer violations (CP->DSO, CP->InfoObject, deep DSO stacks)",
+    "layer_violations": (
+        "Structural layer violations (CP->DSO, CP->InfoObject, deep DSO stacks, write-back loops)"
+    ),
+    "unused_providers": "Providers with no maintained consumer (decommission candidates)",
 }
 
 _SCAN_CAP = 5000  # hard cap on rows pulled for bulk edge scans
@@ -67,6 +72,10 @@ _HIGH_STACK_DEPTH = 3  # >= this many hops escalates a deep-stack finding to hig
 # candidates without a resolvable lookup are skipped, and the scan stops at this many parses.
 _LATENCY_PARSE_BUDGET = 250
 _MANY_LOOKUPS = 3  # >= this many looked-up objects escalates a 9.1 finding to high severity
+# Consumer analysis scans. Queries are read once and bucketed by origin; CompositeProviders are
+# resolved individually (their part list needs the calc-view route), so that scan is kept small.
+_QUERY_CONSUMER_CAP = 5000
+_COMPOSITE_SCAN_CAP = 500
 
 
 def _clean(value: Any) -> str | None:
@@ -119,6 +128,8 @@ class Analyzers(Repository):
         self._hana = HanaRepository(connection, capability, cache)
         self._closure = LoadClosureService(connection, capability, cache)
         self._sources = SourcesRepository(connection, capability, cache)
+        self._providers = ProvidersRepository(connection, capability, cache)
+        self._queries = QueriesRepository(connection, capability, cache)
         self._registry: ConnectorRegistry = registry or ConnectorRegistry()
         # Cadence lookups repeat across findings (many loads read the same master data).
         self._frequency_cache: dict[str, FrequencyClass] = {}
@@ -126,7 +137,7 @@ class Analyzers(Repository):
     # --- dispatch ------------------------------------------------------------------------
 
     def run_scenario(self, scenario: str, *, limit: int = 50) -> ScenarioReport | UnsupportedResult:
-        """Run one scenario by id ("9.1".."9.8" or "layer_violations")."""
+        """Run one analysis by id ("9.1".."9.8", "layer_violations", "unused_providers")."""
         dispatch = {
             "9.1": self.check_load_latency,
             "9.2": self.deep_layer_stacks,
@@ -137,6 +148,7 @@ class Analyzers(Repository):
             "9.7": self.schedule_risk,
             "9.8": self.dashboards_on_calc_views,
             "layer_violations": self.find_layer_violations,
+            "unused_providers": self.find_unused_providers,
         }
         func = dispatch.get(scenario)
         if func is None:
@@ -725,6 +737,170 @@ class Analyzers(Repository):
         walk(root, [root], {root})
         return best
 
+    # --- providers with no maintained consumer -------------------------------------------
+
+    def find_unused_providers(self, *, limit: int = 100) -> ScenarioReport | UnsupportedResult:
+        """Providers nothing maintained depends on: decommission candidates, stated as candidates.
+
+        Three consumer routes are checked, and all three must come up empty:
+
+        1. **Feeds a transformation** - the provider is some transformation's source.
+        2. **Has a designed query** - a query authored in Query Designer reads it. Queries whose
+           technical name marks them ad hoc are counted separately and do not qualify, since a
+           throwaway navigation is not a maintained report.
+        3. **Is a CompositeProvider part** - a CompositeProvider consumes its parts through a
+           generated calc view, not a transformation. Omitting this route would report every DSO
+           under a CompositeProvider as unused, which is the single most likely way this analysis
+           could be wrong.
+
+        What it still cannot see is a consumer outside BW reading the generated table directly.
+        ``bw_get_hana_crossings`` covers that, and the caveat says so. Findings are therefore
+        ``low`` severity and worded as candidates to confirm, never as safe-to-delete.
+        """
+        unsupported = self.require("transformation")
+        if unsupported is not None:
+            return unsupported
+
+        catalog = self._providers.provider_catalog()
+        candidates: list[tuple[str, str]] = [
+            (name, kind) for kind, names in sorted(catalog.items()) for name in names
+        ]
+        if not candidates:
+            return ScenarioReport(
+                scenario="unused_providers",
+                title=SCENARIO_TITLES["unused_providers"],
+                findings=[],
+                analyzed_count=0,
+                caveats=[
+                    "No provider catalogue is available on this release, so no provider could be "
+                    "examined. This is not evidence that every provider is used."
+                ],
+            )
+
+        sources = self._transformation_source_names()
+        designed, ad_hoc = self._query_consumer_names()
+        parts = self._composite_part_names()
+
+        findings: list[Finding] = []
+        for name, kind in candidates:
+            if name in sources or name in designed or name in parts:
+                continue
+            findings.append(self._unused_finding(name, kind, ad_hoc.get(name, 0)))
+            if len(findings) >= limit:
+                break
+        return ScenarioReport(
+            scenario="unused_providers",
+            title=SCENARIO_TITLES["unused_providers"],
+            findings=findings,
+            analyzed_count=len(candidates),
+            truncated=len(findings) >= limit,
+            caveats=[
+                "A provider is reported only when it feeds no transformation, has no "
+                "Query-Designer query, and is no CompositeProvider part. These are candidates to "
+                "confirm, not objects proven safe to delete.",
+                "Consumption from outside BW - a calculation view or reporting tool reading the "
+                "generated table directly - is not covered here. Check bw_get_hana_crossings "
+                "before acting on any of these.",
+                "Ad-hoc queries (technical name prefixed '!!') are reported per provider but do "
+                "not count as maintained consumers; that classification reads the name shape, as "
+                "BW stores no flag for it.",
+                f"{len(designed)} provider(s) have a designed query, {len(parts)} are "
+                f"CompositeProvider parts, and {len(sources)} feed a transformation.",
+            ],
+        )
+
+    def _unused_finding(self, name: str, kind: str, ad_hoc_count: int) -> Finding:
+        detail = (
+            "No transformation reads this provider, no Query-Designer query reports on it, and it "
+            "is not a CompositeProvider part."
+        )
+        recommendation = (
+            "Confirm nothing outside BW reads the generated table, then retire the provider and "
+            "the chain steps that load it. A provider still being loaded but never read costs "
+            "runtime and memory on every run."
+        )
+        if ad_hoc_count:
+            detail += (
+                f" {ad_hoc_count} ad-hoc quer(y/ies) exist against it, so someone has been looking "
+                "at the data directly without a maintained report."
+            )
+            recommendation = (
+                f"Before retiring this, find out who runs the {ad_hoc_count} ad-hoc quer(y/ies) "
+                "against it: an ad-hoc query is often a real reporting need that never got built "
+                "properly. Then confirm nothing outside BW reads the generated table."
+            )
+        return Finding(
+            scenario="unused_providers",
+            severity="low",
+            title="Provider has no maintained consumer",
+            affected_objects=[name],
+            evidence=[self.provenance("transformation", {"SOURCENAME": name, "OBJVERS": "A"})],
+            recommendation=recommendation,
+            detail=detail,
+            metrics={
+                "provider": name,
+                "object_type": kind,
+                "feeds_transformation": False,
+                "has_designed_query": False,
+                "is_composite_part": False,
+                "ad_hoc_query_count": ad_hoc_count,
+            },
+        )
+
+    def _transformation_source_names(self) -> set[str]:
+        rows = self._fetch_transform(
+            ["SOURCENAME"],
+            ["SOURCENAME <> ''"],
+            [],
+            limit=_SCAN_CAP,
+            group_by=["SOURCENAME"],
+            order_by=["SOURCENAME"],
+        )
+        return {name for row in rows if (name := _clean(row[0]))}
+
+    def _query_consumer_names(self) -> tuple[set[str], dict[str, int]]:
+        """``(providers with a designed query, {provider: ad-hoc query count})``."""
+        if not self.capability.is_available("query_provider") or not self.capability.is_available(
+            "query_dir"
+        ):
+            return set(), {}
+        queries = self._queries.list_queries(limit=_QUERY_CONSUMER_CAP)
+        if isinstance(queries, UnsupportedResult):
+            return set(), {}
+        summaries, _total = queries
+        designed: set[str] = set()
+        ad_hoc: dict[str, int] = {}
+        for summary in summaries:
+            provider = summary.provider
+            if not provider:
+                continue
+            if summary.origin == "ad_hoc":
+                ad_hoc[provider] = ad_hoc.get(provider, 0) + 1
+            else:
+                designed.add(provider)
+        return designed, ad_hoc
+
+    def _composite_part_names(self) -> set[str]:
+        """Every provider consumed as a CompositeProvider part (via its generated calc view)."""
+        if not self.capability.is_available("composite_header"):
+            return set()
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["HCPRNM"], from_logical="composite_header", order_by=["HCPRNM"]
+                ),
+                limit=_COMPOSITE_SCAN_CAP,
+            )
+        )
+        parts: set[str] = set()
+        for row in rows:
+            cp_name = _clean(row[0])
+            if cp_name is None:
+                continue
+            resolved, _source, _caveats = self._providers.composite_parts(cp_name)
+            parts.update(part.name for part in resolved if part.name)
+        return parts
+
     # --- 9.6 ECC extractor enhancements (BW heuristic + connector-gated) -----------------
 
     def extractor_enhancements(self, *, limit: int = 50) -> ScenarioReport | UnsupportedResult:
@@ -1028,6 +1204,8 @@ class Analyzers(Repository):
             limit=limit,
         )
         findings += self._deep_stack_violations(max_dso_depth, limit)
+        findings += self._self_loop_violations(limit)
+        findings += self._two_cycle_violations(limit)
         return ScenarioReport(
             scenario="layer_violations",
             title=SCENARIO_TITLES["layer_violations"],
@@ -1036,8 +1214,120 @@ class Analyzers(Repository):
             truncated=len(findings) >= limit,
             caveats=[
                 f"Deep-stack threshold is {max_dso_depth} DSO->DSO hops; adjust via max_dso_depth.",
+                "Write-back detection covers self-loops and two-object cycles. Longer cycles "
+                f"(A->B->C->A) are not searched; the edge scan is capped at {_SCAN_CAP} rows.",
             ],
         )
+
+    # --- write-back loops ------------------------------------------------------------------
+
+    def _self_loop_violations(self, limit: int) -> list[Finding]:
+        """A transformation whose source and target are the same object: a read-write-back loop.
+
+        The load reads the object it writes, so the result depends on how much of the target was
+        already populated when the DTP ran. Re-running it does not reproduce the same data, which is
+        why a failed load cannot simply be repeated.
+        """
+        rows = self._fetch_transform(
+            ["TRANID", "SOURCENAME", "TARGETNAME", "TARGETTYPE"],
+            ["SOURCENAME = TARGETNAME", "SOURCENAME <> ''"],
+            [],
+            limit=limit,
+            order_by=["SOURCENAME", "TRANID"],
+        )
+        findings: list[Finding] = []
+        for tranid, src, _tgt, tgt_type in rows:
+            name = _clean(src)
+            if name is None:
+                continue
+            findings.append(
+                Finding(
+                    scenario="layer_violation",
+                    severity="high",
+                    title="Write-back loop: transformation reads and writes the same object",
+                    affected_objects=[name],
+                    evidence=[
+                        self.provenance("transformation", {"TRANID": str(tranid), "OBJVERS": "A"})
+                    ],
+                    recommendation=(
+                        "Split the read from the write: stage the derived records in a separate "
+                        "object and load from there. Until then, treat this load as non-repeatable "
+                        "and check the target's contents before re-running a failed request."
+                    ),
+                    detail=(
+                        "Source and target are the same object, so the load's output depends on "
+                        "the target's existing contents and re-running it does not reproduce the "
+                        "same result."
+                    ),
+                    metrics={
+                        "tran_id": str(tranid),
+                        "kind": "self_loop",
+                        "object": name,
+                        "object_type": _clean(tgt_type),
+                    },
+                )
+            )
+        return findings
+
+    def _two_cycle_violations(self, limit: int) -> list[Finding]:
+        """Two objects that each feed the other: load order decides the data, and nothing fixes it.
+
+        Detected from the full edge set rather than a per-object walk, so one capped scan finds
+        every pair. Each pair is reported once.
+        """
+        rows = self._fetch_transform(
+            ["TRANID", "SOURCENAME", "TARGETNAME"],
+            ["SOURCENAME <> ''", "TARGETNAME <> ''", "SOURCENAME <> TARGETNAME"],
+            [],
+            limit=_SCAN_CAP,
+            order_by=["SOURCENAME", "TARGETNAME"],
+        )
+        edges: dict[tuple[str, str], str] = {}
+        for tranid, src, tgt in rows:
+            source, target = _clean(src), _clean(tgt)
+            if source and target:
+                edges.setdefault((source, target), str(tranid))
+
+        findings: list[Finding] = []
+        reported: set[tuple[str, str]] = set()
+        for (source, target), tranid in sorted(edges.items()):
+            back = edges.get((target, source))
+            if back is None:
+                continue
+            pair = (source, target) if source < target else (target, source)
+            if pair in reported:
+                continue
+            reported.add(pair)
+            findings.append(
+                Finding(
+                    scenario="layer_violation",
+                    severity="high",
+                    title="Write-back cycle: two objects each feed the other",
+                    affected_objects=list(pair),
+                    evidence=[
+                        self.provenance("transformation", {"TRANID": tranid, "OBJVERS": "A"}),
+                        self.provenance("transformation", {"TRANID": back, "OBJVERS": "A"}),
+                    ],
+                    recommendation=(
+                        "Break the cycle. Decide which object is authoritative for the shared "
+                        "fields and derive the other from it one way, or introduce a third object "
+                        "for the derived values. A cycle has no correct load order, so this cannot "
+                        "be resolved by scheduling."
+                    ),
+                    detail=(
+                        "Transformations exist in both directions between these two objects, so "
+                        "which one holds current data depends on which chain ran last."
+                    ),
+                    metrics={
+                        "kind": "two_cycle",
+                        "objects": list(pair),
+                        "tran_ids": sorted({tranid, back}),
+                    },
+                )
+            )
+            if len(findings) >= limit:
+                break
+        return findings
 
     def _violation_edges(
         self,

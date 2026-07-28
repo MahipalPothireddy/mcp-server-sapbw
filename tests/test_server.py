@@ -34,6 +34,7 @@ from mcp_server_sapbw.services.docgen import DocGenerator
 from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
 from mcp_server_sapbw.services.lineage import LineageService
 from mcp_server_sapbw.services.load_closure import LoadClosureService
+from mcp_server_sapbw.services.routine_register import RoutineRegisterService
 
 _TABLES = {
     "chain_attr": "RSPCCHAINATTR",
@@ -118,6 +119,14 @@ class _Conn:
         if "RSTRANT" in sql:
             return [("E", "Load one", "Load one target set")]
         if "RSAABAP" in sql:
+            if "COUNT(*)" in sql:  # routine-register size aggregate: CODEID, line count
+                return [("CODE1", 3)]
+            if "CODEID IN" in sql:  # routine-register bulk source fetch: CODEID, LINE
+                return [
+                    ("CODE1", "METHOD start."),
+                    ("CODE1", "  SELECT * FROM mara INTO TABLE lt."),
+                    ("CODE1", "ENDMETHOD."),
+                ]
             return [("METHOD start.",), ("  SELECT * FROM mara INTO TABLE lt.",), ("ENDMETHOD.",)]
         if "RSZCOMPDIR" in sql:
             if "TSTPNM" in sql:  # header
@@ -163,10 +172,18 @@ class _Conn:
             or "STARTROUTINE <> ''" in sql
             or "SOURCETYPE = ?" in sql
             or "SOURCETYPE IN ('ODSO', 'ADSO')" in sql
+            # write-back loop scans (self-loop / two-cycle) and the unused-provider source scan
+            or "SOURCENAME = TARGETNAME" in sql
+            or "SOURCENAME <> TARGETNAME" in sql
+            or "GROUP BY" in sql
         ):
             return []
         if "OBJSTAT" in sql:  # get_transformation / get_routine_code header (12 cols)
             return [("ACT", "RSDS", "", "DS_A", "ADSO", "", "ADSO_T", "CODE1", "", "", "", "")]
+        # Routine-register ownership scan: TRANID, endpoints, 5 routine slots. Checked after the
+        # header query, which also selects GLBCODE2 but is identified by OBJSTAT.
+        if "GLBCODE2" in sql:
+            return [("TR1", "DS_A", "ADSO_T", "CODE1", "", "", "", "")]
         if "STARTROUTINE IN" in sql or "TRANID IN" in sql:  # reverse impact search
             return []
         if "SOURCENAME = ?" in sql:  # lineage downstream
@@ -229,6 +246,9 @@ class FakeRuntime:
 
     def sources(self, system: str) -> SourcesRepository:
         return SourcesRepository(_Conn(), self._cap)
+
+    def routine_register(self, system: str) -> RoutineRegisterService:
+        return RoutineRegisterService(_Conn(), self._cap)
 
     def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
         """No source system is configured in the fixture, mirroring a BW-only install."""
@@ -537,3 +557,49 @@ def test_extractor_exit_code_returns_the_inventory_when_configured() -> None:
     assert "src.example.invalid" not in str(body)
     # Source text is opt-in.
     assert body["exits"][0]["source"] is None
+
+
+def test_routine_register_via_client() -> None:
+    """The portfolio register reaches the client with its budget and completeness reported."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(asyncio.run(_call("bw_get_routine_register", {"system": "qa"})))
+    assert body["parse_budget"] > 0
+    assert body["total_routines"] >= 1
+    entry = body["entries"][0]
+    assert entry["code_id"] == "CODE1"
+    assert entry["transformation_id"] == "TR1"
+    assert entry["kind"] == "start"
+    # Provenance cites the row the fact came from.
+    assert entry["provenance"]["source_table"] == "RSAABAP"
+    assert any("lower bound" in c for c in body["caveats"])
+
+
+def test_routine_register_clamps_paging() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_get_routine_register", {"system": "qa", "limit": 99999}))
+    )
+    assert body["limit"] <= 500
+
+
+def test_find_unused_providers_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(asyncio.run(_call("bw_find_unused_providers", {"system": "qa"})))
+    assert body["scenario"] == "unused_providers"
+    # The external-consumption gap must be stated wherever this is surfaced.
+    assert any("bw_get_hana_crossings" in c for c in body["caveats"])
+
+
+def test_list_queries_exposes_origin() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(asyncio.run(_call("bw_list_queries", {"system": "qa"})))
+    assert body["items"]
+    assert all(item["origin"] in ("designed", "ad_hoc") for item in body["items"])
+
+
+def test_review_scenario_accepts_unused_providers() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_review_scenario", {"system": "qa", "scenario": "unused_providers"}))
+    )
+    assert body["scenario"] == "unused_providers"

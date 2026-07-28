@@ -83,6 +83,12 @@ class ScriptedConnection:
             or "STARTROUTINE <> ''" in sql
             or "SOURCENAME = ?" in sql
             or "TARGETNAME = ?" in sql
+            # write-back loop scans (self-loop / two-cycle) and the unused-provider source scan
+            or "SOURCENAME = TARGETNAME" in sql
+            or "SOURCENAME <> TARGETNAME" in sql
+            or "GROUP BY" in sql
+            # routine-register ownership scan (selects the five header routine columns)
+            or "GLBCODE2" in sql
         ):
             return []
         return [("TR1", "RSDS", "DS1", "ODSO", "DSO1", "", "", "")]  # list (8 cols)

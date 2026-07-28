@@ -25,6 +25,8 @@ from ..models.queries import (
     QueryElement,
     QueryElementEdge,
     QueryLineage,
+    QueryOrigin,
+    QueryOriginFilter,
     QuerySummary,
     QueryUsage,
     QueryVariable,
@@ -58,6 +60,16 @@ _LAYTP_TO_ROLE: dict[str, ElementRole] = {
     "NAV": "navigation",
     "AGG": "aggregated",
 }
+# SAP's technical-name prefix for a query created ad hoc in the BEx Analyzer rather than in Query
+# Designer. See models.queries.QueryOrigin for what this does and does not establish.
+_AD_HOC_PREFIX = "!!"
+
+
+def classify_origin(compid: str | None) -> QueryOrigin:
+    """Classify a query by the shape of its technical name. Name-based, never a stored flag."""
+    return "ad_hoc" if compid is not None and compid.startswith(_AD_HOC_PREFIX) else "designed"
+
+
 _VPROCTP_TO_TYPE: dict[str, VariableProcessingType] = {
     "1": "replacement_path",
     "3": "customer_exit",
@@ -128,6 +140,7 @@ class QueriesRepository(Repository):
         *,
         provider: str | None = None,
         owner: str | None = None,
+        origin: QueryOriginFilter = "all",
         limit: int = 100,
         offset: int = 0,
     ) -> tuple[list[QuerySummary], int] | UnsupportedResult:
@@ -144,6 +157,14 @@ class QueriesRepository(Repository):
         if owner:
             where.append("OWNER = ?")
             params.append(owner)
+        # Parameterised rather than an inline literal. "!" is not a LIKE metacharacter and is not
+        # the dialect's escape character, so the pattern needs no escaping.
+        if origin == "designed":
+            where.append("COMPID NOT LIKE ?")
+            params.append(f"{_AD_HOC_PREFIX}%")
+        elif origin == "ad_hoc":
+            where.append("COMPID LIKE ?")
+            params.append(f"{_AD_HOC_PREFIX}%")
         if provider:
             compuids = self._compuids_for_provider(provider)
             if not compuids:
@@ -168,14 +189,16 @@ class QueriesRepository(Repository):
         summaries: list[QuerySummary] = []
         for compuid, compid, owner_val, lastused in rows:
             cu = str(compuid)
+            name = _clean(compid)
             summaries.append(
                 QuerySummary(
                     compuid=cu,
-                    compid=_clean(compid),
+                    compid=name,
                     description=texts.get(cu, (None, None))[1] or texts.get(cu, (None, None))[0],
                     provider=providers.get(cu),
                     owner=_clean(owner_val),
                     last_used=_timestamp_to_date(lastused),
+                    origin=classify_origin(name),
                     provenance=self.provenance("query_dir", {"COMPUID": cu, "OBJVERS": "A"}),
                 )
             )

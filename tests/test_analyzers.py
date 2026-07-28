@@ -100,6 +100,16 @@ _DSO_EDGES = [
 _INBOUND = {
     "MERGE_DSO": [("TR_M1", "ORD_DSO"), ("TR_M2", "BILL_DSO"), ("TR_M3", "SHIP_DSO")],
 }
+# Write-back shapes. SELF_DSO is written from itself; A_DSO and B_DSO each feed the other.
+# TRANID, SOURCENAME, TARGETNAME, TARGETTYPE
+_SELF_LOOPS = [("TR_SELF", "SELF_DSO", "SELF_DSO", "ODSO")]
+# Every source <> target edge, which is what the two-cycle scan reads.
+_ALL_EDGES = [
+    ("TR_AB", "A_DSO", "B_DSO"),
+    ("TR_BA", "B_DSO", "A_DSO"),
+    ("TR_M1", "ORD_DSO", "MERGE_DSO"),  # one-way: must not be reported
+    ("TR_L1", "L1_DSO", "L2_DSO"),
+]
 
 
 class ScriptedConnection:
@@ -149,6 +159,10 @@ class ScriptedConnection:
             # Guard: an aggregate select is only valid with a GROUP BY (HANA rejects it otherwise);
             # returning [] when it is missing makes the offline test catch that regression.
             return _MERGED_GROUP if "GROUP BY" in sql else []
+        if "SOURCENAME = TARGETNAME" in sql:  # write-back self-loops
+            return _SELF_LOOPS
+        if "SOURCENAME <> TARGETNAME" in sql:  # write-back cycle scan (all edges)
+            return _ALL_EDGES
         if "STARTROUTINE <> ''" in sql:  # 9.1 routine-bearing transformations into DSOs
             return [("TR_FULL", "FULL_DSO"), ("TR_MANY", "FULL_DSO"), ("TR_NONE", "FULL_DSO")]
         if "SOURCETYPE IN ('ODSO', 'ADSO')" in sql:  # DSO->DSO edges (9.2 / layer)
@@ -442,3 +456,55 @@ def test_source_system_outage_degrades_to_bw_only_evidence() -> None:
     assert not isinstance(report, UnsupportedResult)
     # The BW-side finding still stands; it simply carries no exit evidence.
     assert _finding_for(report, "DS_ENH").metrics["customer_field_count"] == 5
+
+
+# --- write-back loops in the layer-violation analyzer -----------------------------------------
+
+
+def _violations() -> Any:
+    report = _analyzers().find_layer_violations()
+    assert not isinstance(report, UnsupportedResult)
+    return report
+
+
+def _by_kind(report: Any, kind: str) -> list[Any]:
+    return [f for f in report.findings if f.metrics.get("kind") == kind]
+
+
+def test_self_loop_is_reported_as_high_severity() -> None:
+    """A transformation reading and writing the same object makes its own load non-repeatable."""
+    findings = _by_kind(_violations(), "self_loop")
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.affected_objects == ["SELF_DSO"]
+    assert finding.severity == "high"
+    assert "re-running" in finding.detail
+    assert finding.evidence[0].source_key["TRANID"] == "TR_SELF"
+
+
+def test_two_cycle_is_reported_once_with_both_transformations() -> None:
+    findings = _by_kind(_violations(), "two_cycle")
+    assert len(findings) == 1  # the pair, not one finding per direction
+    finding = findings[0]
+    assert finding.affected_objects == ["A_DSO", "B_DSO"]  # deterministic order
+    assert finding.severity == "high"
+    assert finding.metrics["tran_ids"] == ["TR_AB", "TR_BA"]
+    assert len(finding.evidence) == 2
+
+
+def test_one_way_edges_are_not_cycles() -> None:
+    objects = {obj for f in _by_kind(_violations(), "two_cycle") for obj in f.affected_objects}
+    assert "MERGE_DSO" not in objects
+    assert "L2_DSO" not in objects
+
+
+def test_cycle_scope_is_declared() -> None:
+    assert any("Longer cycles" in c for c in _violations().caveats)
+
+
+def test_existing_layer_violations_still_reported() -> None:
+    """Adding write-back detection must not displace the CP->DSO / deep-stack findings."""
+    report = _violations()
+    titles = {f.title for f in report.findings}
+    assert any("CompositeProvider -> DSO" in t for t in titles)
+    assert any("DSO stack" in t or "stack" in t.lower() for t in titles)
