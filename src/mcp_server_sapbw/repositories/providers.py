@@ -7,9 +7,11 @@ lists its fields, resolves MultiProvider parts, and attaches a labelled descript
 generated). Each variant is capability-gated: an absent table yields ``UnsupportedResult`` rather
 than a guess. Objects whose tables exist but that are not found yield ``ObjectNotFound``.
 
-CompositeProvider part-provider composition lives in RSOHCPR.XML_DEF (XML) with no relational part
-table; parsing it is deferred to the lineage build (B6), so ``part_providers`` is empty for a
-CompositeProvider here and a caveat says exactly that (never implying it has no parts).
+CompositeProvider part-provider composition has no relational part table. It is resolved here by two
+routes: ``RSOHCPR.XML_DEF`` when populated, else the base tables of the HANA calc view BW generates
+for the provider (the route that works when XML_DEF is empty, which is common). An empty XML_DEF is
+reported as a finding, and a composition that could not be derived at all stays empty with a caveat
+saying so — never implying a CompositeProvider has no parts.
 """
 
 from __future__ import annotations
@@ -25,10 +27,39 @@ from ..models.providers import (
     Provider,
     ProviderField,
     ProviderType,
+    classify_cube_type,
 )
 from ..services.descriptions import DescriptionService
+from ..services.table_resolver import (
+    ResolvedKind,
+    calc_view_patterns,
+    is_hierarchy_view,
+    resolve_table,
+)
 from .base import Repository
 from .texts import TextsRepository, TextTableSpec
+
+# HANA schema holding generated BW calc views.
+_CALC_SCHEMA = "_SYS_BIC"
+# SYS.OBJECT_DEPENDENCIES.DEPENDENCY_TYPE: 1 = direct, 2 = transitive.
+#
+# Part-provider resolution needs TRANSITIVE. Verified live: BW layers a CompositeProvider's calc
+# view over intermediate views, so its *direct* table dependencies are only the master-data side
+# tables of its navigation attributes (0 part-provider candidates across every sample), while the
+# part providers' active tables appear one or more hops down as transitive dependencies. Scoping
+# the scan to a single named view keeps this cheap (tens of rows), unlike a system-wide type-2 scan.
+_TRANSITIVE_DEPENDENCY = 2
+_MAX_PART_TABLES = 400  # transitive closure of one view; bounded, and reported when hit
+_MAX_CATALOG = 20000  # provider-name catalogue used to confirm table -> object readings
+
+# Table-resolver kind -> provider type vocabulary.
+_KIND_TO_PROVIDER_TYPE: dict[ResolvedKind, ProviderType | None] = {
+    "dso": "dso",
+    "adso": "adso",
+    "infocube": "infocube",
+    "infoobject": "infoobject",
+    "unknown": None,
+}
 
 # Per-type text-table wiring (see B4 discovery: classic RSD*T vs HANA RSO*T shapes).
 _TEXT_SPECS: dict[ProviderType, TextTableSpec] = {
@@ -49,12 +80,6 @@ _TYPE_LABEL: dict[ProviderType, str] = {
     "virtualprovider": "VirtualProvider",
     "compositeprovider": "CompositeProvider",
     "infoobject": "InfoObject",
-}
-
-_CUBETYPE_TO_PROVIDER: dict[str, ProviderType] = {
-    "B": "infocube",
-    "M": "multiprovider",
-    "V": "virtualprovider",
 }
 
 _IOBJTP_TO_KIND: dict[str, InfoObjectKind] = {
@@ -124,6 +149,8 @@ class ProvidersRepository(Repository):
         super().__init__(connection, capability, cache)
         self._texts = TextsRepository(connection, capability, cache)
         self._descriptions = DescriptionService()
+        # Provider-name catalogue, loaded once per instance to confirm table -> object readings.
+        self._catalog_cache: dict[str, list[str]] | None = None
 
     # --- entry point ---------------------------------------------------------------------
 
@@ -319,7 +346,7 @@ class ProvidersRepository(Repository):
         if not header:
             return None
         cubetype, objstat, info_area, owner, appl = header[0]
-        provider_type = _CUBETYPE_TO_PROVIDER.get(str(cubetype).strip(), "infocube")
+        provider_type = classify_cube_type(cubetype)
         fields = self._cube_fields(name)
         parts: list[PartProviderRef] = []
         composition: str = "none"
@@ -420,13 +447,14 @@ class ProvidersRepository(Repository):
         spec = _TEXT_SPECS["compositeprovider"]
         field_desc = self._texts.field_texts(spec, name)
         fields = self._fields_from_texts("composite_text", "HCPRNM", name, field_desc, [])
+        parts, composition, caveats = self.composite_parts(name)
         description = self._describe(
             "compositeprovider",
             name,
             info_area=_clean(info_area),
             key_names=[],
             field_count=len(fields),
-            part_count=0,
+            part_count=len(parts),
             evidence_tables=["composite_header", "composite_text"],
         )
         return Provider(
@@ -437,12 +465,9 @@ class ProvidersRepository(Repository):
             owner=_clean(owner),
             application=_clean(appl),
             fields=fields,
-            part_providers=[],
-            composition_source="none",
-            caveats=[
-                "part-provider composition is stored in RSOHCPR.XML_DEF (XML) and is not yet "
-                "parsed; part_providers is empty here (deferred to the lineage build, B6)"
-            ],
+            part_providers=parts,
+            composition_source=composition,  # type: ignore[arg-type]
+            caveats=caveats,
             description=description,
             provenance=[self.provenance("composite_header", {"HCPRNM": name, "OBJVERS": "A"})],
         )
@@ -534,3 +559,182 @@ class ProvidersRepository(Repository):
         return self._descriptions.build(
             technical_name=name, stored=stored, generated_summary=summary, evidence=evidence
         )
+
+    # --- CompositeProvider composition ---------------------------------------------------
+
+    def composite_parts(self, name: str) -> tuple[list[PartProviderRef], str, list[str]]:
+        """Resolve a CompositeProvider's part providers.
+
+        Two routes, tried in order:
+
+        1. **XML** — ``RSOHCPR.XML_DEF``. Probed first because when it *is* populated it is the
+           authoritative, declared composition.
+        2. **Generated calc view** — every activated CompositeProvider generates a calc view in
+           ``_SYS_BIC``; its base tables (from ``SYS.OBJECT_DEPENDENCIES``) resolve back to the part
+           providers by BW's table-naming convention. This is the route that works on systems where
+           ``XML_DEF`` is empty, which is common (confirmed live: empty on the reference system,
+           with no CompositeProvider rows in ``RSDCUBEMULTI`` either).
+
+        Returns ``(parts, composition_source, caveats)``. An empty XML_DEF is reported as a finding
+        in the caveats rather than silently ignored.
+        """
+        caveats: list[str] = []
+        xml_present = self._composite_xml_present(name)
+        if xml_present is False:
+            caveats.append(
+                "RSOHCPR.XML_DEF is empty for this CompositeProvider, so the declared XML "
+                "composition is unavailable; parts were resolved from the generated HANA calc "
+                "view's base tables instead"
+            )
+        elif xml_present is None:
+            caveats.append("RSOHCPR.XML_DEF could not be read; XML composition not attempted")
+
+        parts, view_caveats = self._composite_parts_via_calc_view(name)
+        caveats.extend(view_caveats)
+        if parts:
+            if any(p.confidence == "advisory" for p in parts):
+                caveats.append(
+                    "part providers marked advisory were resolved by table-naming convention "
+                    "only (not confirmed against the provider catalogue)"
+                )
+            return parts, "calc_view", caveats
+
+        caveats.append(
+            "part-provider composition could not be derived from RSOHCPR.XML_DEF or from a "
+            "generated calc view; part_providers is empty but the CompositeProvider almost "
+            "certainly has parts (treat as a gap, not as 'no parts')"
+        )
+        return [], "none", caveats
+
+    def _composite_xml_present(self, name: str) -> bool | None:
+        """Whether ``RSOHCPR.XML_DEF`` holds a definition (``None`` when it cannot be read)."""
+        if not self.capability.is_available("composite_header"):
+            return None
+        try:
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["LENGTH(XML_DEF)"],
+                    from_logical="composite_header",
+                    where=["HCPRNM = ?"],
+                    params=[name],
+                )
+            )
+        except Exception:
+            return None  # column absent on this release, or LOB not readable this way
+        if not rows or rows[0][0] is None:
+            return False
+        try:
+            return int(rows[0][0]) > 0
+        except (TypeError, ValueError):
+            return None  # unexpected shape; report "unknown" rather than guessing
+
+    def _composite_parts_via_calc_view(self, name: str) -> tuple[list[PartProviderRef], list[str]]:
+        """Resolve parts from the base tables of the CompositeProvider's generated calc view."""
+        if not (
+            self.capability.is_available("hana_views")
+            and self.capability.is_available("object_dependencies")
+        ):
+            return [], [
+                "HANA catalog views are unavailable, so the calc-view route to part providers "
+                "could not be used"
+            ]
+        view = self._generated_calc_view(name)
+        if view is None:
+            return [], [f"no generated calc view was found for CompositeProvider {name}"]
+
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["DISTINCT BASE_OBJECT_NAME"],
+                    from_logical="object_dependencies",
+                    where=[
+                        "DEPENDENT_SCHEMA_NAME = ?",
+                        "DEPENDENT_OBJECT_NAME = ?",
+                        "BASE_SCHEMA_NAME = ?",
+                        "BASE_OBJECT_TYPE = ?",
+                        "DEPENDENCY_TYPE = ?",
+                    ],
+                    params=[
+                        _CALC_SCHEMA,
+                        view,
+                        self.capability.abap_schema,
+                        "TABLE",
+                        _TRANSITIVE_DEPENDENCY,
+                    ],
+                    order_by=["BASE_OBJECT_NAME"],
+                ),
+                limit=_MAX_PART_TABLES,
+            )
+        )
+        catalog = self._provider_catalog()
+        parts: list[PartProviderRef] = []
+        seen: set[str] = set()
+        for (base_table,) in rows:
+            table = str(base_table).strip()
+            if not table:
+                continue
+            resolved = resolve_table(table, catalog)
+            if not resolved.is_part_provider_candidate or resolved.object_name is None:
+                continue  # master-data side tables and unreadable names are not part providers
+            if resolved.object_name in seen:
+                continue
+            seen.add(resolved.object_name)
+            parts.append(
+                PartProviderRef(
+                    name=resolved.object_name,
+                    part_type=_KIND_TO_PROVIDER_TYPE.get(resolved.kind),
+                    via_table=table,
+                    confidence=resolved.confidence,
+                    provenance=self.provenance(
+                        "object_dependencies",
+                        {"DEPENDENT_OBJECT_NAME": view, "BASE_OBJECT_NAME": table},
+                    ),
+                )
+            )
+        parts.sort(key=lambda p: p.name)
+        return parts, []
+
+    def _generated_calc_view(self, provider: str) -> str | None:
+        """Find the ``_SYS_BIC`` calc view BW generated for a provider (shortest match wins)."""
+        for pattern in calc_view_patterns(provider):
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=["VIEW_NAME"],
+                        from_logical="hana_views",
+                        where=["SCHEMA_NAME = ?", "VIEW_NAME LIKE ?"],
+                        params=[_CALC_SCHEMA, pattern],
+                        order_by=["LENGTH(VIEW_NAME)", "VIEW_NAME"],
+                    ),
+                    limit=5,
+                )
+            )
+            for (view_name,) in rows:
+                candidate = str(view_name).strip()
+                if candidate and not is_hierarchy_view(candidate):
+                    return candidate
+        return None
+
+    def _provider_catalog(self) -> dict[str, list[str]]:
+        """Known object names per kind, used to confirm table -> object readings."""
+        if self._catalog_cache is not None:
+            return self._catalog_cache
+        catalog: dict[str, list[str]] = {}
+        for kind, logical, column in (
+            ("dso", "dso_header", "ODSOBJECT"),
+            ("adso", "adso_header", "ADSONM"),
+            ("infocube", "cube_header", "INFOCUBE"),
+        ):
+            if not self.capability.is_available(logical):
+                continue
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=[column], from_logical=logical, order_by=[column]
+                    ),
+                    limit=_MAX_CATALOG,
+                )
+            )
+            catalog[kind] = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
+        self._catalog_cache = catalog
+        return catalog

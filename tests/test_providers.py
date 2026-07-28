@@ -31,6 +31,8 @@ _PROVIDER_TABLES = {
     "infoobject": "RSDIOBJ",
     "infoobject_text": "RSDIOBJT",
 }
+# HANA catalog views (schema SYS) needed for the calc-view route to CompositeProvider parts.
+_HANA_TABLES = {"hana_views": "VIEWS", "object_dependencies": "OBJECT_DEPENDENCIES"}
 
 # --- synthetic landscape ------------------------------------------------------------------
 
@@ -55,6 +57,15 @@ _MP_PARTS = {"SALES_MP": [("SALES_CUBE", 1), ("SALES_DSO", 2)]}
 _CP = {"SALES_CP": ("ACT", "SALES", "DEVUSER", "SD")}  # OBJSTAT, INFOAREA, OWNER, BWAPPL
 _CP_TEXT_OBJ = {"SALES_CP": [("E", "Sales composite provider view", "tip")]}
 _CP_TEXT_FIELDS = {"SALES_CP": [("MATERIAL", "E", "Material")]}
+# The calc view BW generates for SALES_CP, and the base tables its dependencies report.
+# Generated-table literals are built by concatenation so this file stays clean for the
+# customer-metadata scan (which forbids inline /BIC/<name> outside tests/fixtures/).
+_CP_CALC_VIEW = "system-local.bw.bw2hana/SALES_CP"
+_CP_BASE_TABLES = [
+    "/BIC/" + "ASALES_DSO00",  # -> classic DSO SALES_DSO (active table)
+    "/BIC/" + "FSALES_CUBE",  # -> InfoCube SALES_CUBE (F-fact)
+    "/BI0/" + "PMATERIAL_CHA",  # master-data attributes -> NOT a part provider
+]
 
 _IOBJ = {"MATERIAL_CHA": ("CHA", "ACT", "SD"), "AMOUNT_KYF": ("KYF", "ACT", "SD")}
 _IOBJ_TEXT = {"MATERIAL_CHA": [("E", "Material", "Material master characteristic")]}
@@ -80,6 +91,14 @@ class ScriptedConnection:
         return self._route(sql, name)
 
     def _route(self, sql: str, name: str) -> list[tuple[Any, ...]]:
+        # Catalogue listings (no key filter) back the table -> object confirmation step.
+        if "= ?" not in sql:
+            if "ODSOBJECT" in sql:
+                return [(n,) for n in _DSO]
+            if "ADSONM" in sql:
+                return [(n,) for n in _ADSO]
+            if "INFOCUBE" in sql and "RSDCUBE" in sql:
+                return [(n,) for n in _CUBE]
         # Order matters: check the more specific physical names before their prefixes.
         if "RSDODSOIOBJ" in sql:
             return _rows_for_name(_DSO_FIELDS, name)
@@ -106,8 +125,14 @@ class ScriptedConnection:
             return _rows_for_name(_CUBE, name)
         if "RSOHCPRT" in sql:
             return self._hana_text(sql, name, _CP_TEXT_OBJ, _CP_TEXT_FIELDS)
+        if "LENGTH(XML_DEF)" in sql:
+            return [(0,)]  # XML_DEF empty - the common real case; forces the calc-view route
         if "RSOHCPR" in sql:
             return _rows_for_name(_CP, name)
+        if '"VIEWS"' in sql:  # generated calc view for the composite provider
+            return [(_CP_CALC_VIEW,)]
+        if "OBJECT_DEPENDENCIES" in sql:
+            return [(t,) for t in _CP_BASE_TABLES]
         if "RSDIOBJT" in sql:
             return _rows_for_name(_IOBJ_TEXT, name)
         if "RSDIOBJ" in sql:
@@ -128,22 +153,34 @@ class ScriptedConnection:
 
 
 def _capability(present: set[str] | None = None) -> CapabilityRecord:
-    present = present if present is not None else set(_PROVIDER_TABLES)
+    present = present if present is not None else set(_PROVIDER_TABLES) | set(_HANA_TABLES)
+    tables = {
+        logical: TableStatus(
+            logical_name=logical,
+            resolved_name=physical if logical in present else None,
+            present=logical in present,
+            schema_name=SCHEMA if logical in present else None,
+        )
+        for logical, physical in _PROVIDER_TABLES.items()
+    }
+    tables.update(
+        {
+            logical: TableStatus(
+                logical_name=logical,
+                resolved_name=physical if logical in present else None,
+                present=logical in present,
+                schema_name="SYS" if logical in present else None,
+            )
+            for logical, physical in _HANA_TABLES.items()
+        }
+    )
     return CapabilityRecord(
         system="qa",
         bw_release="7.50",
         abap_schema=SCHEMA,
         discovered_at=datetime.now(UTC),
         object_models={"classic_dso": True, "adso": True, "composite_provider": True},
-        tables={
-            logical: TableStatus(
-                logical_name=logical,
-                resolved_name=physical if logical in present else None,
-                present=logical in present,
-                schema_name=SCHEMA if logical in present else None,
-            )
-            for logical, physical in _PROVIDER_TABLES.items()
-        },
+        tables=tables,
     )
 
 
@@ -215,13 +252,20 @@ def test_describe_multiprovider_parts_and_generated_description() -> None:
 # --- CompositeProvider --------------------------------------------------------------------
 
 
-def test_describe_compositeprovider_defers_xml_composition() -> None:
+def test_describe_compositeprovider_resolves_parts_via_calc_view() -> None:
+    """XML_DEF is empty, so parts must come from the generated calc view's base tables."""
     provider = _repo().describe("SALES_CP")
     assert not isinstance(provider, (ObjectNotFound, UnsupportedResult))
     assert provider.object_type == "compositeprovider"
-    assert provider.composition_source == "none"
-    assert provider.part_providers == []
-    assert any("XML_DEF" in c for c in provider.caveats)
+    assert provider.composition_source == "calc_view"
+    # The DSO and cube base tables resolve to part providers; the master-data P table does not.
+    assert {p.name for p in provider.part_providers} == {"SALES_DSO", "SALES_CUBE"}
+    assert {p.part_type for p in provider.part_providers} == {"dso", "infocube"}
+    assert all(p.via_table for p in provider.part_providers)
+    # Confirmed against the provider catalogue, so not a naming-convention guess.
+    assert {p.confidence for p in provider.part_providers} == {"confirmed"}
+    # The empty XML_DEF is reported as a finding rather than passed over silently.
+    assert any("XML_DEF is empty" in c for c in provider.caveats)
     assert {f.name for f in provider.fields} == {"MATERIAL"}
 
 

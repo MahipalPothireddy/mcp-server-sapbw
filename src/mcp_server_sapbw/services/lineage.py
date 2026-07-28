@@ -31,7 +31,9 @@ from ..models.lineage import (
 )
 from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
+from ..repositories.providers import ProvidersRepository
 from ..repositories.transformations import TransformationsRepository
+from .table_resolver import candidate_tables, provider_from_calc_view
 
 # RSTLOGO type code -> lineage node type.
 _RSTLOGO_TO_NODE: dict[str, LineageNodeType] = {
@@ -44,7 +46,23 @@ _RSTLOGO_TO_NODE: dict[str, LineageNodeType] = {
     "HCPR": "compositeprovider",
     "IOBJ": "infoobject",
 }
+# Provider-type vocabulary -> lineage node type (for calc-view-resolved part providers).
+_PROVIDER_TYPE_TO_NODE: dict[str, LineageNodeType] = {
+    "dso": "dso",
+    "adso": "adso",
+    "infocube": "cube",
+    "multiprovider": "multiprovider",
+    "compositeprovider": "compositeprovider",
+    "infoobject": "infoobject",
+}
 _UPDMODE_MAP: dict[str, UpdateMode] = {"F": "full", "D": "delta", "I": "init"}
+
+# HANA schema holding generated BW calc views. Part-provider edges need TRANSITIVE dependencies
+# (type 2): BW layers a CompositeProvider's calc view over intermediate views, so a part provider's
+# active table is never a *direct* dependency of it (verified live). Bounded by the table filter.
+_CALC_SCHEMA = "_SYS_BIC"
+_TRANSITIVE_DEPENDENCY = 2
+_MAX_COMPOSITE_CONSUMERS = 50
 
 _MAX_NODES = 400
 _MAX_DEPTH = 12
@@ -74,6 +92,7 @@ class LineageService(Repository):
     def __init__(self, connection: Any, capability: Any, cache: Any = None) -> None:
         super().__init__(connection, capability, cache)
         self._transformations = TransformationsRepository(connection, capability, cache)
+        self._providers = ProvidersRepository(connection, capability, cache)
 
     # --- public API ----------------------------------------------------------------------
 
@@ -196,10 +215,102 @@ class LineageService(Repository):
         hops: list[_Hop] = []
         if direction in ("downstream", "both"):
             hops.extend(self._declared_hops(name, downstream=True))
+            hops.extend(self._composite_consumer_hops(name))
         if direction in ("upstream", "both"):
             hops.extend(self._declared_hops(name, downstream=False))
+            hops.extend(self._composite_part_hops(name))
             if include_routine:
                 hops.extend(self._routine_lookup_hops(name))
+        return hops
+
+    # --- CompositeProvider part edges (via the generated HANA calc view) ------------------
+
+    def _composite_part_hops(self, name: str) -> list[_Hop]:
+        """If ``name`` is a CompositeProvider, the part providers that feed it.
+
+        A CompositeProvider persists nothing and has no inbound transformation, so without this its
+        upstream lineage is a dead end. Parts come from the base tables of its generated calc view
+        (RSOHCPR.XML_DEF is commonly empty). Resolution is naming-convention based -> advisory.
+        """
+        if not self.capability.is_available("composite_header"):
+            return []
+        parts = self._providers.composite_parts(name)[0]
+        hops: list[_Hop] = []
+        for part in parts:
+            hops.append(
+                _Hop(
+                    part.name,
+                    _PROVIDER_TYPE_TO_NODE.get(part.part_type or "", "unknown"),
+                    LineageEdge(
+                        src=part.name,
+                        dst=name,
+                        kind="composite_part",
+                        derivation="declared",
+                        confidence="exact" if part.confidence == "confirmed" else "advisory",
+                        note=(
+                            "part provider resolved from the generated calc view's base table "
+                            f"{part.via_table}"
+                            if part.via_table
+                            else None
+                        ),
+                        provenance=part.provenance,
+                    ),
+                )
+            )
+        return hops
+
+    def _composite_consumer_hops(self, name: str) -> list[_Hop]:
+        """CompositeProviders that consume ``name`` as a part provider (the reverse direction)."""
+        if not (
+            self.capability.is_available("object_dependencies")
+            and self.capability.is_available("composite_header")
+        ):
+            return []
+        tables: list[str] = []
+        for kind in ("dso", "adso", "infocube"):
+            tables.extend(candidate_tables(name, kind))
+        if not tables:
+            return []
+        placeholders = ", ".join("?" for _ in tables)
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["DISTINCT DEPENDENT_OBJECT_NAME"],
+                    from_logical="object_dependencies",
+                    where=[
+                        "DEPENDENT_SCHEMA_NAME = ?",
+                        f"BASE_OBJECT_NAME IN ({placeholders})",
+                        "DEPENDENCY_TYPE = ?",
+                    ],
+                    params=[_CALC_SCHEMA, *tables, _TRANSITIVE_DEPENDENCY],
+                ),
+                limit=_MAX_COMPOSITE_CONSUMERS,
+            )
+        )
+        hops: list[_Hop] = []
+        seen: set[str] = set()
+        for (view_name,) in rows:
+            provider = provider_from_calc_view(str(view_name).strip())
+            if not provider or provider == name or provider in seen:
+                continue
+            seen.add(provider)
+            hops.append(
+                _Hop(
+                    provider,
+                    "compositeprovider",
+                    LineageEdge(
+                        src=name,
+                        dst=provider,
+                        kind="composite_part",
+                        derivation="declared",
+                        confidence="advisory",
+                        note="CompositeProvider resolved via its generated calc view",
+                        provenance=self.provenance(
+                            "object_dependencies", {"DEPENDENT_OBJECT_NAME": str(view_name).strip()}
+                        ),
+                    ),
+                )
+            )
         return hops
 
     # --- declared edges (transformations + DTPs) -----------------------------------------

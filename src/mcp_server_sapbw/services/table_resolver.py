@@ -1,0 +1,280 @@
+"""Physical-table <-> BW-object resolution, and generated calc-view naming.
+
+BW generates one or more physical HANA tables per provider, following a naming convention that
+encodes the provider type and the table's role:
+
+===============  ======================================  =====================================
+Provider         Generated table(s)                      Role
+===============  ======================================  =====================================
+classic DSO      ``<ns>A<name>00``                       active data
+Advanced DSO     ``<ns>A<name>1`` / ``2`` / ``3``        inbound / active / changelog
+InfoCube         ``<ns>F<name>`` / ``<ns>E<name>``       F-fact (uncompressed) / E-fact
+InfoObject       ``<ns>P<name>``                         master-data attributes
+===============  ======================================  =====================================
+
+``<ns>`` is normally ``/BIC/`` (customer) or ``/BI0/`` (SAP), but a *namespaced* provider such as
+``/ABC/D_STOCK`` generates tables under its own namespace, and BW's generated objects can also land
+in ``/B1H/``. The ``S``/``T``/``X``/``Y``/``Q``/``M``/``H``/``K`` table classes are master-data SID,
+text, attribute-SID and hierarchy tables — they are *not* part providers and must not be mistaken
+for one.
+
+Resolution in the reverse direction (table -> object) is **name-based and therefore advisory**
+unless the candidate is confirmed against a catalogue of known object names; ``resolve_table``
+reports which happened via :attr:`ResolvedTable.confidence`.
+
+Pure functions only — no database access, no I/O — so the convention is testable offline.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Literal
+
+# Role a generated table plays for its provider.
+TableRole = Literal[
+    "active", "inbound", "changelog", "fact_f", "fact_e", "master_attr", "master_other"
+]
+
+# BW object kinds this module can resolve to (aligned with the provider/lineage type vocabularies).
+ResolvedKind = Literal["dso", "adso", "infocube", "infoobject", "unknown"]
+
+# Table classes that are master-data side tables, never part providers.
+_MASTER_DATA_CLASSES = frozenset({"P", "Q", "S", "T", "X", "Y", "M", "H", "K", "I", "J"})
+
+# A namespaced name splits into exactly these two parts: the namespace and the local name.
+_NAMESPACE_PARTS = 2
+# Length of the classic-DSO active-table suffix ("00").
+_DSO_SUFFIX_LEN = 2
+
+# ADSO table-class suffix -> role.
+_ADSO_SUFFIX_ROLES: dict[str, TableRole] = {"1": "inbound", "2": "active", "3": "changelog"}
+
+# Namespaces a generated BW table can live in when it is not the provider's own namespace.
+_DEFAULT_NAMESPACE = "/BIC/"
+_GENERATED_NAMESPACES = ("/BIC/", "/BI0/", "/B1H/")
+
+# Generated CompositeProvider calc views live under this package in _SYS_BIC.
+CALC_VIEW_PACKAGE = "system-local.bw.bw2hana"
+# Hierarchy runtime views share the package but are not provider views.
+CALC_VIEW_HIER_MARKER = "/hier/"
+
+# Roles whose row counts represent the provider's own persisted data (vs. changelog/inbound).
+PRIMARY_DATA_ROLES: frozenset[TableRole] = frozenset({"active", "fact_f", "fact_e", "master_attr"})
+
+
+@dataclass(frozen=True)
+class ResolvedTable:
+    """The BW object a generated physical table belongs to."""
+
+    table: str
+    object_name: str | None
+    kind: ResolvedKind
+    role: TableRole | None
+    namespace: str
+    is_master_data: bool
+    confidence: Literal["confirmed", "advisory"]
+
+    @property
+    def is_part_provider_candidate(self) -> bool:
+        """True when this table represents a provider that can be a part of a composite."""
+        return self.object_name is not None and not self.is_master_data
+
+
+def split_namespace(name: str) -> tuple[str, str]:
+    """Split a BW name into ``(namespace, local_name)``.
+
+    ``/ABC/D_STOCK`` -> ``("/ABC/", "D_STOCK")``; a plain name gets the default ``/BIC/``
+    namespace, which is where BW generates tables for non-namespaced objects.
+    """
+    if name.startswith("/"):
+        parts = name[1:].split("/", 1)
+        if len(parts) == _NAMESPACE_PARTS and parts[0]:
+            return f"/{parts[0]}/", parts[1]
+    return _DEFAULT_NAMESPACE, name
+
+
+def candidate_tables(name: str, kind: str) -> dict[str, TableRole]:
+    """Physical tables BW would generate for a provider, mapped to each table's role.
+
+    Used both to find a provider's data (volume/freshness) and to recognise its tables in a
+    dependency graph. Returns an empty mapping for kinds that persist no data of their own
+    (CompositeProvider, MultiProvider, Open ODS View).
+    """
+    namespace, local = split_namespace(name)
+    normalized = (kind or "").strip().lower()
+    if normalized in ("adso", "advanced_dso"):
+        return {
+            f"{namespace}A{local}1": "inbound",
+            f"{namespace}A{local}2": "active",
+            f"{namespace}A{local}3": "changelog",
+        }
+    if normalized in ("dso", "odso", "classic_dso"):
+        return {f"{namespace}A{local}00": "active"}
+    if normalized in ("infocube", "cube"):
+        return {f"{namespace}F{local}": "fact_f", f"{namespace}E{local}": "fact_e"}
+    if normalized in ("infoobject", "iobj"):
+        return {f"{namespace}P{local}": "master_attr"}
+    return {}
+
+
+def _namespace_of(table: str) -> tuple[str, str] | None:
+    """Return ``(namespace, body)`` if ``table`` is a namespaced generated table."""
+    if not table.startswith("/"):
+        return None
+    parts = table[1:].split("/", 1)
+    if len(parts) != _NAMESPACE_PARTS or not parts[0] or not parts[1]:
+        return None
+    return f"/{parts[0]}/", parts[1]
+
+
+def _candidate_names(table_class: str, rest: str) -> list[tuple[str, ResolvedKind, TableRole]]:
+    """Candidate ``(object_name, kind, role)`` readings of a generated table body."""
+    candidates: list[tuple[str, ResolvedKind, TableRole]] = []
+    if table_class == "A":
+        if rest.endswith("00") and len(rest) > _DSO_SUFFIX_LEN:
+            candidates.append((rest[:-_DSO_SUFFIX_LEN], "dso", "active"))
+        adso_role = _ADSO_SUFFIX_ROLES.get(rest[-1]) if rest else None
+        if adso_role is not None:
+            candidates.append((rest[:-1], "adso", adso_role))
+        candidates.append((rest, "adso", "active"))  # ADSO whose name itself ends oddly
+        candidates.append((rest, "dso", "active"))
+    elif table_class == "F":
+        candidates.append((rest, "infocube", "fact_f"))
+    elif table_class == "E":
+        candidates.append((rest, "infocube", "fact_e"))
+    elif table_class == "P":
+        candidates.append((rest, "infoobject", "master_attr"))
+    elif table_class in _MASTER_DATA_CLASSES:
+        candidates.append((rest, "infoobject", "master_other"))
+    return [(name, kind, role) for name, kind, role in candidates if name]
+
+
+def resolve_table(table: str, catalog: Mapping[str, Iterable[str]] | None = None) -> ResolvedTable:
+    """Map a generated physical table back to its BW object.
+
+    ``catalog`` optionally maps a kind (``"dso"``, ``"adso"``, ``"infocube"``, ``"infoobject"``) to
+    the known object names of that kind. When a candidate reading is confirmed against it the result
+    is ``confidence='confirmed'``; otherwise the first plausible reading is returned as
+    ``'advisory'`` (mission Rule 2 — the guess is labelled, never presented as fact).
+    """
+    raw = (table or "").strip()
+    upper = raw.upper()
+    parsed = _namespace_of(upper)
+    if parsed is None:
+        return ResolvedTable(
+            table=raw,
+            object_name=None,
+            kind="unknown",
+            role=None,
+            namespace="",
+            is_master_data=False,
+            confidence="advisory",
+        )
+    namespace, body = parsed
+    if not body:
+        return ResolvedTable(
+            table=raw,
+            object_name=None,
+            kind="unknown",
+            role=None,
+            namespace=namespace,
+            is_master_data=False,
+            confidence="advisory",
+        )
+
+    table_class, rest = body[0], body[1:]
+    is_master = table_class in _MASTER_DATA_CLASSES
+    candidates = _candidate_names(table_class, rest)
+    if not candidates:
+        return ResolvedTable(
+            table=raw,
+            object_name=None,
+            kind="unknown",
+            role=None,
+            namespace=namespace,
+            is_master_data=is_master,
+            confidence="advisory",
+        )
+
+    # A generated table in /B1H/ or /BIC/ may belong to a namespaced object: try both readings.
+    def with_namespace(candidate: str) -> list[str]:
+        forms = [candidate]
+        if namespace not in _GENERATED_NAMESPACES:
+            forms.insert(0, f"{namespace}{candidate}")
+        return forms
+
+    if catalog:
+        known = {kind: {str(n).strip().upper() for n in names} for kind, names in catalog.items()}
+        for candidate, kind, role in candidates:
+            for form in with_namespace(candidate):
+                if form.upper() in known.get(kind, set()):
+                    return ResolvedTable(
+                        table=raw,
+                        object_name=form,
+                        kind=kind,
+                        role=role,
+                        namespace=namespace,
+                        is_master_data=is_master,
+                        confidence="confirmed",
+                    )
+
+    candidate, kind, role = candidates[0]
+    return ResolvedTable(
+        table=raw,
+        object_name=with_namespace(candidate)[0],
+        kind=kind,
+        role=role,
+        namespace=namespace,
+        is_master_data=is_master,
+        confidence="advisory",
+    )
+
+
+def calc_view_patterns(provider: str) -> list[str]:
+    """SQL ``LIKE`` patterns matching the calc view BW generates for a CompositeProvider.
+
+    A plain provider generates ``system-local.bw.bw2hana/<NAME>``. A namespaced provider such as
+    ``/ABC/V_STOCK`` generates ``system-local.bw.bw2hana.abc/V_STOCK`` — the namespace becomes a
+    lowercase package suffix and the local name loses its prefix. The trailing-match pattern is the
+    fallback for any other namespace styling.
+    """
+    namespace, local = split_namespace(provider)
+    patterns = [f"{CALC_VIEW_PACKAGE}/{provider}"]
+    if namespace != _DEFAULT_NAMESPACE:
+        suffix = namespace.strip("/").lower()
+        patterns.append(f"{CALC_VIEW_PACKAGE}.{suffix}/{local}")
+    patterns.append(f"%{CALC_VIEW_PACKAGE.rsplit('.', maxsplit=1)[-1]}/{local}")
+    unique: list[str] = []
+    for pattern in patterns:
+        if pattern not in unique:
+            unique.append(pattern)
+    return unique
+
+
+def is_hierarchy_view(view_name: str) -> bool:
+    """True for generated hierarchy runtime views, which are not provider views."""
+    return CALC_VIEW_HIER_MARKER in (view_name or "").lower()
+
+
+def provider_from_calc_view(view_name: str) -> str | None:
+    """Reverse :func:`calc_view_patterns`: the provider a generated calc view belongs to.
+
+    ``system-local.bw.bw2hana/SALES_CP`` -> ``SALES_CP``;
+    ``system-local.bw.bw2hana.abc/V_STOCK`` -> ``/ABC/V_STOCK``.
+    Returns ``None`` for views outside the generated package, and for hierarchy runtime views.
+    """
+    name = (view_name or "").strip()
+    if not name or is_hierarchy_view(name):
+        return None
+    package, _, local = name.rpartition("/")
+    if not local or not package:
+        return None
+    base = CALC_VIEW_PACKAGE.rsplit(".", maxsplit=1)[-1]  # "bw2hana"
+    if base not in package:
+        return None
+    # A namespaced provider encodes its namespace as a lowercase package suffix after "bw2hana".
+    _, _, suffix = package.partition(f"{base}.")
+    if suffix:
+        return f"/{suffix.upper()}/{local}"
+    return local

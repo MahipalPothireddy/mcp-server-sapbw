@@ -62,6 +62,19 @@ InfoObjectKind = Literal[
 ]
 
 
+# RSDCUBE.CUBETYPE -> provider type (verified live, B4). Anything else is treated as a basic cube.
+_CUBETYPE_TO_PROVIDER: dict[str, ProviderType] = {
+    "B": "infocube",
+    "M": "multiprovider",
+    "V": "virtualprovider",
+}
+
+
+def classify_cube_type(cubetype: object) -> ProviderType:
+    """Map an ``RSDCUBE.CUBETYPE`` code to a provider type, defaulting to ``infocube``."""
+    return _CUBETYPE_TO_PROVIDER.get(str(cubetype).strip().upper(), "infocube")
+
+
 class ProviderField(BaseModel):
     """One field/InfoObject of a provider, or one attribute of an InfoObject."""
 
@@ -76,13 +89,20 @@ class ProviderField(BaseModel):
 
 
 class PartProviderRef(BaseModel):
-    """A part provider of a MultiProvider (RSDCUBEMULTI) or CompositeProvider (XML_DEF)."""
+    """A part provider of a MultiProvider (RSDCUBEMULTI) or a CompositeProvider.
+
+    For a CompositeProvider resolved through its generated calc view, ``via_table`` names the
+    physical table the dependency graph reported and ``confidence`` says whether the table -> object
+    reading was confirmed against the provider catalogue or is a naming-convention guess.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
     part_type: ProviderType | None = None  # resolved type if known; None until resolved
     position: int | None = None
+    via_table: str | None = None  # generated table the part was resolved from (calc-view route)
+    confidence: Literal["confirmed", "advisory"] = "confirmed"
     provenance: Provenance
 
 
@@ -90,9 +110,10 @@ class Provider(BaseModel):
     """Universal deep-dive for any InfoProvider or InfoObject.
 
     ``composition_source`` records how ``part_providers`` was derived: ``relational``
-    (RSDCUBEMULTI), ``xml`` (parsed from RSOHCPR.XML_DEF), or ``none``. When a CompositeProvider's
-    composition has not been parsed, ``part_providers`` is empty, ``composition_source='none'``,
-    and a caveat says so (never silently implying a CompositeProvider has no parts).
+    (RSDCUBEMULTI), ``xml`` (parsed from RSOHCPR.XML_DEF), ``calc_view`` (resolved from the
+    dependencies of the HANA calc view BW generates for the CompositeProvider), or ``none``. When a
+    composition could not be derived at all, ``part_providers`` is empty, ``composition_source`` is
+    ``none``, and a caveat says so (never silently implying a CompositeProvider has no parts).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -109,7 +130,7 @@ class Provider(BaseModel):
     key_field_names: list[str] = Field(default_factory=list)  # semantic key (DSO/ADSO)
     fields: list[ProviderField] = Field(default_factory=list)
     part_providers: list[PartProviderRef] = Field(default_factory=list)
-    composition_source: Literal["relational", "xml", "none"] = "none"
+    composition_source: Literal["relational", "xml", "calc_view", "none"] = "none"
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 
