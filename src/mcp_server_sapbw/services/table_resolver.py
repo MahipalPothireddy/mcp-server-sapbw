@@ -110,7 +110,9 @@ def candidate_tables(name: str, kind: str) -> dict[str, TableRole]:
             f"{namespace}A{local}3": "changelog",
         }
     if normalized in ("dso", "odso", "classic_dso"):
-        return {f"{namespace}A{local}00": "active"}
+        # '00' is the active table; '40' is the activation queue (new, not-yet-activated data).
+        # Both confirmed live: every generated /BIC/A* table on the reference system resolved.
+        return {f"{namespace}A{local}00": "active", f"{namespace}A{local}40": "inbound"}
     if normalized in ("infocube", "cube"):
         return {f"{namespace}F{local}": "fact_f", f"{namespace}E{local}": "fact_e"}
     if normalized in ("infoobject", "iobj"):
@@ -134,6 +136,8 @@ def _candidate_names(table_class: str, rest: str) -> list[tuple[str, ResolvedKin
     if table_class == "A":
         if rest.endswith("00") and len(rest) > _DSO_SUFFIX_LEN:
             candidates.append((rest[:-_DSO_SUFFIX_LEN], "dso", "active"))
+        if rest.endswith("40") and len(rest) > _DSO_SUFFIX_LEN:
+            candidates.append((rest[:-_DSO_SUFFIX_LEN], "dso", "inbound"))  # activation queue
         adso_role = _ADSO_SUFFIX_ROLES.get(rest[-1]) if rest else None
         if adso_role is not None:
             candidates.append((rest[:-1], "adso", adso_role))

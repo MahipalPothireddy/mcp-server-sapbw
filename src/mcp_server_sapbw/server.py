@@ -38,6 +38,7 @@ from .models.chains import (
 from .models.diagram import DiagramFormat, DiagramResult
 from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
+from .models.health import ProviderHealth
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
@@ -51,6 +52,7 @@ from .models.transformations import (
 from .prompts.workflows import register_prompts
 from .repositories.chains import ChainsRepository
 from .repositories.hana import HanaRepository
+from .repositories.health import HealthRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
@@ -190,6 +192,7 @@ class Runtime(Protocol):
     def analyzers(self, system: str) -> Analyzers: ...
     def docgen(self, system: str) -> DocGenerator: ...
     def load_closure(self, system: str) -> LoadClosureService: ...
+    def health(self, system: str) -> HealthRepository: ...
 
 
 class ServerRuntime:
@@ -278,6 +281,12 @@ class ServerRuntime:
 
     def load_closure(self, system: str) -> LoadClosureService:
         return LoadClosureService(self._connection(system), self.capability(system))
+
+    def health(self, system: str) -> HealthRepository:
+        return HealthRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+        )
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -657,6 +666,26 @@ def bw_get_hana_crossings(
     return (
         runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
     )
+
+
+@_readonly_tool
+def bw_get_provider_health(
+    system: str, provider: str, object_type: str | None = None
+) -> ProviderHealth | UnsupportedResult:
+    """How much data a provider holds and how current it is.
+
+    Volume comes from the HANA monitoring view per generated table, with active, inbound (activation
+    queue) and changelog rows reported separately — summing them would hide changelog bloat.
+    Currency comes from BW's per-provider request ledger: when it last loaded, whether that load
+    succeeded, how many records arrived, and in which update mode. Data age is measured against the
+    latest request in the system rather than today, so a restored copy is not read as stale.
+    A provider whose generated tables exist but hold nothing is reported as unloaded, not as empty.
+    """
+    repo = runtime().health(system)
+    unsupported = repo.require_health()
+    if unsupported is not None:
+        return unsupported
+    return repo.get_health(provider, object_type)
 
 
 @_readonly_tool

@@ -32,7 +32,11 @@ def test_split_namespace() -> None:
 
 
 def test_candidate_tables_per_provider_kind() -> None:
-    assert candidate_tables("SALES_DSO", "dso") == {BIC + "ASALES_DSO00": "active"}
+    # A classic DSO has an active table and an activation queue ('40') for new data.
+    assert candidate_tables("SALES_DSO", "dso") == {
+        BIC + "ASALES_DSO00": "active",
+        BIC + "ASALES_DSO40": "inbound",
+    }
     assert candidate_tables("FIN_ADSO", "adso") == {
         BIC + "AFIN_ADSO1": "inbound",
         BIC + "AFIN_ADSO2": "active",
@@ -126,3 +130,14 @@ def test_hierarchy_views_are_excluded() -> None:
     view = "system-local.bw.bw2hana/hier/SALES_CP"
     assert is_hierarchy_view(view) is True
     assert provider_from_calc_view(view) is None
+
+
+def test_dso_activation_queue_resolves_back_to_the_dso() -> None:
+    """The '40' table is the DSO's activation queue: same object, different role."""
+    catalog = {"dso": ["SALES_DSO"]}
+    active = resolve_table(BIC + "ASALES_DSO00", catalog)
+    queue = resolve_table(BIC + "ASALES_DSO40", catalog)
+    assert active.object_name == queue.object_name == "SALES_DSO"
+    assert active.role == "active"
+    assert queue.role == "inbound"
+    assert queue.confidence == "confirmed"

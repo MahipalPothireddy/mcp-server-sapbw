@@ -18,6 +18,7 @@ from mcp_server_sapbw import server
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.hana import HanaRepository
+from mcp_server_sapbw.repositories.health import HealthRepository
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
@@ -216,6 +217,9 @@ class FakeRuntime:
 
     def load_closure(self, system: str) -> LoadClosureService:
         return LoadClosureService(_Conn(), self._cap)
+
+    def health(self, system: str) -> HealthRepository:
+        return HealthRepository(_Conn(), self._cap)
 
 
 async def _call(tool: str, args: dict[str, Any]) -> Any:
