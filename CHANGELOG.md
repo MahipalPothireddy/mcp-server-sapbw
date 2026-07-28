@@ -6,6 +6,87 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — capability merge from two script-based BW analysis projects
+
+Eight vertical slices, each with offline tests. Where a source project's claim disagreed with the
+system, the system won and the correction is noted.
+
+- **CompositeProvider part providers, via the generated calc view.** `RSOHCPR.XML_DEF` is empty on
+  every CompositeProvider on the reference system, so composition was previously undiscoverable.
+  Parts are now resolved from the base tables of the CompositeProvider's generated HANA calc view,
+  through a shared physical-table ↔ BW-object resolver (classic DSO `/BIC/A<n>00` active and `…40`
+  activation queue, ADSO `…1|2|3`, cube `F`/`E`, InfoObject `P`, namespaced variants), with
+  master-data side tables and hierarchy views excluded. Lineage emits `composite_part` edges where
+  CompositeProviders previously dead-ended. **Correction:** these require
+  `SYS.OBJECT_DEPENDENCIES.DEPENDENCY_TYPE = 2` (transitive), not 1 — BW layers the calc view over
+  intermediate views, so type-1 dependencies are master-data side tables only. Type 1 remains
+  correct for direct-read crossings. The resolver was reverse-validated against all 864 `/BIC/A*`
+  tables on the reference system.
+- **`bw_render_lineage`** — data-flow diagrams as images. Deterministic layered-DAG layout
+  (longest-path layering with bounded relaxation so a cycle cannot hang it, barycentre ordering),
+  emitted as self-contained SVG or PNG with a legend, per-type node colour and shape, dashed grey
+  advisory edges, collision-avoiding edge labels, and an on-canvas truncation warning. Rendering is
+  entirely local: SVG uses only the standard library, PNG uses the optional `viz` extra. A hosted
+  renderer was rejected outright — it would exfiltrate customer object names.
+- **Transformation rule depth.** Aggregation behaviour, rule group type, no-conversion flag, key
+  fields, constant values, and **declared** lookups from `RSTRANSTEPMASTER`/`ODSO`/`ADSO` — exact
+  dependencies, unlike routine-parsed ones. Where a lookup miss substitutes a constant rather than
+  failing, scenario 9.1 flags it: the load changes data silently. **Correction:**
+  `RSTRANRULE.AGGR` is not a boolean overwrite-vs-summation flag as the source projects assumed; it
+  is a five-value domain (`MOV`/`SUM`/`MIN`/`MAX`/`NOP`) decoded from the ABAP dictionary.
+  `FIELD_USAGE` is entirely empty on the reference system and is deliberately not surfaced.
+- **Observed cadence and load closure (`bw_get_load_closure`).** Cadence is banded from the median
+  gap between runs, with runs-per-day only promoting a daily chain to intraday; a single recorded run
+  yields `unknown` at low confidence rather than a force-fitted band; the reference date is the
+  latest run in the system, never today. Load closure resolves chain → providers recursively through
+  nested sub-chains (where most loads actually live) and provider → loading chains including parent
+  chains, whose schedule governs. Step scope is categorised from process type codes, never names.
+  **Correction of an earlier claim in this repo:** "object → loading chain is not derivable" was
+  wrong; it came from probing `RSPCVARIANT` (parameters) instead of `RSPCCHAIN` (steps). 99% of
+  `DTP_LOAD` steps join cleanly. Every "not derivable" caveat has been removed.
+- **`bw_get_provider_health`** — volume from the HANA monitoring view with active, inbound and
+  changelog rows reported separately (summing them hides changelog bloat), plus request-level
+  currency from BW's own request ledger. Data age is measured against the latest request in the
+  system, so a restored copy is not read as stale. "Could not locate the tables" and "the tables
+  exist and are empty" are separate facts.
+- **`bw_get_source_systems` and `bw_list_extractor_enhancements`.** Topology from the logical systems
+  DataSources actually extract from, compared against the registry, so a logical system referenced
+  but unregistered is surfaced — the signature of a system copy without BDLS. `SRCTYPE` decoding
+  carries dual confidence: the dictionary domain documents three codes while the live data holds
+  eight, so the undocumented ones get a conventional reading labelled advisory. The source projects'
+  practice of inferring risk from a DataSource *name* prefix is deliberately not carried over.
+- **`bw_get_extractor_exit_code`** — extractor-exit ABAP read from the source system over ADT.
+  GET-only with no CSRF token and a stateless session, so it can neither write nor take locks;
+  credentials come through an optional `ecc_systems` profile with the same `${VAR}`-only rule, TLS by
+  default, and plain HTTP requiring a separate explicit opt-in. Risk is attributed per `CASE` branch
+  rather than per include, because one include serves every enhanced DataSource and crediting the
+  whole include to one of them would manufacture false high-severity findings. **Correction of an
+  earlier claim in this repo:** ABAP source is *not* unreachable because `REPOSRC.DATA` is
+  compressed — that reasoning was about reading the table directly, and ADT renders source
+  server-side as `text/plain`.
+- **`bw_get_routine_register`** — every transformation routine in the system, ranked. Three bulk
+  reads rather than a per-transformation loop. Size and portfolio totals are complete; pattern
+  detection is limited to the largest `parse_budget` routines, and an unparsed entry reports **no**
+  pattern counts rather than zeroes, which would read as "clean". Ranking is by measured pattern
+  count then measured line count — no composite score with invented weights.
+- **Query origin, and `bw_find_unused_providers`.** A technical name prefixed `!!` marks a query
+  created ad hoc in the BEx Analyzer rather than Query Designer — a navigation artefact, not a
+  maintained report. `bw_list_queries` gains an `origin` filter (default `all`, so existing behaviour
+  is unchanged) and every summary carries `origin` with its basis stated, since BW stores no flag.
+  `bw_find_unused_providers` reports a provider only when it feeds no transformation, has no
+  Query-Designer query, and is no CompositeProvider part — that third route is essential, since a
+  CompositeProvider consumes its parts through a calc view and ignoring it would flag every DSO
+  beneath one.
+- **Write-back loop detection** in the layer-violation analyzer: a transformation whose source and
+  target are the same object (its load is not repeatable) and two objects that each feed the other
+  (no load order is correct, so scheduling cannot fix it). Both high severity. Longer cycles are not
+  searched and the report says so.
+
+### Changed
+- `scripts/customer_metadata_scan.py` now strips backslashes before matching. A real customer object
+  name had evaded the check because a SQL-`LIKE` escape split the token mid-name.
+- `ExternalConnector.kind` is a read-only property, so a connector can narrow it to its own literal.
+
 ### Fixed
 - **Name filters silently matched nothing.** `bw_search_objects` treated any pattern containing `_`
   as pre-authored and skipped `%`-wrapping, so a partial BW name (nearly all of them contain an

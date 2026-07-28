@@ -7,25 +7,38 @@ changes. It auto-detects BW release and object-model variant at connect time, an
 impact-analysis and incident-triage questions in one call (including dependencies invisible to BW's
 own where-used lists), and can render a full markdown knowledge base on demand.
 
-> **Status: functional (build prompts B0–B10 complete).** The metadata extraction, lineage,
-> routine analysis, BEx query, HANA, risk-analyzer, and knowledge-base subsystems are implemented
-> and exercised against a live BW 7.50 system: **29 tools and 6 prompts**. Still planned:
-> URI-addressable **resources** and the pluggable ECC/Tableau/BOBJ connectors (deferred). See
-> `PROGRESS.md` for the full build log and `.kiro/specs/mcp-server-sapbw/` for the spec.
+> **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
+> BEx query, HANA, provider-health, risk-analyzer, and knowledge-base subsystems are implemented:
+> **37 tools and 6 prompts**, most of them exercised against a live BW 7.50 system. Still planned:
+> URI-addressable **resources**, and the Tableau/BOBJ connectors for scenarios 9.7/9.8. The ECC
+> source-system connector is implemented (ADT, read-only) but not yet exercised against a live
+> source system. See `PROGRESS.md` for the build log and `.kiro/specs/mcp-server-sapbw/` for the
+> spec.
 
 ## What it does
 
-- **Process chains & scheduling** — structure, recursive meta-chains, frequency (from job
-  periodicity, not names), and runtime statistics (p95, success rate, critical path).
+- **Process chains & scheduling** — structure, recursive meta-chains, observed cadence (from run
+  history and job periodicity, never from names), and runtime statistics (p95, success rate,
+  critical path).
+- **Load closure** — what a chain actually loads, walked through its nested sub-chains, and which
+  chains load a given provider, with the cadence that governs it.
 - **Load lineage** — a directed graph across transformations, DTPs, providers, calc views, and
   queries, including advisory edges parsed from ABAP routine source.
-- **Transformations & routines** — field mappings, rule types, and full ABAP source with parsed
-  table dependencies and anti-pattern detection.
-- **BEx queries** — complete definitions with field-level lineage down to the DataSource field.
-- **HANA calc views** — dependencies and every BW↔HANA boundary crossing.
+- **Data-flow diagrams** — the same graph rendered as an image (SVG or PNG) entirely locally, with
+  node types colour-coded and advisory edges dashed so a heuristic never looks like a fact.
+- **Transformations & routines** — field mappings, rule types (aggregation behaviour, key fields,
+  constants, declared lookups), and full ABAP source with parsed table dependencies and
+  anti-pattern detection — plus a portfolio-wide register ranking every routine in the system.
+- **BEx queries** — complete definitions with field-level lineage down to the DataSource field, and
+  a designed-report vs. ad-hoc-navigation distinction.
+- **HANA calc views** — dependencies, CompositeProvider part resolution, and every BW↔HANA crossing.
+- **Provider health** — how much data a provider holds (active vs. changelog vs. inbound, never
+  summed) and how current it is, from BW's own request ledger.
+- **Source-system topology** — which systems feed the warehouse, and which DataSources carry
+  extractor enhancements; optionally the exit ABAP itself, read from the source system over ADT.
 - **Descriptions** — for every object, with explicit provenance (stored vs. generated).
-- **Risk analyzers** — eight landscape-specific analyses (latency contracts, schedule risk,
-  layer violations, and more).
+- **Risk analyzers** — the eight landscape-specific analyses (latency contracts, schedule risk,
+  layer violations including write-back loops, and more) plus decommission-candidate detection.
 - **Knowledge base** — a full markdown documentation set rendered on demand.
 
 ## Supported releases
@@ -110,6 +123,12 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_get_chain` | `system`, `chain_id` | Structure, processes, event-linked edges, nested sub-chains (recursive) |
 | `bw_get_chain_runtimes` | `system`, `chain_id`, `days=90` | min/median/mean/p95/max, success rate, bottleneck steps over the measured window |
 | `bw_get_schedule_matrix` | `system`, `active_only=true`, `window_days=30`, `limit`, `offset` | Chain × observed frequency × typical start × p95 completion |
+| `bw_get_load_closure` | `system`, `chain_id?` \| `provider?` | What a chain loads (walked through nested sub-chains) — or which chains load a provider, with the cadence that governs it |
+
+Cadence is classified from the **observed median gap between runs**, with runs-per-day only used to
+promote a daily chain to intraday. A chain with a single recorded run is reported `unknown` with low
+confidence rather than force-fitted to a band. The reference date is the latest run in the system,
+not today, so a restored copy is not read as dormant.
 
 ### Objects & search
 
@@ -140,6 +159,18 @@ Identity parameters are not patterns: `chain_id`, `tran_id`, `query`, `view_name
 | `bw_get_transformation` | `system`, `tran_id` | Header, field-level rule mappings, routine references |
 | `bw_get_routine_code` | `system`, `tran_id` | Full ABAP source for start/end/expert/field routines |
 | `bw_analyze_routine` | `system`, `tran_id` | Parsed table dependencies + anti-patterns (heuristic lower bound) |
+| `bw_get_routine_register` | `system`, `limit=50`, `offset`, `parse_budget=100` | **Every routine in the system, ranked** by anti-pattern count then size |
+
+`bw_get_transformation` reports each rule's aggregation behaviour (direct assignment vs. summation
+vs. min/max — decoded from the ABAP dictionary, not guessed), key fields, constant values, and
+**declared** lookups from the `RSTRANSTEP*` tables. A declared lookup is exact, unlike a
+routine-parsed one; where a lookup miss substitutes a constant instead of failing, the load changes
+data silently and the analyzer says so.
+
+The register's line counts and portfolio totals cover **every** routine, but pattern detection
+covers only the largest `parse_budget` of them, because parsing means fetching source. An entry
+with `analyzed=false` therefore reports **no** pattern counts rather than zeroes — zeroes would
+read as "this routine is clean".
 
 ### Lineage
 
@@ -148,15 +179,67 @@ Identity parameters are not patterns: `chain_id`, `tran_id`, `query`, `view_name
 | `bw_get_lineage` | `system`, `name`, `direction="both"`, `depth=6` | Directed data-flow graph, with advisory routine edges |
 | `bw_impact_analysis` | `system`, `name`, `depth=3` | Full downstream blast radius, **including routine-embedded consumers** invisible to BW where-used |
 | `bw_trace_to_source` | `system`, `name`, `depth=8` | Trace upstream, hop by hop, to the DataSource boundary |
+| `bw_render_lineage` | `system`, `name`, `direction="both"`, `depth=4`, `image_format="png"`, `output_dir?` | The same graph **as an image**, plus structured metadata |
+
+Diagrams are laid out left-to-right by dependency depth, colour-coded and shaped by BW object type,
+with advisory edges (routine-derived, or resolved by naming convention) drawn dashed and grey, edge
+labels for routine and calc-view logic, a legend, and an on-canvas warning when the graph was
+truncated. Rendering is **entirely local** — SVG needs nothing beyond the standard library, PNG
+needs the `viz` extra. No diagram content ever leaves the machine; a hosted renderer would
+exfiltrate customer object names.
 
 ### BEx queries
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `bw_list_queries` | `system`, `provider?`, `owner?`, `limit`, `offset` | Executable BEx queries (not reusable components) |
+| `bw_list_queries` | `system`, `provider?`, `owner?`, `origin="all"`, `limit`, `offset` | Executable BEx queries (not reusable components), each with its origin |
 | `bw_get_query` | `system`, `query` | Definition: element tree, restrictions, variables with processing types |
 | `bw_get_query_lineage` | `system`, `query` | Field-level lineage per InfoObject toward the DataSource; customer-exit dead ends flagged |
 | `bw_get_query_usage` | `system`, `query`, `stale_days=365` | Last-used and decommission-candidate flag |
+
+`origin` separates a **designed** query — authored in Query Designer, i.e. a maintained report —
+from an **ad_hoc** one, whose technical name SAP prefixes `!!` because it was created straight in
+the BEx Analyzer. Use `origin="designed"` when counting real reports. The classification reads the
+shape of the technical name, since BW stores no flag for it, and the response says so.
+
+### Providers & data currency
+
+| Tool | Parameters | Purpose |
+|---|---|---|
+| `bw_get_provider_health` | `system`, `provider`, `object_type?` | How much data a provider holds and how current it is |
+| `bw_find_unused_providers` | `system`, `limit` | Providers with **no maintained consumer** — decommission candidates |
+
+Volume reports active, inbound (activation queue) and changelog rows **separately**; summing them
+would hide changelog bloat. Data age is measured against the latest request in the system rather
+than today. "Could not locate the generated tables" and "the tables exist and are empty" are
+reported as different facts, because conflating them claims a provider is empty when it is loading
+fine.
+
+`bw_find_unused_providers` reports a provider only when three consumer routes all come up empty: it
+feeds no transformation, no Query-Designer query reads it, and it is no CompositeProvider part. That
+last route matters — a CompositeProvider consumes its parts through a generated calc view rather
+than a transformation, so ignoring it would flag every DSO beneath one. Consumption from outside BW
+is **not** covered; check `bw_get_hana_crossings` before acting.
+
+### Source systems & extractor enhancements
+
+| Tool | Parameters | Purpose |
+|---|---|---|
+| `bw_get_source_systems` | `system` | Which systems feed this BW system, and of what kind |
+| `bw_list_extractor_enhancements` | `system`, `limit=50` | DataSources whose extract structure carries customer-namespace fields |
+| `bw_get_extractor_exit_code` | `ecc_system?`, `include_source=false` | The exit **ABAP behind** those enhancements, read from the source system over ADT |
+
+Topology is built from the logical systems the DataSources actually extract from, compared against
+the source-system registry — so it surfaces logical systems that DataSources reference but the
+registry does not know, the usual signature of a system copy where BDLS was not run. System kinds
+decoded from the ABAP dictionary are labelled as such; codes the dictionary does not document carry
+a conventional reading labelled advisory.
+
+Reading exit ABAP needs an optional `ecc_systems` profile (see `profiles.example.yaml`) and the
+`ecc` extra. That connection is **GET-only**, never requests a CSRF token, and runs a stateless ADT
+session so it takes no locks. Risk is attributed per `CASE` branch, not per include: one include
+serves every enhanced DataSource, so crediting the whole include's table reads to one of them would
+manufacture false findings.
 
 ### HANA layer
 
@@ -179,8 +262,20 @@ never mistaken for a confirmed one.
 |---|---|---|
 | `bw_check_load_latency` | `system`, `limit=25` | Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk). Loads with no resolvable lookup have no contract to check and are counted in the caveats rather than reported as findings |
 | `bw_check_schedule_risk` | `system`, `limit` | Scenario 9.7: report schedules vs. feeding-chain p95 (needs a BI connector) |
-| `bw_find_layer_violations` | `system`, `max_dso_depth=3`, `limit` | CompositeProvider→DSO, CompositeProvider→InfoObject, deep DSO stacks |
-| `bw_review_scenario` | `system`, `scenario`, `limit=50` | Run any scenario by id (`9.1`–`9.8` or `layer_violations`) |
+| `bw_find_layer_violations` | `system`, `max_dso_depth=3`, `limit` | CompositeProvider→DSO, CompositeProvider→InfoObject, deep DSO stacks, **write-back loops** |
+| `bw_review_scenario` | `system`, `scenario`, `limit=50` | Run any analysis by id (`9.1`–`9.8`, `layer_violations`, `unused_providers`) |
+
+Write-back loops are the severe ones. A transformation whose source and target are the same object
+makes its own load non-repeatable: the output depends on what the target already held, so a failed
+request cannot simply be re-run. Two objects that each feed the other have no correct load order at
+all, which is why scheduling cannot fix it. Longer cycles (A→B→C→A) are not searched, and the report
+says so rather than implying the check was exhaustive.
+
+Scenario 9.1 compares each full-update load against the **observed cadence** of the objects its
+routines look up, so a stale-data risk is substantiated rather than assumed, and escalates only when
+the cadence contract is actually violated. Scenario 9.6 reports the appended fields as
+metadata-confirmed evidence; with an `ecc_systems` profile configured it also reports which tables
+the exit branch reads and escalates to high severity on a per-record `SELECT`.
 
 ### Documentation
 
