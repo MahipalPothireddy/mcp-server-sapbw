@@ -6,7 +6,41 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **Name filters silently matched nothing.** `bw_search_objects` treated any pattern containing `_`
+  as pre-authored and skipped `%`-wrapping, so a partial BW name (nearly all of them contain an
+  underscore) matched only an exact full name; `bw_list_chains.name_pattern` was passed into
+  `CHAIN_ID LIKE ?` verbatim, so a bare term matched nothing at all; and
+  `bw_list_transformations.source_name` / `target_name` used equality, which can never match a
+  DataSource endpoint (stored space-padded as `<DATASOURCE><padding><LOGSYS>`). All four now share
+  one rule via `core.dialect.like_term`: a bare term is a case-insensitive substring match with
+  `LIKE` metacharacters escaped (emitting `ESCAPE` only when needed), while a term containing `%`
+  stays under the caller's control. An empty result is the worst failure mode for a model-facing
+  tool, so this is documented in the tool docstrings and the README.
+- **Scenario 9.1 reported findings it could not evaluate.** A full-update load whose routines
+  resolved no lookup has no latency contract to check, but was emitted as a `low` finding — and
+  because candidates were truncated in alphabetical order, those empty findings could crowd the real
+  risks out of the page entirely. Such candidates are now excluded from the findings and counted in
+  the caveats (a parser lower bound, not proof of no lookup), scanning continues past them within a
+  parse budget, and severity scales with the number of looked-up objects.
+
 ### Added
+- **Calc view → InfoProvider resolution (`0BW:BIA:` views).** BW generates a per-InfoProvider HANA
+  view named `0BW:BIA:<PROVIDER>` (with `:J1.CALC.n` / `.CONV*` internal nodes), and that is what
+  sits on the BW side of a `bw_reads_hana` crossing — previously left unresolved. The provider is
+  now parsed from the view name and its **type confirmed** against the provider header tables, so
+  `bw_get_hana_crossings` resolves the calc-view → CompositeProvider hop that BW's own where-used
+  lists do not report, and `bw_get_calc_view_lineage` gains `consuming_bw_providers` (deduplicated
+  per provider). `HanaCrossing.resolution` distinguishes `bic_table` / `bw_provider_view` /
+  `unresolved`, and an unconfirmed provider is named without asserting it exists (`verified=false`).
+  This closes the deferred calc-view → CompositeProvider mapping without parsing `RSOHCPR.XML_DEF`.
+  Generated docs render the hop as a "Calc view -> consuming InfoProvider" table in `07-hana`,
+  derived from crossing rows already fetched (no extra queries).
+- `tests/sqllike.py`: a minimal SQL `LIKE` evaluator so fixture connections honour built patterns
+  the way HANA would — a substring-checking fixture is how the underscore defect survived the
+  original suite.
+- Shared `models.providers.classify_cube_type` (the `RSDCUBE.CUBETYPE` mapping was duplicated in the
+  search and providers repositories).
 - Project scaffold (build prompt B0): `src/mcp_server_sapbw` package tree (core, repositories,
   services, connectors, models, prompts), `server.py` entry-point stub, and offline test scaffold.
 - `pyproject.toml` with pinned `fastmcp==3.4.4`, `hdbcli`, `pydantic`, `pyyaml`, optional `rfc`

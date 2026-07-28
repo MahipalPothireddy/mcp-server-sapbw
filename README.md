@@ -106,7 +106,7 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `bw_list_chains` | `system`, `name_pattern?`, `active_only=true`, `limit`, `offset` | Chains filtered by name/active status |
+| `bw_list_chains` | `system`, `name_pattern?`, `active_only=true`, `limit`, `offset` | Chains filtered by name pattern (see [Name filters](#name-filters)) / active status |
 | `bw_get_chain` | `system`, `chain_id` | Structure, processes, event-linked edges, nested sub-chains (recursive) |
 | `bw_get_chain_runtimes` | `system`, `chain_id`, `days=90` | min/median/mean/p95/max, success rate, bottleneck steps over the measured window |
 | `bw_get_schedule_matrix` | `system`, `active_only=true`, `window_days=30`, `limit`, `offset` | Chain × observed frequency × typical start × p95 completion |
@@ -115,14 +115,28 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `bw_search_objects` | `system`, `query`, `limit`, `offset` | Fuzzy search by technical name or description across object types |
+| `bw_search_objects` | `system`, `pattern`, `object_types?`, `match_descriptions=true`, `limit`, `offset` | Fuzzy search by technical name or description across object types (see [Name filters](#name-filters)) |
 | `bw_describe_object` | `system`, `name` | Universal deep-dive: type, fields, key, parts, description (stored vs. generated) |
+
+#### Name filters
+
+Every name filter (`bw_search_objects.pattern`, `bw_list_chains.name_pattern`,
+`bw_list_transformations.source_name` / `target_name`) follows one rule:
+
+- a bare term is a **case-insensitive substring match**, with `_` matched **literally** — so
+  partial BW names like `SD_O3` work as expected, and a DataSource endpoint (stored as
+  `<DATASOURCE><padding><LOGSYS>`) is found by its DataSource name alone;
+- a term containing `%` is passed through as an authored SQL `LIKE` pattern, so you control the
+  wildcards (`LOAD%` to anchor the start, `%_DSO` to use `_` as a single-character wildcard).
+
+Identity parameters are not patterns: `chain_id`, `tran_id`, `query`, `view_name`, `provider`, and
+`owner` are matched exactly.
 
 ### Transformations & routines
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `bw_list_transformations` | `system`, `source_name?`, `target_name?`, `with_routines_only=false`, `limit`, `offset` | Transformations filtered by endpoint or routine presence |
+| `bw_list_transformations` | `system`, `source_name?`, `target_name?`, `with_routines_only=false`, `limit`, `offset` | Transformations filtered by endpoint pattern (see [Name filters](#name-filters)) or routine presence |
 | `bw_get_transformation` | `system`, `tran_id` | Header, field-level rule mappings, routine references |
 | `bw_get_routine_code` | `system`, `tran_id` | Full ABAP source for start/end/expert/field routines |
 | `bw_analyze_routine` | `system`, `tran_id` | Parsed table dependencies + anti-patterns (heuristic lower bound) |
@@ -149,14 +163,21 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | Tool | Parameters | Purpose |
 |---|---|---|
 | `bw_list_calc_views` | `system`, `bw_consuming_only=false`, `limit`, `offset` | Calc views (`_SYS_BIC`), optionally only those reading BW tables |
-| `bw_get_calc_view_lineage` | `system`, `view_name` | A calc view's direct base tables, resolved to BW objects (advisory) |
-| `bw_get_hana_crossings` | `system`, `calc_view?`, `limit`, `offset` | Every BW↔HANA boundary crossing, both directions |
+| `bw_get_calc_view_lineage` | `system`, `view_name` | A calc view's direct base tables (resolved to BW objects, advisory) **and the InfoProviders consuming it** |
+| `bw_get_hana_crossings` | `system`, `calc_view?`, `limit`, `offset` | Every BW↔HANA boundary crossing, both directions, each with how its BW side resolved |
+
+The BW side of a crossing is either a `/BIC/` table (resolved by naming convention, advisory) or a
+BW-generated `0BW:BIA:<PROVIDER>` view. For the latter the provider name is parsed from the view
+name and its **type confirmed** against the provider header tables, which yields the
+calc-view → CompositeProvider hop that BW's own where-used lists do not report. Each crossing
+carries `resolution` (`bic_table` / `bw_provider_view` / `unresolved`) so an unverified entry is
+never mistaken for a confirmed one.
 
 ### Risk analyzers (mission Section 9)
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `bw_check_load_latency` | `system`, `limit=25` | Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk) |
+| `bw_check_load_latency` | `system`, `limit=25` | Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk). Loads with no resolvable lookup have no contract to check and are counted in the caveats rather than reported as findings |
 | `bw_check_schedule_risk` | `system`, `limit` | Scenario 9.7: report schedules vs. feeding-chain p95 (needs a BI connector) |
 | `bw_find_layer_violations` | `system`, `max_dso_depth=3`, `limit` | CompositeProvider→DSO, CompositeProvider→InfoObject, deep DSO stacks |
 | `bw_review_scenario` | `system`, `scenario`, `limit=50` | Run any scenario by id (`9.1`–`9.8` or `layer_violations`) |
