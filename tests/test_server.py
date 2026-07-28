@@ -103,10 +103,10 @@ class _Conn:
             return [("SALES_DSO",)]  # search-by-name query (ODSOBJECT)
         if "RSTRANSTEPROUT" in sql:  # no field routines in this fixture
             return []
-        if "RSTRANFIELD" in sql:
-            return [(1, "1", "TARGETF"), (1, "0", "SOURCEF")]
-        if "RSTRANRULE" in sql:
-            return [(1, "DIRECT")]
+        if "RSTRANFIELD" in sql:  # RULEID, PARAMTYPE, FIELDNM, KEYFLAG
+            return [(1, "1", "TARGETF", "X"), (1, "0", "SOURCEF", "")]
+        if "RSTRANRULE" in sql:  # RULEID, RULETYPE, AGGR, GROUPTYPE, NO_CONV
+            return [(1, "DIRECT", "MOV", "S", "")]
         if "RSTRANT" in sql:
             return [("E", "Load one", "Load one target set")]
         if "RSAABAP" in sql:

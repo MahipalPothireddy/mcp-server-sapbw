@@ -37,6 +37,29 @@ RuleType = Literal[
 # Which routine slot the ABAP belongs to.
 RoutineKind = Literal["start", "end", "expert", "global", "field", "formula", "unit", "unknown"]
 
+# Aggregation behaviour of a rule (RSTRANRULE.AGGR). Decoded from the ABAP dictionary domain
+# RSTRAN_AGGREGATION (verified live), NOT assumed: MOV/SUM/MIN/MAX/NOP.
+AggregationBehaviour = Literal[
+    "direct_assignment",  # MOV - overwrite the target value
+    "summation",  # SUM - add to the target value
+    "minimum",  # MIN
+    "maximum",  # MAX
+    "none",  # NOP - no aggregation
+]
+
+# Rule group type (RSTRANRULE.GROUPTYPE, domain RSTRAN_GROUPTYPE).
+RuleGroupType = Literal["standard", "normal", "return_table", "technical_fields"]
+
+# What a declared lookup reads.
+LookupKind = Literal["master_data", "dso", "adso"]
+
+# What BW does when a declared lookup finds no record (RSTRANSTEPODSO/ADSO.BEHAVIOR,
+# domain RSTRAN_ODSO).
+LookupMissBehaviour = Literal["error", "constant"]
+
+# Key date a time-dependent master-data lookup reads at (RSTRANSTEPMASTER.MPER, domain RSMPER).
+LookupKeyDate = Literal["period_start", "period_end", "current_date", "constant_date"]
+
 # BW logical-object type of a transformation endpoint (RSTLOGO code -> readable kind).
 EndpointKind = Literal[
     "datasource",  # RSDS
@@ -63,8 +86,30 @@ class TransformationEndpoint(BaseModel):
     subtype: str | None = None
 
 
+class ConstantValue(BaseModel):
+    """The literal a ``CONSTANT`` rule writes (RSTRANSTEPCNST).
+
+    Without the value you cannot tell a meaningful business default from a technical zero-fill,
+    which is why the rule type alone is not enough.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str
+    internal_type: str | None = None  # ABAP internal type: C/N/D/T/P/I/F
+    internal_type_label: str | None = None
+    length: int | None = None
+    decimals: int | None = None
+
+
 class FieldMapping(BaseModel):
-    """One rule's field-level mapping: which target field(s) come from which source field(s)."""
+    """One rule's field-level mapping: which target field(s) come from which source field(s).
+
+    ``aggregation`` is the rule's aggregation behaviour (RSTRANRULE.AGGR, decoded from the ABAP
+    dictionary domain). It changes what every key figure in the target *means* — ``MOV`` (direct
+    assignment) overwrites the existing value, whereas ``SUM`` adds to it — so it is surfaced
+    alongside the mapping rather than left implicit.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -72,7 +117,41 @@ class FieldMapping(BaseModel):
     rule_type: RuleType
     target_fields: list[str] = Field(default_factory=list)  # RSTRANFIELD PARAMTYPE='1'
     source_fields: list[str] = Field(default_factory=list)  # RSTRANFIELD PARAMTYPE='0'
+    key_fields: list[str] = Field(default_factory=list)  # target fields with RSTRANFIELD.KEYFLAG
     routine_code_id: str | None = None  # set when the rule derives via a routine (-> RSAABAP)
+    aggregation: AggregationBehaviour | None = None  # decoded RSTRANRULE.AGGR
+    aggregation_code: str | None = None  # raw code, so an undecoded value is still visible
+    group_type: RuleGroupType | None = None  # decoded RSTRANRULE.GROUPTYPE
+    no_conversion: bool = False  # RSTRANRULE.NO_CONV: conversion routine suppressed
+    constant: ConstantValue | None = None  # populated for CONSTANT rules
+    provenance: Provenance
+
+
+class DeclaredLookup(BaseModel):
+    """A lookup the transformation *declares* against another object.
+
+    These come from the typed rule-step tables (``RSTRANSTEPMASTER`` for master-data reads,
+    ``RSTRANSTEPODSO`` / ``RSTRANSTEPADSO`` for DataStore reads), so unlike the dependencies the
+    routine parser infers from ABAP text these are **exact**: BW itself records them. That makes
+    them the reliable half of a transformation's read dependencies, and they are labelled
+    ``derivation='declared'`` wherever they feed lineage or latency analysis.
+
+    ``miss_behaviour`` is what happens when the lookup finds nothing — erroring the record versus
+    substituting a constant — which decides whether a missing master-data row fails the load or
+    silently changes the data.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: LookupKind
+    object_name: str
+    rule_id: int | None = None
+    step_id: int | None = None
+    miss_behaviour: LookupMissBehaviour | None = None
+    miss_constant: str | None = None  # value substituted when miss_behaviour == 'constant'
+    key_date: LookupKeyDate | None = None  # master-data lookups only
+    key_date_field: str | None = None  # RSTRANSTEPMASTER.DATEIOBJNM
+    derivation: Literal["declared"] = "declared"
     provenance: Provenance
 
 
@@ -112,9 +191,11 @@ class Transformation(BaseModel):
     target: TransformationEndpoint | None = None
     field_mappings: list[FieldMapping] = Field(default_factory=list)
     routines: list[RoutineRef] = Field(default_factory=list)
+    declared_lookups: list[DeclaredLookup] = Field(default_factory=list)
     has_start_routine: bool = False
     has_end_routine: bool = False
     has_expert_routine: bool = False
+    caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 
 

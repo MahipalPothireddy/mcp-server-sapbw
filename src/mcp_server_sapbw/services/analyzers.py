@@ -442,30 +442,63 @@ class Analyzers(Repository):
                     obj = dep.resolved_object
                     if obj and obj != target and obj not in looked_up:
                         looked_up.append(obj)
-        if not looked_up:
+        # Declared lookups (typed rule-step tables) are exact: BW records them itself. They are
+        # kept separate from the routine-parsed ones so a finding never blurs a recorded
+        # dependency with an inferred one.
+        declared: list[str] = []
+        declared_detail: list[dict[str, Any]] = []
+        for lookup in self._transformations.declared_lookups(tran_id):
+            evidence.append(lookup.provenance)
+            if lookup.object_name != target and lookup.object_name not in declared:
+                declared.append(lookup.object_name)
+            declared_detail.append(
+                {
+                    "object": lookup.object_name,
+                    "kind": lookup.kind,
+                    "key_date": lookup.key_date,
+                    "miss_behaviour": lookup.miss_behaviour,
+                }
+            )
+        if not looked_up and not declared:
             return None  # no resolvable lookup -> no latency contract to evaluate
+        all_lookups = declared + [obj for obj in looked_up if obj not in declared]
         delta = self._extractor_constraint(target)
+        # A lookup that substitutes a constant on a miss changes data silently instead of failing.
+        silent_miss = [
+            item["object"] for item in declared_detail if item["miss_behaviour"] == "constant"
+        ]
         return Finding(
             scenario="9.1",
-            severity="high" if len(looked_up) >= _MANY_LOOKUPS else "medium",
-            title="Full-update load reads other objects in its routines",
-            affected_objects=[target, *looked_up],
+            severity="high" if len(all_lookups) >= _MANY_LOOKUPS else "medium",
+            title="Full-update load reads other objects while loading",
+            affected_objects=[target, *all_lookups],
             evidence=evidence,
             recommendation=(
                 "Verify each looked-up object is refreshed at least as often as this full-update "
                 "load runs. If the load runs more than once daily and a looked-up object refreshes "
                 "once daily, the later run enriches new data against stale data. Prefer delta "
                 "loading or event-based sequencing after the looked-up object completes."
+                + (
+                    " Lookups that substitute a constant when no record is found will not fail the "
+                    "load - they change the data silently, so a stale or missing row is invisible."
+                    if silent_miss
+                    else ""
+                )
             ),
             detail=(
-                "Full-update load (UPDMODE='F') whose transformation routine reads "
-                f"{len(looked_up)} resolvable BW object(s)."
+                f"Full-update load (UPDMODE='F') with {len(declared)} declared lookup(s) "
+                f"(exact, from BW's rule-step tables) and {len(looked_up)} routine-parsed "
+                "read(s) (heuristic)."
                 + (f" Source extractor delta method: {delta}." if delta else "")
             ),
             metrics={
                 "target": target,
                 "tran_id": tran_id,
-                "looked_up_objects": looked_up,
+                "declared_lookups": declared,
+                "declared_lookup_detail": declared_detail,
+                "routine_lookup_objects": looked_up,
+                "looked_up_objects": all_lookups,
+                "silent_miss_lookups": silent_miss,
                 "update_mode": "F",
                 "extractor_delta_method": delta,
             },

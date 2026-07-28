@@ -22,6 +22,10 @@ _TABLES = {
     "transformation_rule": "RSTRANRULE",
     "transformation_field": "RSTRANFIELD",
     "transformation_step_rout": "RSTRANSTEPROUT",
+    "transformation_step_const": "RSTRANSTEPCNST",
+    "transformation_step_master": "RSTRANSTEPMASTER",
+    "transformation_step_dso": "RSTRANSTEPODSO",
+    "transformation_step_adso": "RSTRANSTEPADSO",
     "routine_source": "RSAABAP",
     "transformation_text": "RSTRANT",
 }
@@ -61,17 +65,32 @@ _TRAN["TRANSFORM02"] = (
     "",
     "",
 )
-_RULES = {"TRANSFORM01": [(1, "DIRECT"), (2, "ROUTINE"), (3, "CONSTANT")]}
-_FIELDS = {
+# RULEID, RULETYPE, AGGR, GROUPTYPE, NO_CONV
+_RULES = {
     "TRANSFORM01": [
-        (1, "1", "GL_ACCOUNT"),
-        (1, "0", "GLACCT"),
-        (2, "1", "AMOUNT"),
-        (2, "0", "DMBTR"),
-        (2, "0", "WRBTR"),
-        (3, "1", "COMPANY"),
+        (1, "DIRECT", "MOV", "S", ""),  # direct assignment = overwrite
+        (2, "ROUTINE", "SUM", "S", "X"),  # summation, conversion suppressed
+        (3, "CONSTANT", "", "T", ""),
     ]
 }
+# RULEID, PARAMTYPE ('1' target / '0' source), FIELDNM, KEYFLAG
+_FIELDS = {
+    "TRANSFORM01": [
+        (1, "1", "GL_ACCOUNT", "X"),  # target + part of the semantic key
+        (1, "0", "GLACCT", ""),
+        (2, "1", "AMOUNT", ""),
+        (2, "0", "DMBTR", ""),
+        (2, "0", "WRBTR", ""),
+        (3, "1", "COMPANY", ""),
+    ]
+}
+# RULEID, VALUE, INTTYPE, LENGTH, DECIMALS
+_CONSTANTS = {"TRANSFORM01": [(3, "1000", "C", 4, 0)]}
+# RULEID, STEPID, IOBJNM, MPER, DATEIOBJNM, CONSTANT
+_MASTER_LOOKUPS = {"TRANSFORM01": [(2, 1, "COST_CENTER", "2", "POSTING_DATE", "")]}
+# RULEID, STEPID, ODSOBJECT/ADSONM, BEHAVIOR, CONSTANT
+_DSO_LOOKUPS = {"TRANSFORM01": [(2, 2, "RATES_DSO", "C", "0.00")]}
+_ADSO_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {}
 _STEPROUT = {"TRANSFORM01": [(2, "CODEFIELD", "NORMAL")]}
 _SOURCE = {
     "CODESTART": ["METHOD start_routine.", "  SELECT * FROM mara INTO TABLE lt.", "ENDMETHOD."],
@@ -110,10 +129,18 @@ class ScriptedConnection:
             if "KIND" in sql:
                 return [(r[0], r[1], r[2]) for r in rows]
             return [(r[0], r[1]) for r in rows]
+        if "RSTRANSTEPCNST" in sql:
+            return list(_CONSTANTS.get(name, []))
+        if "RSTRANSTEPMASTER" in sql:
+            return list(_MASTER_LOOKUPS.get(name, []))
+        if "RSTRANSTEPODSO" in sql:
+            return list(_DSO_LOOKUPS.get(name, []))
+        if "RSTRANSTEPADSO" in sql:
+            return list(_ADSO_LOOKUPS.get(name, []))
         if "RSTRANFIELD" in sql:
-            return [(r[0], r[1], r[2]) for r in _FIELDS.get(name, [])]
+            return list(_FIELDS.get(name, []))
         if "RSTRANRULE" in sql:
-            return [(r[0], r[1]) for r in _RULES.get(name, [])]
+            return list(_RULES.get(name, []))
         if "RSTRANT" in sql:
             text = _TEXT.get(name)
             return [text] if text else []
@@ -254,3 +281,83 @@ def test_routine_code_unsupported_without_rsaabap() -> None:
     repo = _repo(present={"transformation", "transformation_rule", "transformation_field"})
     result = repo.get_routine_code("TRANSFORM01")
     assert isinstance(result, UnsupportedResult)
+
+
+# --- rule depth (slice 3) -----------------------------------------------------------------
+
+
+def test_aggregation_is_decoded_not_guessed() -> None:
+    """AGGR distinguishes overwrite from summation, which changes what a key figure means."""
+    tran = _repo().get_transformation("TRANSFORM01")
+    assert not isinstance(tran, UnsupportedResult)
+    by_rule = {m.rule_id: m for m in tran.field_mappings}
+    assert by_rule[1].aggregation == "direct_assignment"  # MOV
+    assert by_rule[1].aggregation_code == "MOV"
+    assert by_rule[2].aggregation == "summation"  # SUM
+    # An empty code decodes to nothing rather than a made-up default.
+    assert by_rule[3].aggregation is None
+    assert by_rule[3].aggregation_code is None
+
+
+def test_group_type_and_no_conversion_flags() -> None:
+    tran = _repo().get_transformation("TRANSFORM01")
+    assert not isinstance(tran, UnsupportedResult)
+    by_rule = {m.rule_id: m for m in tran.field_mappings}
+    assert by_rule[1].group_type == "standard"
+    assert by_rule[3].group_type == "technical_fields"
+    assert by_rule[2].no_conversion is True
+    assert by_rule[1].no_conversion is False
+
+
+def test_key_fields_are_separated_from_plain_targets() -> None:
+    tran = _repo().get_transformation("TRANSFORM01")
+    assert not isinstance(tran, UnsupportedResult)
+    by_rule = {m.rule_id: m for m in tran.field_mappings}
+    assert by_rule[1].target_fields == ["GL_ACCOUNT"]
+    assert by_rule[1].key_fields == ["GL_ACCOUNT"]  # KEYFLAG = 'X'
+    assert by_rule[2].key_fields == []  # target, but not part of the key
+
+
+def test_constant_value_is_surfaced_with_its_type() -> None:
+    """The rule type alone cannot distinguish a business default from a technical zero-fill."""
+    tran = _repo().get_transformation("TRANSFORM01")
+    assert not isinstance(tran, UnsupportedResult)
+    constant = {m.rule_id: m.constant for m in tran.field_mappings}[3]
+    assert constant is not None
+    assert constant.value == "1000"
+    assert constant.internal_type == "C"
+    assert constant.internal_type_label == "character"
+    assert constant.length == 4
+
+
+def test_declared_lookups_are_exact_and_carry_miss_behaviour() -> None:
+    tran = _repo().get_transformation("TRANSFORM01")
+    assert not isinstance(tran, UnsupportedResult)
+    lookups = {lookup.object_name: lookup for lookup in tran.declared_lookups}
+    assert set(lookups) == {"COST_CENTER", "RATES_DSO"}
+
+    master = lookups["COST_CENTER"]
+    assert master.kind == "master_data"
+    assert master.derivation == "declared"  # exact, unlike routine-parsed reads
+    assert master.key_date == "period_end"  # MPER = '2'
+    assert master.key_date_field == "POSTING_DATE"
+
+    dso = lookups["RATES_DSO"]
+    assert dso.kind == "dso"
+    # BEHAVIOR 'C': a miss substitutes a constant instead of failing the record.
+    assert dso.miss_behaviour == "constant"
+    assert dso.miss_constant == "0.00"
+
+
+def test_missing_lookup_tables_are_declared_as_a_caveat() -> None:
+    """An empty lookup list must be distinguishable from 'this release cannot tell us'."""
+    present = set(_TABLES) - {
+        "transformation_step_master",
+        "transformation_step_dso",
+        "transformation_step_adso",
+        "transformation_step_const",
+    }
+    tran = _repo(present).get_transformation("TRANSFORM01")
+    assert not isinstance(tran, UnsupportedResult)
+    assert tran.declared_lookups == []
+    assert any("RSTRANSTEPMASTER" in c for c in tran.caveats)

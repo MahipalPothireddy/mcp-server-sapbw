@@ -23,12 +23,19 @@ from typing import Any
 from ..core.dialect import like_term
 from ..models.provenance import UnsupportedResult
 from ..models.transformations import (
+    AggregationBehaviour,
+    ConstantValue,
+    DeclaredLookup,
     EndpointKind,
     FieldMapping,
+    LookupKeyDate,
+    LookupKind,
+    LookupMissBehaviour,
     RoutineAnalysis,
     RoutineCode,
     RoutineKind,
     RoutineRef,
+    RuleGroupType,
     RuleType,
     Transformation,
     TransformationEndpoint,
@@ -51,6 +58,43 @@ _RSTLOGO_TO_KIND: dict[str, EndpointKind] = {
     "HCPR": "compositeprovider",
     "IOBJ": "infoobject",
     "ELEM": "query_element",
+}
+
+# Rule-depth decodes. Every mapping below was read from the ABAP dictionary (DD03L -> DD07T fixed
+# domain values) on the live system rather than assumed, so the labels are SAP's own:
+#   RSTRAN_AGGREGATION, RSTRAN_GROUPTYPE, RSTRAN_ODSO, RSMPER.
+_AGGR_TO_BEHAVIOUR: dict[str, AggregationBehaviour] = {
+    "MOV": "direct_assignment",  # overwrite the target value
+    "SUM": "summation",  # add to the target value
+    "MIN": "minimum",
+    "MAX": "maximum",
+    "NOP": "none",
+}
+_GROUPTYPE_TO_KIND: dict[str, RuleGroupType] = {
+    "S": "standard",
+    "N": "normal",
+    "R": "return_table",
+    "T": "technical_fields",
+}
+# RSTRANSTEPODSO/ADSO.BEHAVIOR: what BW does when the lookup finds no record.
+_BEHAVIOR_TO_MISS: dict[str, LookupMissBehaviour] = {"": "error", "C": "constant"}
+# RSTRANSTEPMASTER.MPER: which key date a time-dependent master-data read uses.
+_MPER_TO_KEY_DATE: dict[str, LookupKeyDate] = {
+    "1": "period_start",
+    "2": "period_end",
+    "3": "current_date",
+    "4": "constant_date",
+}
+# RSTRANSTEPCNST.INTTYPE: ABAP internal type of a constant value.
+_INTTYPE_LABEL: dict[str, str] = {
+    "C": "character",
+    "N": "numeric text",
+    "D": "date",
+    "T": "time",
+    "P": "packed decimal",
+    "I": "integer",
+    "F": "floating point",
+    "X": "byte",
 }
 
 # RSTRANRULE.RULETYPE code -> RuleType (codes are upper-case words on the wire).
@@ -236,18 +280,42 @@ class TransformationsRepository(Repository):
             target=_endpoint(row[4], row[5], row[6]),
             field_mappings=self._field_mappings(tran_id),
             routines=refs,
+            declared_lookups=self._declared_lookups_or_note(tran_id),
             has_start_routine=bool(_clean(row[7])),
             has_end_routine=bool(_clean(row[8])),
             has_expert_routine=bool(_clean(row[9])),
+            caveats=self._structure_caveats(),
             provenance=self.provenance("transformation", {"TRANID": tran_id, "OBJVERS": "A"}),
         )
+
+    def _declared_lookups_or_note(self, tran_id: str) -> list[DeclaredLookup]:
+        return self.declared_lookups(tran_id)
+
+    def _structure_caveats(self) -> list[str]:
+        """Say which rule-depth sources were unavailable, so an empty list is not read as 'none'."""
+        missing = [
+            physical
+            for logical, physical in (
+                ("transformation_step_const", "RSTRANSTEPCNST"),
+                ("transformation_step_master", "RSTRANSTEPMASTER"),
+                ("transformation_step_dso", "RSTRANSTEPODSO"),
+                ("transformation_step_adso", "RSTRANSTEPADSO"),
+            )
+            if not self.capability.is_available(logical)
+        ]
+        if not missing:
+            return []
+        return [
+            f"not available on this release: {', '.join(missing)}; declared lookups and/or "
+            "constant values may be incomplete"
+        ]
 
     def _field_mappings(self, tran_id: str) -> list[FieldMapping]:
         if not self.capability.is_available("transformation_rule"):
             return []
         rules = self.select(
             self.dialect.build_select(
-                columns=["RULEID", "RULETYPE"],
+                columns=["RULEID", "RULETYPE", "AGGR", "GROUPTYPE", "NO_CONV"],
                 from_logical="transformation_rule",
                 where=["TRANID = ?"],
                 params=[tran_id],
@@ -256,19 +324,27 @@ class TransformationsRepository(Repository):
         )
         fields_by_rule = self._fields_by_rule(tran_id)
         routine_by_rule = self._routine_code_by_rule(tran_id)
+        constants = self._constants_by_rule(tran_id)
         mappings: list[FieldMapping] = []
-        for rule_id_raw, ruletype in rules:
+        for rule_id_raw, ruletype, aggr, grouptype, no_conv in rules:
             rule_id = _as_int(rule_id_raw)
             if rule_id is None:
                 continue
-            targets, sources = fields_by_rule.get(rule_id, ([], []))
+            targets, sources, keys = fields_by_rule.get(rule_id, ([], [], []))
+            aggr_code = _clean(aggr)
             mappings.append(
                 FieldMapping(
                     rule_id=rule_id,
                     rule_type=_RULETYPE_TO_RULE.get(str(ruletype).strip(), "unknown"),
                     target_fields=targets,
                     source_fields=sources,
+                    key_fields=keys,
                     routine_code_id=routine_by_rule.get(rule_id),
+                    aggregation=_AGGR_TO_BEHAVIOUR.get(aggr_code or ""),
+                    aggregation_code=aggr_code,
+                    group_type=_GROUPTYPE_TO_KIND.get(_clean(grouptype) or ""),
+                    no_conversion=str(no_conv).strip().upper() == "X",
+                    constant=constants.get(rule_id),
                     provenance=self.provenance(
                         "transformation_rule", {"TRANID": tran_id, "RULEID": str(rule_id)}
                     ),
@@ -276,28 +352,144 @@ class TransformationsRepository(Repository):
             )
         return mappings
 
-    def _fields_by_rule(self, tran_id: str) -> dict[int, tuple[list[str], list[str]]]:
+    def _constants_by_rule(self, tran_id: str) -> dict[int, ConstantValue]:
+        """The literal each CONSTANT rule writes (RSTRANSTEPCNST)."""
+        if not self.capability.is_available("transformation_step_const"):
+            return {}
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["RULEID", "VALUE", "INTTYPE", "LENGTH", "DECIMALS"],
+                from_logical="transformation_step_const",
+                where=["TRANID = ?"],
+                params=[tran_id],
+                order_by=["RULEID", "STEPID"],
+            )
+        )
+        result: dict[int, ConstantValue] = {}
+        for rule_id_raw, value, inttype, length, decimals in rows:
+            rule_id = _as_int(rule_id_raw)
+            if rule_id is None or rule_id in result:
+                continue
+            code = _clean(inttype)
+            result[rule_id] = ConstantValue(
+                value="" if value is None else str(value).strip(),
+                internal_type=code,
+                internal_type_label=_INTTYPE_LABEL.get(code or ""),
+                length=_as_int(length),
+                decimals=_as_int(decimals),
+            )
+        return result
+
+    def declared_lookups(self, tran_id: str) -> list[DeclaredLookup]:
+        """Lookups the transformation declares, from the typed rule-step tables.
+
+        Exact by construction — BW records these itself — unlike the routine parser's inferred
+        reads. Master-data lookups additionally carry the key-date rule they read at.
+        """
+        lookups: list[DeclaredLookup] = []
+        lookups.extend(self._master_lookups(tran_id))
+        lookups.extend(self._store_lookups(tran_id, "transformation_step_dso", "ODSOBJECT", "dso"))
+        lookups.extend(self._store_lookups(tran_id, "transformation_step_adso", "ADSONM", "adso"))
+        lookups.sort(key=lambda item: (item.kind, item.object_name))
+        return lookups
+
+    def _master_lookups(self, tran_id: str) -> list[DeclaredLookup]:
+        if not self.capability.is_available("transformation_step_master"):
+            return []
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["RULEID", "STEPID", "IOBJNM", "MPER", "DATEIOBJNM", "CONSTANT"],
+                from_logical="transformation_step_master",
+                where=["TRANID = ?"],
+                params=[tran_id],
+                order_by=["RULEID", "STEPID"],
+            )
+        )
+        out: list[DeclaredLookup] = []
+        for rule_id, step_id, iobjnm, mper, date_iobj, constant in rows:
+            name = _clean(iobjnm)
+            if name is None:
+                continue
+            out.append(
+                DeclaredLookup(
+                    kind="master_data",
+                    object_name=name,
+                    rule_id=_as_int(rule_id),
+                    step_id=_as_int(step_id),
+                    key_date=_MPER_TO_KEY_DATE.get(_clean(mper) or ""),
+                    key_date_field=_clean(date_iobj),
+                    miss_constant=_clean(constant),
+                    provenance=self.provenance(
+                        "transformation_step_master", {"TRANID": tran_id, "IOBJNM": name}
+                    ),
+                )
+            )
+        return out
+
+    def _store_lookups(
+        self, tran_id: str, logical: str, name_column: str, kind: LookupKind
+    ) -> list[DeclaredLookup]:
+        if not self.capability.is_available(logical):
+            return []
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["RULEID", "STEPID", name_column, "BEHAVIOR", "CONSTANT"],
+                from_logical=logical,
+                where=["TRANID = ?"],
+                params=[tran_id],
+                order_by=["RULEID", "STEPID"],
+            )
+        )
+        out: list[DeclaredLookup] = []
+        for rule_id, step_id, obj, behavior, constant in rows:
+            name = _clean(obj)
+            if name is None:
+                continue
+            out.append(
+                DeclaredLookup(
+                    kind=kind,
+                    object_name=name,
+                    rule_id=_as_int(rule_id),
+                    step_id=_as_int(step_id),
+                    miss_behaviour=_BEHAVIOR_TO_MISS.get((_clean(behavior) or "").upper(), "error"),
+                    miss_constant=_clean(constant),
+                    provenance=self.provenance(logical, {"TRANID": tran_id, name_column: name}),
+                )
+            )
+        return out
+
+    def _fields_by_rule(self, tran_id: str) -> dict[int, tuple[list[str], list[str], list[str]]]:
+        """Per rule: ``(target_fields, source_fields, key_fields)``.
+
+        ``KEYFLAG`` marks a target field as part of the target's semantic key, which is what decides
+        whether a second record overwrites the first or lands beside it.
+        """
         if not self.capability.is_available("transformation_field"):
             return {}
         rows = self.select(
             self.dialect.build_select(
-                columns=["RULEID", "PARAMTYPE", "FIELDNM"],
+                columns=["RULEID", "PARAMTYPE", "FIELDNM", "KEYFLAG"],
                 from_logical="transformation_field",
                 where=["TRANID = ?"],
                 params=[tran_id],
                 order_by=["RULEID", "RULEPOSIT"],
             )
         )
-        result: dict[int, tuple[list[str], list[str]]] = defaultdict(lambda: ([], []))
-        for rule_id_raw, paramtype, fieldnm in rows:
+        result: dict[int, tuple[list[str], list[str], list[str]]] = defaultdict(
+            lambda: ([], [], [])
+        )
+        for rule_id_raw, paramtype, fieldnm, keyflag in rows:
             rule_id = _as_int(rule_id_raw)
             field = _clean(fieldnm)
             if rule_id is None or field is None:
                 continue
-            targets, sources = result[rule_id]
-            bucket = targets if _as_int(paramtype) == 1 else sources
+            targets, sources, keys = result[rule_id]
+            is_target = _as_int(paramtype) == 1
+            bucket = targets if is_target else sources
             if field not in bucket:
                 bucket.append(field)
+            if is_target and str(keyflag).strip().upper() == "X" and field not in keys:
+                keys.append(field)
         return result
 
     def _routine_code_by_rule(self, tran_id: str) -> dict[int, str]:

@@ -59,6 +59,12 @@ ABAP_TABLES: dict[str, str] = {
     # MASTER, ODSO, ...) which B5 (transformations) will validate and read as needed.
     "transformation_rule_step": "RSTRANRULESTEP",
     "transformation_step_rout": "RSTRANSTEPROUT",  # rule/step -> routine CODEID (field routines)
+    # Typed rule-step tables (all confirmed live on 7.50). These record the lookups and constants
+    # BW itself knows about, so they are exact where the routine parser is only heuristic.
+    "transformation_step_const": "RSTRANSTEPCNST",  # the literal a CONSTANT rule writes
+    "transformation_step_master": "RSTRANSTEPMASTER",  # declared master-data (InfoObject) lookups
+    "transformation_step_dso": "RSTRANSTEPODSO",  # declared classic-DSO lookups
+    "transformation_step_adso": "RSTRANSTEPADSO",  # declared advanced-DSO lookups
     "transformation_seg": "RSTRANSEG",
     "routine_source": "RSAABAP",  # ABAP source lines; NOTE prefix RSA -> no auto OBJVERS injection
     "dtp": "RSBKDTP",

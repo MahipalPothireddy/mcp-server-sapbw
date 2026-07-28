@@ -52,15 +52,17 @@ _HEADER: dict[str, tuple[Any, ...]] = {
     # Several looked-up objects -> escalated severity.
     "TR_MANY": ("ACT", "RSDS", "", "DS_SRC", "ODSO", "", "FULL_DSO", "CODE_MANY", "", "", "", ""),
 }
+# RULEID, RULETYPE, AGGR, GROUPTYPE, NO_CONV
 _RULES: dict[str, list[tuple[Any, ...]]] = {
-    "TR_M1": [(1, "DIRECT")],
-    "TR_M2": [(1, "DIRECT")],
-    "TR_M3": [(1, "DIRECT")],
+    "TR_M1": [(1, "DIRECT", "MOV", "S", "")],
+    "TR_M2": [(1, "DIRECT", "MOV", "S", "")],
+    "TR_M3": [(1, "DIRECT", "MOV", "S", "")],
 }
+# RULEID, PARAMTYPE, FIELDNM, KEYFLAG
 _FIELDS: dict[str, list[tuple[Any, ...]]] = {
-    "TR_M1": [(1, 1, "AMOUNT"), (1, 0, "S_AMT")],
-    "TR_M2": [(1, 1, "AMOUNT"), (1, 0, "B_AMT")],  # AMOUNT collides with TR_M1
-    "TR_M3": [(1, 1, "QTY"), (1, 0, "S_QTY")],
+    "TR_M1": [(1, 1, "AMOUNT", ""), (1, 0, "S_AMT", "")],
+    "TR_M2": [(1, 1, "AMOUNT", ""), (1, 0, "B_AMT", "")],  # AMOUNT collides with TR_M1
+    "TR_M3": [(1, 1, "QTY", ""), (1, 0, "S_QTY", "")],
 }
 _BIC_MANY = ["/BIC/" + f"AL{n}DSO00" for n in (1, 2, 3)]  # -> L1DSO / L2DSO / L3DSO
 _RSAABAP = {
