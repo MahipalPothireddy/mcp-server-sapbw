@@ -20,6 +20,7 @@ from math import ceil, floor
 from typing import Any
 
 from ..core.capabilities import MAX_RUNTIME_WINDOW_DAYS
+from ..core.dialect import like_term
 from ..models.chains import (
     Chain,
     ChainEdge,
@@ -148,8 +149,9 @@ class ChainsRepository(Repository):
             where.append("OBJSTAT = ?")
             params.append("ACT")
         if name_pattern:
-            where.append("CHAIN_ID LIKE ?")
-            params.append(name_pattern)
+            like = like_term(name_pattern)
+            where.append(like.clause("CHAIN_ID"))
+            params.append(like.value)
 
         base = self.dialect.build_select(
             columns=["CHAIN_ID", "APPLNM", "OBJSTAT"],

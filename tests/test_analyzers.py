@@ -47,6 +47,10 @@ _HEADER: dict[str, tuple[Any, ...]] = {
     "TR_M2": ("ACT", "ODSO", "", "BILL_DSO", "ODSO", "", "MERGE_DSO", "", "", "", "", ""),
     "TR_M3": ("ACT", "ODSO", "", "SHIP_DSO", "ODSO", "", "MERGE_DSO", "", "", "", "", ""),
     "TR_FULL": ("ACT", "RSDS", "", "DS_SRC", "ODSO", "", "FULL_DSO", "CODE_FULL", "", "", "", ""),
+    # Same full-update target, but its routine reads nothing resolvable -> no latency contract.
+    "TR_NONE": ("ACT", "RSDS", "", "DS_SRC", "ODSO", "", "FULL_DSO", "CODE_NONE", "", "", "", ""),
+    # Several looked-up objects -> escalated severity.
+    "TR_MANY": ("ACT", "RSDS", "", "DS_SRC", "ODSO", "", "FULL_DSO", "CODE_MANY", "", "", "", ""),
 }
 _RULES: dict[str, list[tuple[Any, ...]]] = {
     "TR_M1": [(1, "DIRECT")],
@@ -58,8 +62,16 @@ _FIELDS: dict[str, list[tuple[Any, ...]]] = {
     "TR_M2": [(1, 1, "AMOUNT"), (1, 0, "B_AMT")],  # AMOUNT collides with TR_M1
     "TR_M3": [(1, 1, "QTY"), (1, 0, "S_QTY")],
 }
+_BIC_MANY = ["/BIC/" + f"AL{n}DSO00" for n in (1, 2, 3)]  # -> L1DSO / L2DSO / L3DSO
 _RSAABAP = {
-    "CODE_FULL": ["METHOD start.", "  SELECT * FROM " + _BIC_LOOKUP + " INTO lt.", "ENDMETHOD."]
+    "CODE_FULL": ["METHOD start.", "  SELECT * FROM " + _BIC_LOOKUP + " INTO lt.", "ENDMETHOD."],
+    # A plain (non-generated) table: parsed as a dependency, but resolves to no BW object.
+    "CODE_NONE": ["METHOD start.", "  SELECT * FROM mara INTO TABLE lt.", "ENDMETHOD."],
+    "CODE_MANY": [
+        "METHOD start.",
+        *(f"  SELECT * FROM {table} INTO lt." for table in _BIC_MANY),
+        "ENDMETHOD.",
+    ],
 }
 _MERGED_GROUP = [
     ("MERGE_DSO", 3),
@@ -124,7 +136,7 @@ class ScriptedConnection:
             # returning [] when it is missing makes the offline test catch that regression.
             return _MERGED_GROUP if "GROUP BY" in sql else []
         if "STARTROUTINE <> ''" in sql:  # 9.1 routine-bearing transformations into DSOs
-            return [("TR_FULL", "FULL_DSO")]
+            return [("TR_FULL", "FULL_DSO"), ("TR_MANY", "FULL_DSO"), ("TR_NONE", "FULL_DSO")]
         if "SOURCETYPE IN ('ODSO', 'ADSO')" in sql:  # DSO->DSO edges (9.2 / layer)
             return _DSO_EDGES
         if "SOURCETYPE = ?" in sql:  # CP edges (9.3 / 9.4 / layer)
@@ -195,11 +207,41 @@ def test_check_load_latency_finds_routine_lookup() -> None:
     report = _analyzers().check_load_latency()
     assert not isinstance(report, UnsupportedResult)
     assert report.scenario == "9.1"
-    assert report.finding_count == 1
-    finding = report.findings[0]
+    by_tran = {f.metrics["tran_id"]: f for f in report.findings}
+    finding = by_tran["TR_FULL"]
     assert finding.metrics["target"] == "FULL_DSO"
     assert "LOOKUP" in finding.metrics["looked_up_objects"]
     assert finding.metrics["extractor_delta_method"] == "ADD"
+
+
+def test_check_load_latency_excludes_loads_with_no_resolvable_lookup() -> None:
+    """Regression: a full-update load whose routines resolve no lookup has no latency contract to
+    check, but was still emitted as a finding — crowding real risks out of the page."""
+    report = _analyzers().check_load_latency()
+    assert not isinstance(report, UnsupportedResult)
+    assert "TR_NONE" not in {f.metrics["tran_id"] for f in report.findings}
+    assert report.analyzed_count == 3  # it was examined, not skipped silently
+    assert report.finding_count == 2
+    assert any("1 of 3 evaluated" in caveat for caveat in report.caveats)
+
+
+def test_check_load_latency_severity_scales_with_lookup_count() -> None:
+    report = _analyzers().check_load_latency()
+    assert not isinstance(report, UnsupportedResult)
+    by_tran = {f.metrics["tran_id"]: f for f in report.findings}
+    assert by_tran["TR_FULL"].severity == "medium"  # one looked-up object
+    assert by_tran["TR_MANY"].severity == "high"  # three looked-up objects
+    assert len(by_tran["TR_MANY"].metrics["looked_up_objects"]) == 3
+    # most-severe-first ordering means the riskiest finding leads the report
+    assert report.findings[0].metrics["tran_id"] == "TR_MANY"
+
+
+def test_check_load_latency_reports_page_truncation() -> None:
+    report = _analyzers().check_load_latency(limit=1)
+    assert not isinstance(report, UnsupportedResult)
+    assert report.finding_count == 1
+    assert report.truncated is True
+    assert any("of 3 full-update candidates were parsed" in c for c in report.caveats)
     # The object->chain frequency gap must be documented, not guessed.
     assert any("loading-chain" in c or "cadence" in c for c in report.caveats)
 

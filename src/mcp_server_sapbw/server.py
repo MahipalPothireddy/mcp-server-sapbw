@@ -338,7 +338,11 @@ def bw_list_chains(
     limit: int = _DEFAULT_PAGE,
     offset: int = 0,
 ) -> ChainListResult | UnsupportedResult:
-    """Process chains filtered by name pattern / active status, paginated with a total_count."""
+    """Process chains filtered by name pattern / active status, paginated with a total_count.
+
+    ``name_pattern`` is a substring match on the chain id, case-insensitive, with ``_`` treated
+    literally. Include ``%`` to author the wildcards yourself (e.g. ``LOAD%`` to anchor the start).
+    """
     limit, offset = _clamp_page(limit, offset)
     result = (
         runtime()
@@ -410,7 +414,11 @@ def bw_search_objects(
     limit: int = _DEFAULT_PAGE,
     offset: int = 0,
 ) -> SearchResult:
-    """Fuzzy search by technical name or description across chains, providers, and InfoObjects."""
+    """Fuzzy search by technical name or description across chains, providers, and InfoObjects.
+
+    ``pattern`` is a substring match, case-insensitive, with ``_`` treated literally — so a partial
+    BW name like ``SD_O3`` works. Include ``%`` to author the wildcards yourself.
+    """
     limit, offset = _clamp_page(limit, offset)
     items, total = (
         runtime()
@@ -439,7 +447,12 @@ def bw_list_transformations(
     limit: int = _DEFAULT_PAGE,
     offset: int = 0,
 ) -> TransformationListResult | UnsupportedResult:
-    """Transformations filtered by source/target name or routine presence, paginated."""
+    """Transformations filtered by source/target name or routine presence, paginated.
+
+    ``source_name`` / ``target_name`` are substring matches (``_`` literal). This is deliberate: a
+    DataSource endpoint is stored as ``<DATASOURCE><padding><LOGSYS>``, so passing just the
+    DataSource name works. Include ``%`` to author the wildcards yourself.
+    """
     limit, offset = _clamp_page(limit, offset)
     result = (
         runtime()
@@ -595,7 +608,12 @@ def bw_list_calc_views(
 
 @_readonly_tool
 def bw_get_calc_view_lineage(system: str, view_name: str) -> CalcViewLineage | UnsupportedResult:
-    """A calc view's direct base tables (SYS.OBJECT_DEPENDENCIES), resolved to BW objects."""
+    """A calc view's base tables and the InfoProviders consuming it, resolved to BW objects.
+
+    Base tables come from SYS.OBJECT_DEPENDENCIES with ``/BIC/`` names resolved (advisory).
+    ``consuming_bw_providers`` reads BW's generated ``0BW:BIA:<PROVIDER>`` views, giving the
+    calc-view -> CompositeProvider hop that BW's own where-used lists omit.
+    """
     return runtime().hana(system).get_calc_view_lineage(view_name)
 
 
@@ -603,7 +621,12 @@ def bw_get_calc_view_lineage(system: str, view_name: str) -> CalcViewLineage | U
 def bw_get_hana_crossings(
     system: str, calc_view: str | None = None, limit: int = _DEFAULT_PAGE, offset: int = 0
 ) -> HanaCrossingReport | UnsupportedResult:
-    """Every BW<->HANA boundary crossing, both directions (calc-view<->BW-object)."""
+    """Every BW<->HANA boundary crossing, both directions (calc-view<->BW-object).
+
+    Each crossing says how its BW side was resolved: ``bic_table`` (from a ``/BIC/`` name,
+    advisory), ``bw_provider_view`` (a ``0BW:BIA:`` view parsed to its InfoProvider and
+    type-confirmed), or ``unresolved``.
+    """
     limit, offset = _clamp_page(limit, offset)
     return (
         runtime().hana(system).get_hana_crossings(calc_view=calc_view, limit=limit, offset=offset)
@@ -615,7 +638,11 @@ def bw_get_hana_crossings(
 
 @_readonly_tool
 def bw_check_load_latency(system: str, limit: int = 25) -> ScenarioReport | UnsupportedResult:
-    """Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk)."""
+    """Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk).
+
+    Only loads with at least one resolvable lookup are findings; candidates whose routine reads did
+    not resolve carry no checkable latency contract and are counted in the caveats instead.
+    """
     limit, _ = _clamp_page(limit, 0)
     return runtime().analyzers(system).check_load_latency(limit=limit)
 

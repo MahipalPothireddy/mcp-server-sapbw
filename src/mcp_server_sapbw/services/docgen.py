@@ -23,6 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..connectors.base import ConnectorRegistry
 from ..models.capability import CapabilityRecord
 from ..models.description import Description
+from ..models.hana import HanaCrossingReport
 from ..models.lineage import LineageGraph
 from ..models.provenance import UnsupportedResult
 from ..models.providers import ObjectNotFound
@@ -711,11 +712,45 @@ class DocGenerator(Repository):
                 f"BW reads HANA: {crossings.bw_reads_hana_count})",
                 "",
             ]
+            page += self._calc_view_consumers(crossings)
             for caveat in crossings.caveats:
                 self._gaps.add("hana crossings", caveat)
         page += rows
         page.append(self._citation("SYS.VIEWS, SYS.OBJECT_DEPENDENCIES"))
         self._write(base, "07-hana/index.md", "\n".join(page))
+
+    @staticmethod
+    def _calc_view_consumers(crossings: HanaCrossingReport) -> list[str]:
+        """The calc-view -> consuming-InfoProvider hop, from the crossing rows already fetched."""
+        consumers = [
+            crossing
+            for crossing in crossings.crossings
+            if crossing.direction == "bw_reads_hana" and crossing.resolution == "bw_provider_view"
+        ]
+        if not consumers:
+            return []
+        lines = [
+            "### Calc view -> consuming InfoProvider",
+            "",
+            "Derived from the BW-generated `0BW:BIA:<PROVIDER>` views. For a CompositeProvider "
+            "this is the calc-view -> CompositeProvider hop, which BW's own where-used lists do "
+            "not report.",
+            "",
+            "| Calc view | Consuming provider | Kind | Verified |",
+            "|---|---|---|---|",
+        ]
+        seen: set[tuple[str, str]] = set()
+        for crossing in consumers:
+            provider = crossing.bw_object_resolved or "?"
+            key = (crossing.hana_object, provider)
+            if key in seen:
+                continue  # the ':J1.CALC.n' internal nodes all name the same provider
+            seen.add(key)
+            kind = crossing.bw_object_kind or "unverified"
+            verified = "yes" if crossing.bw_object_kind else "no"
+            lines.append(f"| {crossing.hana_object} | {provider} | {kind} | {verified} |")
+        lines.append("")
+        return lines
 
     # --- 08 scenarios --------------------------------------------------------------------
 

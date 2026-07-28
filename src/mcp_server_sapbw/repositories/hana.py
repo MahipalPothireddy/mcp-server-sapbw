@@ -5,15 +5,25 @@ dependencies from ``SYS.OBJECT_DEPENDENCIES`` (DEPENDENCY_TYPE=1 = direct, valid
 resolving BW-generated ``/BIC/`` / ``/BI0/`` base tables back to BW objects (advisory, reusing the
 routine parser's resolver). Builds the bidirectional BW<->HANA crossing table. The SYS catalog
 views are OBJVERS-free and schema-qualified as ``SYS`` via the capability record.
+
+BW also generates a HANA view per InfoProvider in the ABAP schema, named
+``0BW:BIA:<PROVIDER>`` with internal nodes suffixed ``:<node>`` / ``.<node>`` (e.g.
+``0BW:BIA:<CP>:J1.CALC.1``). Those views are what appear on the BW side of a ``bw_reads_hana``
+crossing, so parsing the provider out of the name (:func:`_bw_view_provider`) and confirming its
+type against the provider header tables (:meth:`HanaRepository.resolve_bw_view_providers`) is what
+maps a calc view to the **CompositeProvider that consumes it** — the boundary hop BW's own
+where-used lists do not show. The provider name is parsed from the naming convention; its *type* is
+verified by lookup, not guessed.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from ..core.dialect import quote_ident
 from ..models.hana import (
     BaseTableRef,
+    BwProviderView,
     CalcView,
     CalcViewLineage,
     CalcViewType,
@@ -22,6 +32,7 @@ from ..models.hana import (
     HanaCrossingReport,
 )
 from ..models.provenance import UnsupportedResult
+from ..models.providers import classify_cube_type
 from ..services.routine_parser import _resolve_bw_table
 from .base import Repository
 
@@ -37,6 +48,18 @@ _CALC_SCHEMA = "_SYS_BIC"
 _DIRECT = 1  # SYS.OBJECT_DEPENDENCIES.DEPENDENCY_TYPE = direct dependency
 _MAX_BASE_TABLES = 500
 _MAX_CONSUMING = 5000
+_MAX_PROVIDER_CONSUMERS = 200  # BW provider views resolved per calc-view lineage call
+
+# BW-generated per-InfoProvider HANA view: '0BW:BIA:<PROVIDER>' plus optional ':node' / '.node'.
+_BW_VIEW_PREFIX = "0BW:BIA:"
+# Provider header tables probed to confirm a parsed provider name, most specific first.
+# (logical table, id column, kind) — 'cube_header' is refined by CUBETYPE.
+_PROVIDER_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("composite_header", "HCPRNM", "compositeprovider"),
+    ("adso_header", "ADSONM", "adso"),
+    ("dso_header", "ODSOBJECT", "dso"),
+    ("cube_header", "INFOCUBE", "infocube"),
+)
 
 
 def _clean(value: Any) -> str | None:
@@ -49,6 +72,21 @@ def _clean(value: Any) -> str | None:
 def _is_bw_generated(name: str) -> bool:
     upper = name.upper()
     return upper.startswith(("/BIC/", "/BI0/"))
+
+
+def _bw_view_provider(name: str) -> str | None:
+    """Provider name inside a BW-generated view name (``0BW:BIA:<PROVIDER>[:node][.node]``).
+
+    Returns ``None`` for anything that is not a ``0BW:BIA:`` view (including BW's internal helper
+    views such as the lower-cased pruning views, which name no provider).
+    """
+    upper = name.strip().upper()
+    if not upper.startswith(_BW_VIEW_PREFIX):
+        return None
+    rest = upper[len(_BW_VIEW_PREFIX) :]
+    for separator in (":", "."):
+        rest = rest.partition(separator)[0]
+    return rest.strip() or None
 
 
 class HanaRepository(Repository):
@@ -147,14 +185,24 @@ class HanaRepository(Repository):
                     ),
                 )
             )
+        consumers, consumers_truncated = self._consuming_bw_providers(view_name)
         caveats = ["/BIC/ and /BI0/ base-table resolution to BW objects is advisory (naming-based)"]
+        if consumers:
+            caveats.append(
+                "consuming BW providers are read from the '0BW:BIA:<PROVIDER>' generated views; "
+                "the provider name is parsed from the view name and its type confirmed against the "
+                "provider header tables (unverified entries are flagged)"
+            )
         if truncated:
             caveats.append(f"base-table list capped at {_MAX_BASE_TABLES}")
+        if consumers_truncated:
+            caveats.append(f"consuming-provider list capped at {_MAX_PROVIDER_CONSUMERS}")
         return CalcViewLineage(
             view_name=view_name,
             base_tables=base_tables,
             resolved_bw_objects=resolved,
-            truncated=truncated,
+            consuming_bw_providers=consumers,
+            truncated=truncated or consumers_truncated,
             caveats=caveats,
             provenance=self.provenance(
                 "object_dependencies",
@@ -209,8 +257,9 @@ class HanaRepository(Repository):
         )
         total = self._count(base)
         rows = self.select(self.dialect.paginate(base, limit=limit, offset=offset))
+        # This direction is filtered to /BIC/ and /BI0/ base tables in SQL, so no BW provider views.
         crossings = [
-            self._crossing("hana_reads_bw", str(dep), str(base_obj), str(base_type))
+            self._crossing("hana_reads_bw", str(dep), str(base_obj), str(base_type), {})
             for dep, base_obj, base_type in rows
         ]
         return crossings, total, total > offset + limit
@@ -232,29 +281,139 @@ class HanaRepository(Repository):
         )
         total = self._count(base)
         rows = self.select(self.dialect.paginate(base, limit=limit, offset=offset))
+        # The BW side here is a BW-generated object; '0BW:BIA:<PROVIDER>' views resolve to the
+        # consuming InfoProvider (this is the calc-view -> CompositeProvider hop).
+        provider_views = self.resolve_bw_view_providers([str(dep) for _, dep, _ in rows])
         crossings = [
-            self._crossing("bw_reads_hana", str(base_obj), str(dep), str(dep_type))
+            self._crossing("bw_reads_hana", str(base_obj), str(dep), str(dep_type), provider_views)
             for base_obj, dep, dep_type in rows
         ]
         return crossings, total, total > offset + limit
 
     def _crossing(
-        self, direction: CrossingDirection, hana_object: str, bw_object: str, object_type: str
+        self,
+        direction: CrossingDirection,
+        hana_object: str,
+        bw_object: str,
+        object_type: str,
+        provider_views: dict[str, BwProviderView],
     ) -> HanaCrossing:
-        resolved, kind = (
-            _resolve_bw_table(bw_object) if _is_bw_generated(bw_object) else (None, None)
-        )
+        resolution: Literal["bic_table", "bw_provider_view", "unresolved"] = "unresolved"
+        resolved: str | None = None
+        kind: str | None = None
+        if _is_bw_generated(bw_object):
+            resolved, kind = _resolve_bw_table(bw_object)
+            if resolved is not None:
+                resolution = "bic_table"
+        elif (view := provider_views.get(bw_object)) is not None:
+            resolved, kind = view.provider, view.resolved_kind
+            resolution = "bw_provider_view"
         return HanaCrossing(
             direction=direction,
             hana_object=hana_object,
             bw_object=bw_object,
             bw_object_resolved=resolved,
             bw_object_kind=kind,
+            resolution=resolution,
             object_type=_clean(object_type),
             provenance=self.provenance(
                 "object_dependencies", {"HANA": hana_object, "BW": bw_object}
             ),
         )
+
+    # --- BW provider views (0BW:BIA:) ----------------------------------------------------
+
+    def _consuming_bw_providers(self, view_name: str) -> tuple[list[BwProviderView], bool]:
+        """InfoProviders whose generated views read this calc view (the BW side of the boundary)."""
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["DEPENDENT_OBJECT_NAME"],
+                    from_logical="object_dependencies",
+                    where=[
+                        "BASE_SCHEMA_NAME = ?",
+                        "BASE_OBJECT_NAME = ?",
+                        "DEPENDENT_SCHEMA_NAME = ?",
+                        "DEPENDENCY_TYPE = ?",
+                        f"DEPENDENT_OBJECT_NAME LIKE '{_BW_VIEW_PREFIX}%'",
+                    ],
+                    params=[
+                        _CALC_SCHEMA,
+                        view_name,
+                        self.capability.abap_schema,
+                        _DIRECT,
+                    ],
+                    order_by=["DEPENDENT_OBJECT_NAME"],
+                ),
+                limit=_MAX_PROVIDER_CONSUMERS + 1,
+            )
+        )
+        truncated = len(rows) > _MAX_PROVIDER_CONSUMERS
+        names = [str(r[0]) for r in rows[:_MAX_PROVIDER_CONSUMERS]]
+        resolved = self.resolve_bw_view_providers(names)
+        # One entry per provider: the internal ':J1.CALC.n' nodes all name the same provider.
+        by_provider: dict[str, BwProviderView] = {}
+        for name in names:
+            view = resolved.get(name)
+            if view is not None:
+                by_provider.setdefault(view.provider, view)
+        return sorted(by_provider.values(), key=lambda v: v.provider), truncated
+
+    def resolve_bw_view_providers(self, view_names: list[str]) -> dict[str, BwProviderView]:
+        """Resolve ``0BW:BIA:`` view names to the InfoProviders that own them.
+
+        The provider name is parsed from the view name; its **type** is then confirmed against the
+        provider header tables present on this release, so the returned kind is verified metadata
+        rather than a naming guess. Views whose provider name matches no header row are still
+        returned, with ``resolved_kind=None`` and ``verified=False``.
+        """
+        parsed: dict[str, str] = {}
+        for view in view_names:
+            provider = _bw_view_provider(view)
+            if provider is not None:
+                parsed[view] = provider
+        if not parsed:
+            return {}
+        kinds = self._provider_kinds(sorted(set(parsed.values())))
+        resolved: dict[str, BwProviderView] = {}
+        for view, provider in parsed.items():
+            kind = kinds.get(provider)
+            resolved[view] = BwProviderView(
+                view_name=view,
+                provider=provider,
+                resolved_kind=kind,
+                verified=kind is not None,
+                provenance=self.provenance(
+                    "object_dependencies", {"BW_VIEW": view, "PROVIDER": provider}
+                ),
+            )
+        return resolved
+
+    def _provider_kinds(self, providers: list[str]) -> dict[str, str]:
+        """Confirm provider names against the header tables, returning name -> provider kind."""
+        remaining = list(providers)
+        kinds: dict[str, str] = {}
+        for logical, id_column, kind in _PROVIDER_SOURCES:
+            if not remaining or not self.capability.is_available(logical):
+                continue
+            is_cube = logical == "cube_header"
+            columns = [id_column, "CUBETYPE"] if is_cube else [id_column]
+            placeholders = ", ".join("?" for _ in remaining)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=columns,
+                    from_logical=logical,
+                    where=[f"{id_column} IN ({placeholders})"],
+                    params=list(remaining),
+                )
+            )
+            for row in rows:
+                name = _clean(row[0])
+                if name is None or name in kinds:
+                    continue
+                kinds[name] = classify_cube_type(row[1]) if is_cube else kind
+            remaining = [name for name in remaining if name not in kinds]
+        return kinds
 
     # --- helpers -------------------------------------------------------------------------
 

@@ -9,6 +9,10 @@ and joins were validated live in B5:
   prefix is not OBJVERS-auto (see dialect), so its queries add OBJVERS='A' explicitly.
 - RSTRANFIELD.PARAMTYPE: '1' = target field, '0' = source field (verified against CONSTANT rules).
 - RULETYPE / RSTLOGO endpoint codes are decoded below.
+
+``list_transformations`` filters endpoints by pattern (see :func:`..core.dialect.like_term`): a
+DataSource endpoint is stored space-padded as ``<DATASOURCE><pad><LOGSYS>``, so an equality filter
+on the DataSource name alone can never match.
 """
 
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from ..core.dialect import like_term
 from ..models.provenance import UnsupportedResult
 from ..models.transformations import (
     EndpointKind,
@@ -134,12 +139,14 @@ class TransformationsRepository(Repository):
 
         where: list[str] = []
         params: list[Any] = []
-        if source_name:
-            where.append("SOURCENAME = ?")
-            params.append(source_name)
-        if target_name:
-            where.append("TARGETNAME = ?")
-            params.append(target_name)
+        # Endpoint names are pattern-matched, not compared: DataSource endpoints are stored
+        # space-padded ('<DATASOURCE><pad><LOGSYS>'), so equality can never match one.
+        for column, value in (("SOURCENAME", source_name), ("TARGETNAME", target_name)):
+            if not value:
+                continue
+            like = like_term(value)
+            where.append(like.clause(column))
+            params.append(like.value)
         if with_routines_only:
             where.append("(STARTROUTINE <> '' OR ENDROUTINE <> '' OR EXPERT <> '')")
 

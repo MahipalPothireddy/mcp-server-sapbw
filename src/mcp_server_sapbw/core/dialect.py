@@ -6,7 +6,9 @@ Responsibilities (mission Section 3, Rule 6):
 * auto-inject ``OBJVERS = 'A'`` on ``RSD*`` / ``RSO*`` / ``RSTRAN*`` / ``RSZ*`` tables unless a
   version comparison is explicitly requested;
 * qualify tables with the schema resolved by the capability record (never hardcoded);
-* provide pagination and count helpers so list endpoints return a ``total_count``.
+* provide pagination and count helpers so list endpoints return a ``total_count``;
+* build ``LIKE`` terms for caller-supplied name filters (:func:`like_term`) with one consistent
+  wildcard rule across every list endpoint.
 
 Everything produced here begins with ``SELECT`` and therefore passes the connection-layer guard.
 """
@@ -22,6 +24,10 @@ from ..models.capability import CapabilityRecord
 
 # Tables in these families carry an OBJVERS column; active version is 'A'.
 _ACTIVE_VERSION_PREFIX = re.compile(r"^(RSD|RSO|RSZ|RSTRAN)", re.IGNORECASE)
+
+# Escape character for LIKE patterns. Backslash has no special meaning in a HANA string literal,
+# so ``ESCAPE '\'`` is a plain single-character literal.
+LIKE_ESCAPE = "\\"
 
 # Member tables that match the versioned prefixes but carry NO OBJVERS column (discovered live in
 # B4). Active-version injection must be skipped for these, or the generated SQL references a
@@ -62,6 +68,44 @@ def quote_ident(name: str) -> str:
     """Double-quote a HANA identifier, escaping embedded quotes."""
     escaped = name.replace('"', '""')
     return f'"{escaped}"'
+
+
+@dataclass(frozen=True)
+class LikeTerm:
+    """A bound ``LIKE`` value plus the SQL fragment that applies it.
+
+    Use :meth:`clause` to build the condition and pass :attr:`value` as the bound parameter, so the
+    ``ESCAPE`` clause is only emitted when the value actually contains escapes.
+    """
+
+    value: str
+    escaped: bool
+
+    def clause(self, expression: str) -> str:
+        """The ``<expression> LIKE ?`` condition, with ``ESCAPE`` when the value needs it."""
+        suffix = f" ESCAPE '{LIKE_ESCAPE}'" if self.escaped else ""
+        return f"{expression} LIKE ?{suffix}"
+
+
+def like_term(pattern: str) -> LikeTerm:
+    """Turn a caller-supplied name filter into an upper-cased ``LIKE`` term.
+
+    One rule, used by every list endpoint that filters on an object name:
+
+    * a pattern containing ``%`` is treated as caller-authored and passed through verbatim, so
+      ``%SALES\\_O3%``-style patterns and their wildcards stay under the caller's control;
+    * any other pattern is a **substring** search — wrapped in ``%``, with SQL ``LIKE``
+      metacharacters (``_`` and the escape character) escaped so they match literally.
+
+    The second rule is what makes BW naming usable: virtually every BW technical name contains an
+    underscore, and DataSource endpoints are stored space-padded (``<DS><pad><LOGSYS>``), so an
+    unescaped or unwrapped pattern silently matches nothing.
+    """
+    text = pattern.strip().upper()
+    if "%" in text:
+        return LikeTerm(text, escaped=False)
+    escaped = text.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2).replace("_", f"{LIKE_ESCAPE}_")
+    return LikeTerm(f"%{escaped}%", escaped=escaped != text)
 
 
 class SqlDialect:

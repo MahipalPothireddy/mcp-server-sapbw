@@ -2,7 +2,10 @@
 
 Backs bw_search_objects. Searches process chains, every present InfoProvider variant, and
 InfoObjects, matching a pattern against the technical name (``id LIKE``) and, optionally, the
-stored description (``UPPER(desc) LIKE``). Results are object-type-tagged, carry provenance citing
+stored description (``UPPER(desc) LIKE``). Bare patterns are substring matches with ``_`` escaped
+as a literal (BW names are full of underscores); a pattern containing ``%`` is passed through so
+the caller controls the wildcards — see :func:`..core.dialect.like_term`. Results are
+object-type-tagged, carry provenance citing
 the table the match was found in, and are de-duplicated with name matches taking precedence over
 description matches. Each per-source scan is internally capped, so ``total_count`` reflects the
 collected (capped) result set for very broad patterns; narrow the pattern for exhaustive results.
@@ -13,18 +16,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..models.providers import ProviderType, SearchHit, SearchObjectType
+from ..core.dialect import LikeTerm, like_term
+from ..models.providers import ProviderType, SearchHit, SearchObjectType, classify_cube_type
 from .base import Repository
 from .texts import TextShape
 
 # Per-source scan cap: broad patterns are truncated here rather than scanning entire text tables.
 _INTERNAL_CAP = 2000
 
-_CUBETYPE_TO_PROVIDER: dict[str, ProviderType] = {
-    "B": "infocube",
-    "M": "multiprovider",
-    "V": "virtualprovider",
-}
 _CUBE_TYPES: frozenset[SearchObjectType] = frozenset(
     {"infocube", "multiprovider", "virtualprovider"}
 )
@@ -91,12 +90,9 @@ _SIMPLE_SOURCES: tuple[_Source, ...] = (
 )
 
 
-def _to_like(pattern: str) -> str:
-    """Turn a search term into an (upper-cased) LIKE pattern, wrapping bare terms with ``%``."""
-    text = pattern.strip().upper()
-    if "%" in text or "_" in text:
-        return text
-    return f"%{text}%"
+def _to_like(pattern: str) -> LikeTerm:
+    """Turn a search term into a LIKE term (see :func:`..core.dialect.like_term`)."""
+    return like_term(pattern)
 
 
 def _clean(value: Any) -> str | None:
@@ -107,7 +103,7 @@ def _clean(value: Any) -> str | None:
 
 
 def _classify_cube(cubetype: Any) -> ProviderType:
-    return _CUBETYPE_TO_PROVIDER.get(str(cubetype).strip(), "infocube")
+    return classify_cube_type(cubetype)
 
 
 class SearchRepository(Repository):
@@ -147,15 +143,15 @@ class SearchRepository(Repository):
     # --- fixed-type sources --------------------------------------------------------------
 
     def _collect_names(
-        self, source: _Source, like: str, hits: dict[tuple[str, str], SearchHit]
+        self, source: _Source, like: LikeTerm, hits: dict[tuple[str, str], SearchHit]
     ) -> None:
         rows = self.select(
             self.dialect.paginate(
                 self.dialect.build_select(
                     columns=[source.id_column],
                     from_logical=source.header_logical,
-                    where=[*source.header_where, f"{source.id_column} LIKE ?"],
-                    params=[like],
+                    where=[*source.header_where, like.clause(source.id_column)],
+                    params=[like.value],
                     order_by=[source.id_column],
                 ),
                 limit=_INTERNAL_CAP,
@@ -175,11 +171,11 @@ class SearchRepository(Repository):
             )
 
     def _collect_descriptions(
-        self, source: _Source, like: str, hits: dict[tuple[str, str], SearchHit]
+        self, source: _Source, like: LikeTerm, hits: dict[tuple[str, str], SearchHit]
     ) -> None:
         if source.text_logical is None or not self.capability.is_available(source.text_logical):
             return
-        where = [*source.text_where, f"UPPER({source.text_desc_column}) LIKE ?"]
+        where = [*source.text_where, like.clause(f"UPPER({source.text_desc_column})")]
         if source.text_shape == "hana":
             where.append("TRIM(COLNAME) = ''")
         rows = self.select(
@@ -188,7 +184,7 @@ class SearchRepository(Repository):
                     columns=[source.id_column, source.text_desc_column or "TXTLG"],
                     from_logical=source.text_logical,
                     where=where,
-                    params=[like],
+                    params=[like.value],
                 ),
                 limit=_INTERNAL_CAP,
             )
@@ -211,7 +207,7 @@ class SearchRepository(Repository):
 
     def _collect_cube(
         self,
-        like: str,
+        like: LikeTerm,
         wanted: set[str] | None,
         match_descriptions: bool,
         hits: dict[tuple[str, str], SearchHit],
@@ -221,8 +217,8 @@ class SearchRepository(Repository):
                 self.dialect.build_select(
                     columns=["INFOCUBE", "CUBETYPE"],
                     from_logical="cube_header",
-                    where=["INFOCUBE LIKE ?"],
-                    params=[like],
+                    where=[like.clause("INFOCUBE")],
+                    params=[like.value],
                     order_by=["INFOCUBE"],
                 ),
                 limit=_INTERNAL_CAP,
@@ -246,15 +242,15 @@ class SearchRepository(Repository):
             self._collect_cube_descriptions(like, wanted, hits)
 
     def _collect_cube_descriptions(
-        self, like: str, wanted: set[str] | None, hits: dict[tuple[str, str], SearchHit]
+        self, like: LikeTerm, wanted: set[str] | None, hits: dict[tuple[str, str], SearchHit]
     ) -> None:
         rows = self.select(
             self.dialect.paginate(
                 self.dialect.build_select(
                     columns=["INFOCUBE", "TXTLG"],
                     from_logical="cube_text",
-                    where=["UPPER(TXTLG) LIKE ?"],
-                    params=[like],
+                    where=[like.clause("UPPER(TXTLG)")],
+                    params=[like.value],
                 ),
                 limit=_INTERNAL_CAP,
             )

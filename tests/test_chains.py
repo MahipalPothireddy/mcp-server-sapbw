@@ -21,6 +21,7 @@ from mcp_server_sapbw.repositories.chains import (
     _parse_dats_tims,
     _percentile,
 )
+from tests.sqllike import escape_for_sql, matches_like
 
 SCHEMA = "TESTSCHEMA"
 _CHAIN_TABLES = {
@@ -56,6 +57,18 @@ def _ts(text: str) -> Decimal:
     return Decimal(text)
 
 
+def _filtered_chains(sql: str, params: list[Any]) -> list[str]:
+    """Active chain ids, honouring a ``CHAIN_ID LIKE`` filter the way HANA would.
+
+    Parameter order follows the built WHERE clause: OBJSTAT (when active_only) then the LIKE value.
+    """
+    active = [c for c in sorted(_ATTR) if _ATTR[c][1] == "ACT"]
+    if "CHAIN_ID LIKE" not in sql:
+        return active
+    pattern = str(params[1 if "OBJSTAT = ?" in sql else 0])
+    return [c for c in active if matches_like(pattern, c, escape_for_sql(sql))]
+
+
 # Fixture landscape (synthetic).
 # MASTER_CHAIN: TRIGGER -> (green) CHAIN:SUBCHAIN_1 -> (green) LOADING:LOAD_A
 _EDGES = {
@@ -73,6 +86,8 @@ _EDGES = {
 _ATTR = {  # CHAIN_ID -> (APPLNM, OBJSTAT)
     "MASTER_CHAIN": ("SALESAREA", "ACT"),
     "SUBCHAIN_1": ("SALESAREA", "ACT"),
+    # Sibling of SUBCHAIN_1 that only stays out of a 'SUBCHAIN_1' filter when '_' is escaped.
+    "SUBCHAINX1": ("SALESAREA", "ACT"),
     "DAILY_LOAD": ("FINANCE", "ACT"),
 }
 _TEXT = {  # CHAIN_ID -> TXTLG
@@ -135,10 +150,10 @@ class ScriptedConnection:
         params = list(parameters or [])
         if "TOTAL_COUNT" in sql:
             if "RSPCCHAINATTR" in sql:
-                return [(len([c for c in _ATTR if _ATTR[c][1] == "ACT"]),)]
+                return [(len(_filtered_chains(sql, params)),)]
             return [(0,)]
         if "RSPCCHAINATTR" in sql:
-            active = [c for c in sorted(_ATTR) if _ATTR[c][1] == "ACT"]
+            active = _filtered_chains(sql, params)
             if "CHAIN_ID = ?" in sql:  # single header
                 cid = params[-1]
                 return [(_ATTR[cid][0], _ATTR[cid][1])] if cid in _ATTR else []
@@ -299,8 +314,35 @@ def test_list_chains() -> None:
     result = repo.list_chains(window_days=90)
     assert not isinstance(result, UnsupportedResult)
     summaries, total = result
-    assert total == 3
+    assert total == 4
     by_id = {s.chain_id: s for s in summaries}
     assert by_id["DAILY_LOAD"].description == "Daily finance load"
     assert by_id["MASTER_CHAIN"].active is True
     assert summaries[0].provenance  # provenance present
+
+
+def test_list_chains_name_pattern_is_a_substring_match() -> None:
+    """Regression: name_pattern went into ``CHAIN_ID LIKE ?`` verbatim, so a bare term (the natural
+    thing for a caller to pass) silently matched nothing at all."""
+    result = _repo().list_chains(name_pattern="DAILY")
+    assert not isinstance(result, UnsupportedResult)
+    summaries, total = result
+    assert total == 1
+    assert [s.chain_id for s in summaries] == ["DAILY_LOAD"]
+
+
+def test_list_chains_name_pattern_underscore_is_literal() -> None:
+    result = _repo().list_chains(name_pattern="SUBCHAIN_1")
+    assert not isinstance(result, UnsupportedResult)
+    summaries, total = result
+    assert [s.chain_id for s in summaries] == ["SUBCHAIN_1"]  # SUBCHAINX1 must not match
+    assert total == 1
+
+
+def test_list_chains_name_pattern_honours_caller_wildcards() -> None:
+    result = _repo().list_chains(name_pattern="SUBCHAIN_1")
+    wildcard = _repo().list_chains(name_pattern="%SUBCHAIN_1%")
+    assert not isinstance(result, UnsupportedResult)
+    assert not isinstance(wildcard, UnsupportedResult)
+    # '_' is a single-character wildcard when the caller authors the pattern.
+    assert {s.chain_id for s in wildcard[0]} == {"SUBCHAIN_1", "SUBCHAINX1"}

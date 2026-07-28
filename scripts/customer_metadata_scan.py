@@ -71,7 +71,11 @@ _ALWAYS_SCAN_NAMES = {".gitignore", ".gitattributes"}
 
 
 def _tokens(text: str) -> set[str]:
-    return {m.group(0) for m in _COMBINED.finditer(text)} - ALLOW
+    # Strip backslashes first: they are SQL-LIKE / regex escape artefacts, never part of a BW
+    # object name, and they would otherwise split a real name mid-token and hide it from the
+    # pattern (e.g. an escaped "ABC\_O3" reads as the too-short "ABC"). Found by a live miss.
+    normalized = text.replace("\\", "")
+    return {m.group(0) for m in _COMBINED.finditer(normalized)} - ALLOW
 
 
 def scan_working_tree() -> set[str]:

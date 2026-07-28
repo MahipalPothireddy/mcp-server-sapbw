@@ -11,6 +11,7 @@ from typing import Any
 
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.repositories.search import SearchRepository
+from tests.sqllike import escape_for_sql, matches_like
 
 SCHEMA = "TESTSCHEMA"
 _SEARCH_TABLES = {
@@ -32,7 +33,8 @@ _SEARCH_TABLES = {
 
 _CHAINS = ["SALES_LOAD", "FIN_LOAD"]
 _CHAIN_TEXT = {"SALES_LOAD": "Sales master data load chain"}
-_DSO = ["SALES_DSO"]
+# FIN_DSO vs FINXDSO: a pair that only behaves correctly when '_' is escaped as a literal.
+_DSO = ["SALES_DSO", "FIN_DSO", "FINXDSO"]
 _DSO_TEXT = {"SALES_DSO": "Sales orders detailed store"}
 _ADSO = ["SALES_ADSO"]
 _ADSO_TEXT = {"SALES_ADSO": "Sales advanced datastore object"}
@@ -44,20 +46,17 @@ _IOBJ = ["SALES_KYF"]
 _IOBJ_TEXT = {"SALES_KYF": "Sales key figure amount"}
 
 
-def _term(like: str) -> str:
-    return like.strip("%").upper()
+def _match(like: str, value: str, sql: str) -> bool:
+    """Evaluate the built LIKE the way HANA would (production wraps text columns in UPPER())."""
+    return matches_like(like, value.upper(), escape_for_sql(sql))
 
 
-def _match(like: str, value: str) -> bool:
-    return _term(like) in value.upper()
+def _names(items: list[str], like: str, sql: str) -> list[tuple[Any, ...]]:
+    return [(n,) for n in items if _match(like, n, sql)]
 
 
-def _names(items: list[str], like: str) -> list[tuple[Any, ...]]:
-    return [(n,) for n in items if _match(like, n)]
-
-
-def _descs(table: dict[str, str], like: str) -> list[tuple[Any, ...]]:
-    return [(n, d) for n, d in table.items() if _match(like, d)]
+def _descs(table: dict[str, str], like: str, sql: str) -> list[tuple[Any, ...]]:
+    return [(n, d) for n, d in table.items() if _match(like, d, sql)]
 
 
 class ScriptedConnection:
@@ -71,31 +70,31 @@ class ScriptedConnection:
         params = list(parameters or [])
         like = str(params[0]) if params else "%%"
         if "RSPCCHAINT" in sql:
-            return _descs(_CHAIN_TEXT, like)
+            return _descs(_CHAIN_TEXT, like, sql)
         if "RSPCCHAINATTR" in sql:
-            return _names(_CHAINS, like)
+            return _names(_CHAINS, like, sql)
         if "RSDODSOT" in sql:
-            return _descs(_DSO_TEXT, like)
+            return _descs(_DSO_TEXT, like, sql)
         if "RSDODSO" in sql:
-            return _names(_DSO, like)
+            return _names(_DSO, like, sql)
         if "RSOADSOT" in sql:
-            return _descs(_ADSO_TEXT, like)
+            return _descs(_ADSO_TEXT, like, sql)
         if "RSOADSO" in sql:
-            return _names(_ADSO, like)
+            return _names(_ADSO, like, sql)
         if "RSDCUBET" in sql:
-            return _descs(_CUBE_TEXT, like)
+            return _descs(_CUBE_TEXT, like, sql)
         if "RSDCUBE" in sql:
             if "IN (" in sql:  # _cube_types batch lookup
                 return [(n, _CUBE[n]) for n in params if n in _CUBE]
-            return [(n, t) for n, t in _CUBE.items() if _match(like, n)]
+            return [(n, t) for n, t in _CUBE.items() if _match(like, n, sql)]
         if "RSOHCPRT" in sql:
-            return _descs(_CP_TEXT, like)
+            return _descs(_CP_TEXT, like, sql)
         if "RSOHCPR" in sql:
-            return _names(_CP, like)
+            return _names(_CP, like, sql)
         if "RSDIOBJT" in sql:
-            return _descs(_IOBJ_TEXT, like)
+            return _descs(_IOBJ_TEXT, like, sql)
         if "RSDIOBJ" in sql:
-            return _names(_IOBJ, like)
+            return _names(_IOBJ, like, sql)
         return []
 
 
@@ -183,3 +182,31 @@ def test_pagination() -> None:
 def test_no_description_match_when_disabled() -> None:
     _hits, total = _repo().search("reporting", match_descriptions=False)
     assert total == 0
+
+
+# --- pattern semantics (regression) ------------------------------------------------------
+
+
+def test_partial_name_with_underscore_matches() -> None:
+    """Regression: a pattern containing '_' used to be passed through unwrapped, matching only an
+    exact full name — which silently returned nothing for almost every real BW name."""
+    hits, total = _repo().search("FIN_DS", object_types=["dso"])
+    assert total == 1
+    assert hits[0].name == "FIN_DSO"
+
+
+def test_underscore_is_matched_literally_not_as_a_wildcard() -> None:
+    hits, _ = _repo().search("FIN_DSO", object_types=["dso"])
+    assert {h.name for h in hits} == {"FIN_DSO"}  # FINXDSO must not match
+
+
+def test_exact_full_name_still_matches() -> None:
+    hits, total = _repo().search("SALES_DSO", object_types=["dso"])
+    assert total == 1
+    assert hits[0].name == "SALES_DSO"
+
+
+def test_caller_supplied_wildcards_are_honoured() -> None:
+    # '%_DSO' = any prefix + any single character + 'DSO' -> both SALES_DSO and FINXDSO.
+    hits, _ = _repo().search("%_DSO", object_types=["dso"])
+    assert {h.name for h in hits} == {"SALES_DSO", "FIN_DSO", "FINXDSO"}

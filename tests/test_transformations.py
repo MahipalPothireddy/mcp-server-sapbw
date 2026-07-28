@@ -10,9 +10,11 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from mcp_server_sapbw.core.dialect import LIKE_ESCAPE
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
+from tests.sqllike import matches_like
 
 SCHEMA = "TESTSCHEMA"
 _TABLES = {
@@ -42,6 +44,23 @@ _TRAN = {
         "",
     )
 }
+# A DataSource endpoint as BW actually stores it: '<DATASOURCE><padding><LOGSYS>'. An equality
+# filter on the DataSource name alone can never match this, which is why endpoints are LIKE-matched.
+_PADDED_DS = "DATASOURCE_B".ljust(30) + "SRCSYS100"
+_TRAN["TRANSFORM02"] = (
+    "ACT",
+    "RSDS",
+    "",
+    _PADDED_DS,
+    "ODSO",
+    "",
+    "FIN_DSO",
+    "",
+    "",
+    "",
+    "",
+    "",
+)
 _RULES = {"TRANSFORM01": [(1, "DIRECT"), (2, "ROUTINE"), (3, "CONSTANT")]}
 _FIELDS = {
     "TRANSFORM01": [
@@ -62,6 +81,22 @@ _SOURCE = {
 _TEXT = {"TRANSFORM01": ("E", "Load fin postings", "Load financial postings into ADSO")}
 
 
+def _endpoint_filtered(sql: str, params: list[Any]) -> list[str]:
+    """Transformation ids surviving the built SOURCENAME/TARGETNAME LIKE filters, HANA-style."""
+    ids = list(_TRAN)
+    index = 0
+    for column, position in (("SOURCENAME", 3), ("TARGETNAME", 6)):
+        clause = f"{column} LIKE ?"
+        if clause not in sql:
+            continue
+        pattern = str(params[index])
+        index += 1
+        # Each clause carries its own ESCAPE, so check this clause rather than the whole statement.
+        escape = LIKE_ESCAPE if f"{clause} ESCAPE" in sql else None
+        ids = [t for t in ids if matches_like(pattern, str(_TRAN[t][position]), escape)]
+    return ids
+
+
 class ScriptedConnection:
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
@@ -69,7 +104,7 @@ class ScriptedConnection:
         params = list(parameters or [])
         name = str(params[-1]) if params else ""
         if "TOTAL_COUNT" in sql:
-            return [(len(_TRAN),)]
+            return [(len(_endpoint_filtered(sql, params)),)]
         if "RSTRANSTEPROUT" in sql:
             rows = _STEPROUT.get(name, [])
             if "KIND" in sql:
@@ -90,7 +125,10 @@ class ScriptedConnection:
                 d = _TRAN.get(name)
                 return [d] if d else []
             # list_transformations (8 cols)
-            return [(t, d[1], d[3], d[4], d[6], d[7], d[8], d[9]) for t, d in _TRAN.items()]
+            return [
+                (t, _TRAN[t][1], _TRAN[t][3], _TRAN[t][4], _TRAN[t][6], *_TRAN[t][7:10])
+                for t in _endpoint_filtered(sql, params)
+            ]
         return []
 
 
@@ -151,13 +189,39 @@ def test_list_transformations() -> None:
     result = _repo().list_transformations()
     assert not isinstance(result, UnsupportedResult)
     summaries, total = result
-    assert total == 1
-    summary = summaries[0]
-    assert summary.tran_id == "TRANSFORM01"
+    assert total == 2
+    summary = next(s for s in summaries if s.tran_id == "TRANSFORM01")
     assert summary.source_kind == "datasource"
     assert summary.target_kind == "adso"
     assert summary.has_routines is True
     assert summary.description == "Load fin postings"
+
+
+def test_list_transformations_matches_padded_datasource_endpoint() -> None:
+    """Regression: SOURCENAME/TARGETNAME were compared with '='; a DataSource endpoint is stored
+    '<DATASOURCE><padding><LOGSYS>', so filtering by the DataSource name matched nothing."""
+    result = _repo().list_transformations(source_name="DATASOURCE_B")
+    assert not isinstance(result, UnsupportedResult)
+    summaries, total = result
+    assert total == 1
+    assert [s.tran_id for s in summaries] == ["TRANSFORM02"]
+    assert summaries[0].source_name == _PADDED_DS.strip()
+
+
+def test_list_transformations_target_filter_is_a_substring_match() -> None:
+    result = _repo().list_transformations(target_name="FIN_DSO")
+    assert not isinstance(result, UnsupportedResult)
+    summaries, total = result
+    assert total == 1
+    assert [s.tran_id for s in summaries] == ["TRANSFORM02"]  # FIN_ADSO must not match
+
+
+def test_list_transformations_both_endpoint_filters_apply() -> None:
+    result = _repo().list_transformations(source_name="DATASOURCE_A", target_name="FIN_ADSO")
+    assert not isinstance(result, UnsupportedResult)
+    summaries, total = result
+    assert total == 1
+    assert [s.tran_id for s in summaries] == ["TRANSFORM01"]
 
 
 def test_get_routine_code() -> None:

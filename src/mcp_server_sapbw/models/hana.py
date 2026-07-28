@@ -6,6 +6,11 @@ reads BW-generated ``/BIC/`` or ``/BI0/`` tables, which resolve back to BW objec
 convention (advisory). The BW<->HANA crossing table captures both directions: a calc view reading a
 BW table (``hana_reads_bw``) and a BW-layer object reading a calc view (``bw_reads_hana``). Every
 fact cites ``SYS.OBJECT_DEPENDENCIES``.
+
+On the BW side of a ``bw_reads_hana`` crossing sits a BW-generated per-InfoProvider view named
+``0BW:BIA:<PROVIDER>``; :class:`BwProviderView` carries the provider parsed from that name with its
+type confirmed by lookup, which is what turns a raw dependency row into the calc-view ->
+CompositeProvider hop.
 """
 
 from __future__ import annotations
@@ -47,8 +52,30 @@ class BaseTableRef(BaseModel):
     provenance: Provenance
 
 
+class BwProviderView(BaseModel):
+    """A BW-generated per-InfoProvider HANA view (``0BW:BIA:<PROVIDER>``) and its owner.
+
+    The provider name is parsed from the view name; ``resolved_kind`` is confirmed against the
+    provider header tables, and ``verified`` says whether that confirmation succeeded. An
+    unverified entry names the parsed provider without asserting it exists.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    view_name: str
+    provider: str
+    resolved_kind: str | None = None  # 'compositeprovider' / 'adso' / 'dso' / cube variant
+    verified: bool = False
+    provenance: Provenance
+
+
 class CalcViewLineage(BaseModel):
-    """A calc view's direct base tables, resolved to BW objects where possible."""
+    """A calc view's direct base tables and the BW providers that consume it.
+
+    ``consuming_bw_providers`` is the BW side of the boundary: the InfoProviders whose generated
+    ``0BW:BIA:`` views read this calc view. For a CompositeProvider that is exactly the
+    calc-view -> CompositeProvider hop, which BW's own where-used lists do not report.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -56,6 +83,7 @@ class CalcViewLineage(BaseModel):
     schema_name: str = "_SYS_BIC"
     base_tables: list[BaseTableRef] = Field(default_factory=list)
     resolved_bw_objects: list[str] = Field(default_factory=list)
+    consuming_bw_providers: list[BwProviderView] = Field(default_factory=list)
     truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
@@ -69,8 +97,11 @@ class HanaCrossing(BaseModel):
     direction: CrossingDirection
     hana_object: str  # the calc view (in _SYS_BIC)
     bw_object: str  # the BW-layer object (a /BIC/ table, or an ABAP-schema view/synonym)
-    bw_object_resolved: str | None = None  # resolved BW object when bw_object is a /BIC/ table
+    # Resolved BW object: from the /BIC/ table name (advisory, naming-based) or from a
+    # '0BW:BIA:<PROVIDER>' view name (parsed, then type-confirmed against the header tables).
+    bw_object_resolved: str | None = None
     bw_object_kind: str | None = None
+    resolution: Literal["bic_table", "bw_provider_view", "unresolved"] = "unresolved"
     object_type: str | None = None  # the HANA object type on the BW side (TABLE/VIEW/SYNONYM)
     provenance: Provenance
 

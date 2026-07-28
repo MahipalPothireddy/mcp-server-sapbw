@@ -7,12 +7,15 @@ from datetime import UTC, datetime
 import pytest
 
 from mcp_server_sapbw.core.dialect import (
+    LIKE_ESCAPE,
     DialectError,
     SqlDialect,
+    like_term,
     needs_active_version,
     quote_ident,
 )
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from tests.sqllike import matches_like
 
 
 def _capability() -> CapabilityRecord:
@@ -123,3 +126,44 @@ def test_count_query_wraps() -> None:
     assert count.sql == (
         'SELECT COUNT(*) AS TOTAL_COUNT FROM (SELECT CHAIN_ID FROM "SAPHANADB"."RSPCCHAIN")'
     )
+
+
+# --- LIKE terms for caller-supplied name filters -----------------------------------------
+
+
+def test_like_term_wraps_bare_pattern_and_upper_cases() -> None:
+    term = like_term("  billing  ")
+    assert term.value == "%BILLING%"
+    assert term.escaped is False
+    assert term.clause("TXTLG") == "TXTLG LIKE ?"  # nothing to escape -> no ESCAPE clause
+
+
+def test_like_term_escapes_underscore_as_a_literal() -> None:
+    """Regression: BW names are full of underscores; an unescaped '_' is a single-char wildcard."""
+    term = like_term("SALES_D0")
+    assert term.value == f"%SALES{LIKE_ESCAPE}_D0%"
+    assert term.escaped is True
+    assert term.clause("ODSOBJECT") == f"ODSOBJECT LIKE ? ESCAPE '{LIKE_ESCAPE}'"
+    # substring match works, and the underscore does not match an arbitrary character
+    assert matches_like(term.value, "SALES_D01")
+    assert not matches_like(term.value, "SALESXD01")
+
+
+def test_like_term_bare_pattern_is_a_substring_match() -> None:
+    """Regression: a bare term used to be passed through, so it only matched a full name."""
+    term = like_term("SALES_D0")
+    assert matches_like(term.value, "PREFIX_SALES_D01_SUFFIX")
+
+
+def test_like_term_passes_through_caller_wildcards() -> None:
+    term = like_term("%sales\\_d0%")
+    assert term.value == "%SALES\\_D0%"
+    assert term.escaped is False  # caller authored the pattern; no ESCAPE clause is added
+    assert term.clause("ADSONM") == "ADSONM LIKE ?"
+
+
+def test_like_term_escapes_the_escape_character() -> None:
+    term = like_term(f"A{LIKE_ESCAPE}B")
+    assert term.value == f"%A{LIKE_ESCAPE * 2}B%"
+    assert term.escaped is True
+    assert matches_like(term.value, f"XA{LIKE_ESCAPE}BY")

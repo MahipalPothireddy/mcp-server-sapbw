@@ -55,6 +55,10 @@ _SCAN_CAP = 5000  # hard cap on rows pulled for bulk edge scans
 _MERGED_INBOUND_CAP = 20  # inbound transformations examined per merged DSO for the field matrix
 _DEEP_STACK_MIN = 2  # >= this many DSO->DSO hops (3+ layers) is the 9.2 "deep stack" shape
 _HIGH_STACK_DEPTH = 3  # >= this many hops escalates a deep-stack finding to high severity
+# 9.1 parses routine source per candidate (RSAABAP), so scanning is budgeted rather than unbounded:
+# candidates without a resolvable lookup are skipped, and the scan stops at this many parses.
+_LATENCY_PARSE_BUDGET = 250
+_MANY_LOOKUPS = 3  # >= this many looked-up objects escalates a 9.1 finding to high severity
 
 
 def _clean(value: Any) -> str | None:
@@ -349,25 +353,53 @@ class Analyzers(Repository):
             for tran_id, target in self._routine_transformations_targeting_dsos()
             if target in full_targets
         ]
-        truncated = len(candidates) > limit
-        findings = [
-            self._latency_finding(tran_id, target) for tran_id, target in candidates[:limit]
+
+        # A full-update load whose routines resolve no lookups carries no latency contract to
+        # check, so it is not a finding. Keep scanning past those (within a parse budget) instead
+        # of letting them consume the page, and report how many were suppressed rather than
+        # silently dropping them.
+        findings: list[Finding] = []
+        evaluated = 0
+        no_lookup_count = 0
+        for tran_id, target in candidates:
+            if len(findings) >= limit or evaluated >= _LATENCY_PARSE_BUDGET:
+                break
+            evaluated += 1
+            finding = self._latency_finding(tran_id, target)
+            if finding is None:
+                no_lookup_count += 1
+                continue
+            findings.append(finding)
+
+        truncated = evaluated < len(candidates)
+        caveats = [
+            "Routine table dependencies are a heuristic lower bound (dynamic SQL / FM / method "
+            "calls are not followed).",
+            "The looked-up object's refresh frequency vs. this load's run frequency cannot be "
+            "auto-verified: object -> loading-chain mapping is not derivable on this landscape "
+            "(RSPCVARIANT has no DTP_LOAD linkage). Verify cadence manually per looked-up "
+            "object; the risk is that a load running more than once daily enriches new data "
+            "against master data refreshed less often.",
         ]
+        if no_lookup_count:
+            caveats.append(
+                f"{no_lookup_count} of {evaluated} evaluated full-update loads have routines whose "
+                "reads did not resolve to a BW object; they carry no checkable latency contract "
+                "and are excluded from the findings (parser lower bound, not proof of no lookup)."
+            )
+        if truncated:
+            caveats.append(
+                f"{evaluated} of {len(candidates)} full-update candidates were parsed "
+                f"(page limit {limit}, parse budget {_LATENCY_PARSE_BUDGET}); "
+                "raise limit or page through for the remainder."
+            )
         return ScenarioReport(
             scenario="9.1",
             title=SCENARIO_TITLES["9.1"],
             findings=findings,
-            analyzed_count=len(candidates[:limit]),
+            analyzed_count=evaluated,
             truncated=truncated,
-            caveats=[
-                "Routine table dependencies are a heuristic lower bound (dynamic SQL / FM / method "
-                "calls are not followed).",
-                "The looked-up object's refresh frequency vs. this load's run frequency cannot be "
-                "auto-verified: object -> loading-chain mapping is not derivable on this landscape "
-                "(RSPCVARIANT has no DTP_LOAD linkage). Verify cadence manually per looked-up "
-                "object; the risk is that a load running more than once daily enriches new data "
-                "against master data refreshed less often.",
-            ],
+            caveats=caveats,
         )
 
     def _full_update_targets(self) -> set[str]:
@@ -394,7 +426,8 @@ class Analyzers(Repository):
         )
         return [(str(tr), str(tgt).strip()) for tr, tgt in rows if _clean(tgt)]
 
-    def _latency_finding(self, tran_id: str, target: str) -> Finding:
+    def _latency_finding(self, tran_id: str, target: str) -> Finding | None:
+        """A 9.1 finding, or ``None`` when the routines resolve no lookup to check."""
         looked_up: list[str] = []
         evidence: list[Provenance] = [
             self.provenance("transformation", {"TRANID": tran_id, "OBJVERS": "A"})
@@ -409,10 +442,12 @@ class Analyzers(Repository):
                     obj = dep.resolved_object
                     if obj and obj != target and obj not in looked_up:
                         looked_up.append(obj)
+        if not looked_up:
+            return None  # no resolvable lookup -> no latency contract to evaluate
         delta = self._extractor_constraint(target)
         return Finding(
             scenario="9.1",
-            severity="medium" if looked_up else "low",
+            severity="high" if len(looked_up) >= _MANY_LOOKUPS else "medium",
             title="Full-update load reads other objects in its routines",
             affected_objects=[target, *looked_up],
             evidence=evidence,

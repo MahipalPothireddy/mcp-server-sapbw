@@ -16,6 +16,7 @@ import pytest
 
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.description import Description
+from mcp_server_sapbw.models.hana import HanaCrossing, HanaCrossingReport
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.services.docgen import (
@@ -166,6 +167,45 @@ def test_mermaid_renders_nodes_and_advisory_edges() -> None:
     assert "flowchart LR" in mermaid
     assert "DSO1" in mermaid and "LOOKUP" in mermaid
     assert "-.->" in mermaid  # advisory edge is dashed
+
+
+def _crossing(bw_object: str, resolved: str | None, kind: str | None, resolution: str) -> Any:
+    return HanaCrossing(
+        direction="bw_reads_hana",
+        hana_object="CV_SALES",
+        bw_object=bw_object,
+        bw_object_resolved=resolved,
+        bw_object_kind=kind,
+        resolution=resolution,  # type: ignore[arg-type]
+        provenance=Provenance(source_table="OBJECT_DEPENDENCIES"),
+    )
+
+
+def test_calc_view_consumers_table_dedupes_and_flags_verification() -> None:
+    report = HanaCrossingReport(
+        crossings=[
+            _crossing(
+                "0BW:BIA:SALES_CP:J1.CALC.1", "SALES_CP", "compositeprovider", "bw_provider_view"
+            ),
+            _crossing(
+                "0BW:BIA:SALES_CP:J2.CALC.1", "SALES_CP", "compositeprovider", "bw_provider_view"
+            ),
+            _crossing("0BW:BIA:GONE_PROV", "GONE_PROV", None, "bw_provider_view"),
+            _crossing("COMPAT_VIEW", None, None, "unresolved"),
+        ],
+        bw_reads_hana_count=4,
+        total_count=4,
+    )
+    lines = DocGenerator._calc_view_consumers(report)
+    rendered = "\n".join(lines)
+    assert "Calc view -> consuming InfoProvider" in rendered
+    assert rendered.count("| CV_SALES | SALES_CP |") == 1  # both calc nodes -> one row
+    assert "| CV_SALES | GONE_PROV | unverified | no |" in rendered
+    assert "COMPAT_VIEW" not in rendered  # not a BW provider view
+
+
+def test_calc_view_consumers_table_omitted_when_none() -> None:
+    assert DocGenerator._calc_view_consumers(HanaCrossingReport()) == []
 
 
 # --- integration test --------------------------------------------------------------------
