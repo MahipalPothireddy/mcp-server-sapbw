@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -233,7 +233,10 @@ class ProfileManager:
         profiles_path: str | Path | None = None,
         env: Mapping[str, str] | None = None,
     ) -> None:
-        self._env: Mapping[str, str] = env if env is not None else os.environ
+        if env is None:
+            env = os.environ
+            self._load_local_dotenv(env)
+        self._env: Mapping[str, str] = env
         resolved = profiles_path or self._env.get("BW_PROFILES_PATH")
         if not resolved:
             raise ProfileConfigError("no profiles path given and BW_PROFILES_PATH is not set")
@@ -241,6 +244,45 @@ class ProfileManager:
         raw = self._read()
         self._profiles: dict[str, Profile] = self._load_systems(raw)
         self._ecc_profiles: dict[str, EccProfile] = self._load_ecc_systems(raw)
+
+    @staticmethod
+    def _load_local_dotenv(env: Mapping[str, str]) -> None:
+        """Populate missing environment variables from the first local .env file that exists.
+
+        This mirrors the server bootstrap behavior so ProfileManager can resolve profiles when the
+        process only has the workspace config files, not a pre-populated shell environment.
+        """
+        target: MutableMapping[str, str] | None = None
+        if isinstance(env, MutableMapping):
+            target = env
+
+        candidates: list[Path] = []
+        explicit = os.environ.get("BW_DOTENV_PATH")
+        if explicit:
+            candidates.append(Path(explicit).expanduser())
+        profiles = os.environ.get("BW_PROFILES_PATH")
+        if profiles:
+            candidates.append(Path(profiles).expanduser().resolve().parent / ".env")
+        candidates.append(Path.cwd() / ".env")
+
+        for path in candidates:
+            try:
+                if not path.is_file():
+                    continue
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for raw in lines:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                resolved = value.strip().strip('"').strip("'")
+                if target is not None:
+                    target.setdefault(key.strip(), resolved)
+                else:
+                    os.environ.setdefault(key.strip(), resolved)
+            return
 
     def _read(self) -> Mapping[str, Any]:
         if not self._path.is_file():

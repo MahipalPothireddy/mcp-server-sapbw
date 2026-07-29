@@ -146,6 +146,39 @@ def test_path_from_env(tmp_path: Path) -> None:
     assert mgr.get("qa").host == "qa.example.invalid"
 
 
+def test_loads_local_dotenv_when_no_env_is_provided(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "BW_PROFILES_PATH=./profiles.yaml\n"
+        "BW_QA_HOST=qa.example.invalid\n"
+        "BW_QA_USER=qa_ro\n"
+        "BW_QA_PASSWORD=s3cr3t-qa\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "profiles.yaml").write_text(
+        """
+systems:
+  qa:
+    host: ${BW_QA_HOST}
+    port: 30015
+    user: ${BW_QA_USER}
+    password: ${BW_QA_PASSWORD}
+    abap_schema: auto
+    encrypt: true
+    read_only_user: true
+""",
+        encoding="utf-8",
+    )
+    for key in ["BW_PROFILES_PATH", "BW_QA_HOST", "BW_QA_USER", "BW_QA_PASSWORD"]:
+        monkeypatch.delenv(key, raising=False)
+
+    mgr = ProfileManager()
+
+    assert mgr.get("qa").host == "qa.example.invalid"
+    assert mgr.get("qa").user == "qa_ro"
+    assert mgr.get("qa").password.get_secret_value() == "s3cr3t-qa"
+
+
 def test_ssl_defaults_to_validation_on(tmp_path: Path) -> None:
     mgr = ProfileManager(_write(tmp_path, _GOOD_YAML), env=_ENV)
     qa = mgr.get("qa")

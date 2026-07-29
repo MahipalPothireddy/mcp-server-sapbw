@@ -16,6 +16,7 @@ from typing import Any
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
 from mcp_server_sapbw.repositories.queries import QueriesRepository, classify_origin
+from mcp_server_sapbw.services.lineage import LineageService
 
 SCHEMA = "TESTSCHEMA"
 _TABLES = {
@@ -203,6 +204,17 @@ def test_get_query_lineage_reaches_datasource_and_flags_exit_var() -> None:
     assert material.reaches_datasource is True
     ds_hops = [h for h in material.hops if h.via == "datasource"]
     assert any(h.object_name == "DS_SALES" for h in ds_hops)
+
+
+def test_lineage_service_resolves_query_to_provider_and_datasource() -> None:
+    service = LineageService(ScriptedConnection(), _capability())
+    graph = service.get_lineage("QUERY_SALES", direction="both", depth=4)
+    assert not isinstance(graph, UnsupportedResult)
+    names = {n.name for n in graph.nodes}
+    assert "QUERY_SALES" in names
+    assert "SALES_CUBE" in names
+    assert "DS_SALES" in names
+    assert any(e.kind == "query_provider" for e in graph.edges)
 
 
 def test_list_queries_and_provider_filter() -> None:

@@ -93,6 +93,7 @@ class LineageService(Repository):
         super().__init__(connection, capability, cache)
         self._transformations = TransformationsRepository(connection, capability, cache)
         self._providers = ProvidersRepository(connection, capability, cache)
+        self._queries = None
 
     # --- public API ----------------------------------------------------------------------
 
@@ -218,11 +219,13 @@ class LineageService(Repository):
         if direction in ("downstream", "both"):
             hops.extend(self._declared_hops(name, downstream=True))
             hops.extend(self._composite_consumer_hops(name))
+            hops.extend(self._query_provider_hops(name, downstream=True))
         if direction in ("upstream", "both"):
             hops.extend(self._declared_hops(name, downstream=False))
             hops.extend(self._composite_part_hops(name))
             if include_routine:
                 hops.extend(self._routine_lookup_hops(name))
+            hops.extend(self._query_provider_hops(name, downstream=False))
         return hops
 
     def _node_type_of(self, name: str) -> LineageNodeType:
@@ -264,7 +267,46 @@ class LineageService(Repository):
             )
             if rows:
                 return "compositeprovider"
+        if self.capability.is_available("query_dir"):
+            header = self._query_repo()._header(name)
+            if header is not None:
+                return "query"
         return "unknown"
+
+    def _query_repo(self) -> Any:
+        if self._queries is None:
+            from ..repositories.queries import QueriesRepository
+
+            self._queries = QueriesRepository(self._connection, self.capability, self._cache)
+        return self._queries
+
+    def _query_provider_hops(self, name: str, *, downstream: bool) -> list[_Hop]:
+        """Resolve a BEx query to its provider, then continue the normal lineage walk.
+
+        The generic lineage service handles BW objects and transformations, but BEx queries are a
+        separate metadata layer. If the supplied name is a query, attach a synthetic edge to its
+        provider and let downstream/upstream expansion continue from there.
+        """
+        if not self.capability.is_available("query_dir"):
+            return []
+        query_repo = self._query_repo()
+        header = query_repo._header(name)
+        if header is None:
+            return []
+        providers = query_repo._providers_list(str(header[0]))
+        if not providers:
+            return []
+        provider = providers[0]
+        edge = LineageEdge(
+            src=name if downstream else provider,
+            dst=provider if downstream else name,
+            kind="query_provider",
+            derivation="declared",
+            confidence="exact",
+            note="provider resolved from the BEx query metadata",
+            provenance=self.provenance("query_provider", {"COMPUID": str(header[0])}),
+        )
+        return [_Hop(provider, "unknown", edge)]
 
     # --- CompositeProvider part edges (via the generated HANA calc view) ------------------
 
