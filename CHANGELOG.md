@@ -6,6 +6,85 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — concurrent callers shared a database connection
+
+One raw connection per profile was shared across the worker threadpool that runs synchronous MCP
+tools, with no serialisation around cursor use. Two simultaneous tool calls against the same system
+therefore used one connection from two threads, which the driver does not support: the failure mode
+is interleaved cursors returning **wrong rows** rather than raising, which is the worst possible
+outcome for a server whose value is trustworthy answers. A reproduction of the old code path observed
+95 overlaps across 96 concurrent calls; the pooled version observes zero.
+
+- `_RawConnectionPool`: a bounded, lazily grown set of connections, each created by the same vetted
+  factory so every one has passed the fail-closed grant check. `Profile.pool_size` (default 4) caps
+  it, and sequential single-analyst use still opens exactly one session.
+- Reconnect semantics, statement-guard ordering and `reconnect_count` are unchanged.
+
+### Added — operational bounds and observability
+
+- **Per-call query budgets** (`core/budget.py`). A tool call was previously unbounded against tables
+  running to millions of rows. A contextvar-scoped allowance is charged before each statement, and
+  exceeding it returns a structured `BudgetResult` naming what was spent rather than hanging. Tunable
+  via `SAPBW_MAX_QUERIES_PER_CALL` / `SAPBW_MAX_SECONDS_PER_CALL`.
+- **Structured logging** (`core/logging.py`) to **stderr only** — stdout carries the MCP protocol, so
+  a handler there corrupts the stream. Level from `SAPBW_LOG_LEVEL` / `FASTMCP_LOG_LEVEL`, quiet by
+  default. Query lines record table, elapsed milliseconds and row count; **bound parameters are never
+  logged at any level** because they carry concrete object names. Slow statements warn regardless of
+  level.
+- Per-profile `connect_timeout_seconds`, `communication_timeout_seconds`, `slow_query_ms`.
+- `ServerRuntime.close()` releases sessions and cache handles on shutdown.
+
+### Added — the seven `bw://` resources, and response shaping
+
+Resources were the last unimplemented MCP surface (mission Section 4), and are also the mechanism
+that fixes response size: `profile`, `catalog`, `chain/{id}`, `provider/{name}`,
+`transformation/{id}`, `query/{id}`, `calcview/{name}`.
+
+`detail='auto'|'summary'|'full'` on `bw_describe_object` and `bw_get_lineage`. Shaping never loses
+information: counts stay exact, a trimmed graph remains a valid subgraph (retained edges keep both
+endpoints), and the caveat states what was trimmed plus the resource URI holding the whole record.
+
+### Added — field-level query lineage
+
+`bw_get_query_lineage` returned a byte-identical path for every InfoObject — the provider's upstream
+DataSource set, repeated — while the per-InfoObject shape implied each had been traced individually.
+`services/field_lineage.py` now follows a field through `RSTRANFIELD`/`RSTRANRULE`: each hop carries
+`target_field`, `rule_type`, `source_fields`, `transformation_id` and `routine_code_id`, and
+`resolution` distinguishes `field` from a labelled `provider`-level fallback. A routine hop is marked
+advisory.
+
+### Added — vendor-neutral BI connector; 9.7 and 9.8 now produce findings
+
+The only two scenarios that could not produce a finding for anybody. The connector is now a
+*capability* rather than a product, and the reference implementation reads an inventory **file**
+exported from whatever platform you run (Tableau, Power BI, SAP Analytics Cloud, Looker, Qlik, BOBJ)
+— so it works everywhere, the export is auditable, and this server holds no BI credentials. An
+existing `tableau`/`bobj` configuration keeps working.
+
+- 9.7 computes a safety margin per report: scheduled start vs the p95 completion of the chain feeding
+  its provider. Unmatched reports are excluded and counted, never assumed safe.
+- 9.8 classifies each dashboard's calc view as shared with a CompositeProvider (one change breaks
+  both paths) or separate (the two can silently diverge), using the `0BW:BIA:` consumer resolution.
+
+### Added — release-portability tests
+
+All 37 read entry points are now run against seven capability shapes (no advanced DSO /
+CompositeProvider, no classic cube or BW 3.x stack, no HANA catalogue, no BEx tables, no run history,
+and one where nothing is available). In every shape no entry point builds SQL naming an absent table
+and none raises. The fixtures are explicit that they are behavioural shapes, **not** a claim about
+SAP's per-release table inventory.
+
+### Security
+
+- **The customer object name in git history has been purged** with `git filter-repo` and force-pushed;
+  all 46 commits are preserved and the scan is clean over the full history. Anyone who cloned before
+  this still holds the old history, and GitHub may serve cached views of the old commits for a while —
+  ask GitHub Support to purge them if that matters.
+- `tmp_*` scratch scripts untracked and git-ignored; the probe scripts take the object name as an
+  argument.
+- Cache location, opt-out and retention documented in SECURITY.md; `bw_cache_status` reports what is
+  at rest without reading any cached value.
+
 ### Fixed — the SQLite metadata cache was never used
 
 `core/cache.py`, the `cache_get`/`cache_put` helpers and the `bw_refresh_cache` tool all existed, but
