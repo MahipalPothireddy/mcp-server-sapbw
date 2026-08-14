@@ -103,6 +103,17 @@ _DEFAULT_PAGE = 100
 # that protects the reply size on the list tools does not apply. Bounded only to stop a runaway.
 _MAX_DOCGEN_PAGES = 5000
 
+# Response shaping. A wide provider or a busy lineage graph can dominate a model's context window,
+# and the context spent on 150 field-provenance blocks is context unavailable for reasoning. Above
+# these bounds the reply carries the shape plus the resource URI holding the complete record, so
+# nothing becomes unreachable - it just stops being forced into every response.
+_MAX_INLINE_FIELDS = 40
+_MAX_INLINE_NODES = 60
+_MAX_INLINE_EDGES = 90
+
+# How much of a result may be inlined before it is summarised. 'auto' decides per response.
+DetailLevel = Literal["auto", "summary", "full"]
+
 mcp: FastMCP = FastMCP(name="sapbw", mask_error_details=True)
 
 _LOG = get_logger("server")
@@ -711,15 +722,51 @@ def bw_get_schedule_matrix(
 
 @_readonly_tool
 def bw_describe_object(
-    system: str, name: str, object_type: ProviderType | None = None
+    system: str,
+    name: str,
+    object_type: ProviderType | None = None,
+    *,
+    detail: DetailLevel = "auto",
 ) -> Provider | ObjectNotFound | UnsupportedResult:
     """Universal deep-dive for any provider/InfoObject: definition, fields, parts, description.
 
     Auto-detects the object type when ``object_type`` is omitted. The description is labelled
     stored vs generated (origin) with a quality flag. ``ObjectNotFound`` when the name matches no
     object; ``UnsupportedResult`` when the requested type's tables are absent on this release.
+
+    ``detail`` controls the field list, which dominates the response for wide providers (a real DSO
+    can carry 150+ fields, each with its own provenance):
+
+    * ``auto`` (default) — every field up to a threshold, then key fields only plus a note and the
+      ``bw://{system}/provider/{name}`` resource URI for the complete record. Nothing is lost.
+    * ``summary`` — always key fields only.
+    * ``full`` — always every field.
     """
-    return runtime().providers(system).describe(name, object_type)
+    provider = runtime().providers(system).describe(name, object_type)
+    if isinstance(provider, Provider):
+        return _shape_provider(provider, system=system, detail=detail)
+    return provider
+
+
+def _shape_provider(provider: Provider, *, system: str, detail: DetailLevel) -> Provider:
+    """Trim a provider's field list when it would dominate the reply, pointing at the resource."""
+    total = len(provider.fields)
+    if detail == "full" or (detail == "auto" and total <= _MAX_INLINE_FIELDS):
+        return provider
+    keys = {key.upper() for key in provider.key_field_names}
+    kept = [f for f in provider.fields if f.is_key or f.name.upper() in keys]
+    shaped = provider.model_copy(
+        update={
+            "fields": kept,
+            "caveats": [
+                *provider.caveats,
+                f"field list summarised: {len(kept)} of {total} shown (the semantic key). "
+                f"Read bw://{system}/provider/{provider.name} for every field, "
+                "or call again with detail='full'.",
+            ],
+        }
+    )
+    return shaped
 
 
 @_readonly_tool
@@ -824,14 +871,58 @@ def bw_analyze_routine(
 
 @_readonly_tool
 def bw_get_lineage(
-    system: str, name: str, direction: LineageDirection = "both", depth: int = 3
+    system: str,
+    name: str,
+    direction: LineageDirection = "both",
+    depth: int = 3,
+    *,
+    detail: DetailLevel = "auto",
 ) -> LineageGraph | UnsupportedResult:
     """Directed lineage graph around an object (upstream/downstream/both) to a depth.
 
     Nodes + edges JSON, including advisory routine-derived edges (a target's routines' reads). Large
     graphs are truncated at a node cap with ``truncated=true``.
+
+    ``detail='auto'`` (default) keeps the whole graph while it is small, and above that keeps the
+    nodes and edges nearest the root, saying so in ``caveats``. Use ``full`` for the entire graph,
+    or lower ``depth`` — a smaller depth is usually a better answer than a truncated big graph,
+    and ``bw_render_lineage`` draws the shape without spending context on JSON.
     """
-    return runtime().lineage(system).get_lineage(name, direction=direction, depth=depth)
+    graph = runtime().lineage(system).get_lineage(name, direction=direction, depth=depth)
+    if isinstance(graph, LineageGraph):
+        return _shape_graph(graph, detail=detail)
+    return graph
+
+
+def _shape_graph(graph: LineageGraph, *, detail: DetailLevel) -> LineageGraph:
+    """Keep the neighbourhood of the root when a graph would dominate the reply.
+
+    Node and edge *counts* stay exact — the caller still learns the true size — and the trimming
+    keeps edges whose endpoints are both retained, so what is returned remains a valid subgraph
+    rather than a set of dangling references.
+    """
+    nodes, edges = len(graph.nodes), len(graph.edges)
+    if detail == "full" or (
+        detail == "auto" and nodes <= _MAX_INLINE_NODES and edges <= _MAX_INLINE_EDGES
+    ):
+        return graph
+    kept_nodes = graph.nodes[:_MAX_INLINE_NODES]
+    kept_ids = {node.id for node in kept_nodes}
+    kept_edges = [e for e in graph.edges if e.src in kept_ids and e.dst in kept_ids]
+    kept_edges = kept_edges[:_MAX_INLINE_EDGES]
+    return graph.model_copy(
+        update={
+            "nodes": kept_nodes,
+            "edges": kept_edges,
+            "caveats": [
+                *graph.caveats,
+                f"response summarised: {len(kept_nodes)} of {nodes} nodes and "
+                f"{len(kept_edges)} of {edges} edges shown, nearest the root "
+                f"('{graph.root_id}'). node_count/edge_count remain exact. Call again with "
+                "detail='full' for the whole graph, lower the depth, or use bw_render_lineage.",
+            ],
+        }
+    )
 
 
 @_readonly_tool
@@ -1315,6 +1406,86 @@ def bw_generate_docs(
         .docgen(system)
         .generate(target, limit=limit, catalog_cap=cap, sections=sections, resume=resume)
     )
+
+
+# --- resources (URI-addressable read-only context) ---------------------------------------
+#
+# Mission Section 4. Two purposes:
+#
+# 1. A client can pull one object into context by URI without spending a tool round-trip.
+# 2. They are where a summarised tool response points. A wide provider has 150+ fields and a
+#    lineage graph can carry a hundred edges; dumping that inline burns the model's context on
+#    every call. The tool returns the shape plus a `resource_uri`, and the full record stays one
+#    fetch away — nothing is lost, it is just no longer forced into every reply.
+#
+# Resources return JSON (FastMCP serialises non-str returns), and every one of them goes through
+# the same repositories, budgets and read-only guard as the tools.
+
+
+def _resource_payload(value: Any) -> Any:
+    """Serialise a model (or a structured error) for a resource read."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    return value
+
+
+@mcp.resource("bw://{system}/profile", mime_type="application/json")
+def resource_profile(system: str) -> Any:
+    """Release, ABAP schema, object-model variants and table availability for a system."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        return _resource_payload(runtime().capability(system))
+
+
+@mcp.resource("bw://{system}/catalog", mime_type="application/json")
+def resource_catalog(system: str) -> Any:
+    """Object counts per type — the system's shape at a glance."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        record = runtime().capability(system)
+        return {
+            "system": system,
+            "bw_release": record.bw_release,
+            "object_models": dict(record.object_models),
+            "tables": {
+                name: {"resolved_name": status.resolved_name, "rows": status.row_estimate}
+                for name, status in record.tables.items()
+                if status.present
+            },
+        }
+
+
+@mcp.resource("bw://{system}/chain/{chain_id}", mime_type="application/json")
+def resource_chain(system: str, chain_id: str) -> Any:
+    """One process chain: processes, event-linked edges, nested sub-chains resolved."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        return _resource_payload(runtime().chains(system).get_chain(chain_id))
+
+
+@mcp.resource("bw://{system}/provider/{name}", mime_type="application/json")
+def resource_provider(system: str, name: str) -> Any:
+    """One InfoProvider or InfoObject in full, including every field."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        return _resource_payload(runtime().providers(system).describe(name))
+
+
+@mcp.resource("bw://{system}/transformation/{tran_id}", mime_type="application/json")
+def resource_transformation(system: str, tran_id: str) -> Any:
+    """One transformation: header, field mappings, rule types, routine references."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        return _resource_payload(runtime().transformations(system).get_transformation(tran_id))
+
+
+@mcp.resource("bw://{system}/query/{query_id}", mime_type="application/json")
+def resource_query(system: str, query_id: str) -> Any:
+    """One BEx query: element tree, restrictions, calculated key figures, variables."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        return _resource_payload(runtime().queries(system).get_query(query_id))
+
+
+@mcp.resource("bw://{system}/calcview/{view_name}", mime_type="application/json")
+def resource_calcview(system: str, view_name: str) -> Any:
+    """One calc view: base tables resolved to BW objects, and the providers consuming it."""
+    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
+        return _resource_payload(runtime().hana(system).get_calc_view_lineage(view_name))
 
 
 # --- prompts (analyst workflows composing the read-only tools) ---------------------------
