@@ -19,11 +19,20 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import suppress
 from typing import Any, Protocol
 
+from .budget import charge_query
+from .logging import get_logger, log_query, table_of
 from .profiles import Profile
+
+_LOG = get_logger("connection")
+
+# A statement slower than this is logged at WARNING even when the level would hide it: on someone
+# else's landscape the slow query is the thing you need to see without turning on debug logging.
+DEFAULT_SLOW_QUERY_MS = 5_000.0
 
 # --- Statement-level guard ---------------------------------------------------------------
 
@@ -238,12 +247,126 @@ def verify_read_only_grants(connection: RawConnection, *, profile_name: str) -> 
 # --- Connection wrapper and pool ---------------------------------------------------------
 
 
+class _Lease:
+    """One checked-out raw connection. ``dead`` marks it for disposal instead of reuse."""
+
+    __slots__ = ("dead", "raw")
+
+    def __init__(self, raw: RawConnection) -> None:
+        self.raw = raw
+        self.dead = False
+
+
+class _RawConnectionPool:
+    """A bounded set of interchangeable raw connections for one profile.
+
+    Why this exists: a single raw connection cannot be shared by concurrent callers. MCP tool
+    functions are synchronous, so the server runs them in a worker threadpool — two tool calls
+    against the same system genuinely execute at the same time, and driver connections are not
+    safe for simultaneous use from several threads. Interleaved cursors on one connection produce
+    wrong rows or protocol errors rather than an honest failure, which is the worst outcome for a
+    server whose whole value is trustworthy answers.
+
+    Every connection here is created by the same vetted factory as the first one, so each has
+    passed the fail-closed grant check. Growth is lazy and bounded: a single analyst issuing one
+    call at a time keeps using exactly one connection, and a HANA session is only ever spent when
+    concurrency actually demands it.
+    """
+
+    def __init__(
+        self,
+        initial: RawConnection,
+        *,
+        create: Callable[[], RawConnection] | None,
+        max_size: int,
+    ) -> None:
+        # Without a factory the pool cannot grow, so it degrades to serialising the one connection
+        # it was given (which is correct, just not concurrent).
+        self._create = create
+        self._max_size = max(1, int(max_size)) if create is not None else 1
+        self._capacity = threading.Semaphore(self._max_size)
+        self._lock = threading.Lock()
+        self._idle: list[RawConnection] = [initial]
+        self._created: list[RawConnection] = [initial]
+
+    @property
+    def max_size(self) -> int:
+        return self._max_size
+
+    def checkout(self) -> _Lease:
+        """Take an idle connection, or open one if the pool is below its ceiling."""
+        self._capacity.acquire()
+        try:
+            with self._lock:
+                if self._idle:
+                    return _Lease(self._idle.pop())
+            if self._create is None:  # pragma: no cover - max_size is 1 without a factory
+                raise ConnectionFailure("connection pool is exhausted and cannot grow")
+            raw = self._create()
+            with self._lock:
+                self._created.append(raw)
+            return _Lease(raw)
+        except BaseException:
+            self._capacity.release()  # never strand a permit
+            raise
+
+    def checkin(self, lease: _Lease) -> None:
+        """Return a connection for reuse, or dispose of it when the lease is marked dead."""
+        try:
+            if lease.dead:
+                self._dispose(lease.raw)
+                return
+            with self._lock:
+                self._idle.append(lease.raw)
+        finally:
+            self._capacity.release()
+
+    def replace(self, lease: _Lease) -> bool:
+        """Swap a dropped connection for a fresh, fully vetted one. False when impossible."""
+        if self._create is None:
+            return False
+        self._dispose(lease.raw)
+        try:
+            raw = self._create()
+        except Exception:
+            # Includes ReadOnlyViolation from the re-run grant check. The caller reports the
+            # original transport failure instead, so the reason the query failed stays visible.
+            lease.dead = True
+            return False
+        with self._lock:
+            self._created.append(raw)
+        lease.raw = raw
+        lease.dead = False
+        return True
+
+    def _dispose(self, raw: RawConnection) -> None:
+        with suppress(Exception):
+            raw.close()
+        with self._lock:
+            for index, existing in enumerate(self._created):
+                if existing is raw:
+                    del self._created[index]
+                    break
+
+    def close(self) -> None:
+        with self._lock:
+            connections = list(self._created)
+            self._created.clear()
+            self._idle.clear()
+        for raw in connections:
+            with suppress(Exception):
+                raw.close()
+
+
 class ReadOnlyConnection:
-    """Wraps a raw connection so every query passes the statement guard before the driver.
+    """Wraps raw connections so every query passes the statement guard before the driver.
 
     Reconnects transparently when the transport drops. ``reopen`` must reproduce the *full* connect
     path including the read-only grant check — otherwise a reconnect would be a way to end up on a
     connection that never passed the gate, which is the one thing this layer exists to prevent.
+
+    Concurrent callers are served from a bounded pool (:class:`_RawConnectionPool`) rather than a
+    shared connection, so simultaneous tool calls never interleave cursors on one session.
     """
 
     def __init__(
@@ -252,33 +375,63 @@ class ReadOnlyConnection:
         *,
         scrubber: SecretScrubber,
         reopen: Callable[[], RawConnection] | None = None,
+        pool_size: int = 1,
+        slow_query_ms: float = DEFAULT_SLOW_QUERY_MS,
     ) -> None:
-        self._raw = raw
         self._scrubber = scrubber
         self._reopen = reopen
-        self._reconnect_lock = threading.Lock()
+        self._pool = _RawConnectionPool(raw, create=reopen, max_size=pool_size)
+        self._counter_lock = threading.Lock()
+        self._slow_query_ms = slow_query_ms
         self.reconnect_count = 0
+
+    @property
+    def pool_size(self) -> int:
+        """Maximum concurrent connections this wrapper will open for its profile."""
+        return self._pool.max_size
 
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
-        """Run a read-only query. Raises :class:`ReadOnlyViolation` for anything not SELECT/WITH."""
+        """Run a read-only query. Raises :class:`ReadOnlyViolation` for anything not SELECT/WITH.
+
+        Charged against the active query budget (if any) before the statement runs, so a runaway
+        tool call stops at a documented bound instead of holding a session indefinitely.
+        """
         assert_read_only(sql)  # BEFORE the driver — the load-bearing check
+        charge_query()  # bound the call before spending a session on it
         bound = list(parameters) if parameters is not None else []
         attempts = _MAX_RECONNECT_ATTEMPTS if self._reopen is not None else 0
-        for attempt in range(attempts + 1):
-            try:
-                return self._run(sql, bound)
-            except QueryError as exc:
-                retryable = is_connection_lost(exc) and attempt < attempts
-                if not retryable:
-                    raise
-                if not self._reconnect():
-                    raise
-        raise AssertionError("unreachable")  # pragma: no cover - loop always returns or raises
+        lease = self._pool.checkout()
+        started = time.monotonic()
+        try:
+            for attempt in range(attempts + 1):
+                try:
+                    rows = self._run(lease.raw, sql, bound)
+                except QueryError as exc:
+                    retryable = is_connection_lost(exc) and attempt < attempts
+                    if not retryable:
+                        raise
+                    if not self._pool.replace(lease):
+                        raise
+                    with self._counter_lock:
+                        self.reconnect_count += 1
+                    _LOG.warning("reconnected after transport loss attempt=%d", attempt + 1)
+                else:
+                    log_query(
+                        _LOG,
+                        table=table_of(sql),
+                        elapsed_ms=(time.monotonic() - started) * 1000.0,
+                        rows=len(rows),
+                        slow_ms=self._slow_query_ms,
+                    )
+                    return rows
+            raise AssertionError("unreachable")  # pragma: no cover - loop returns or raises
+        finally:
+            self._pool.checkin(lease)
 
-    def _run(self, sql: str, bound: list[Any]) -> list[tuple[Any, ...]]:
-        cursor = self._raw.cursor()
+    def _run(self, raw: RawConnection, sql: str, bound: list[Any]) -> list[tuple[Any, ...]]:
+        cursor = raw.cursor()
         try:
             cursor.execute(sql, bound)
             return cursor.fetchall()
@@ -288,25 +441,8 @@ class ReadOnlyConnection:
             with suppress(Exception):
                 cursor.close()
 
-    def _reconnect(self) -> bool:
-        """Replace the dropped raw connection. False when reopening is impossible."""
-        if self._reopen is None:
-            return False
-        with self._reconnect_lock:
-            with suppress(Exception):
-                self._raw.close()
-            try:
-                self._raw = self._reopen()
-            except Exception:
-                # Includes ReadOnlyViolation from the re-run grant check. Report the original
-                # transport failure rather than this, so the caller sees why the query failed.
-                return False
-            self.reconnect_count += 1
-            return True
-
     def close(self) -> None:
-        with suppress(Exception):
-            self._raw.close()
+        self._pool.close()
 
 
 def _default_factory(profile: Profile) -> RawConnection:
@@ -320,6 +456,14 @@ def _default_factory(profile: Profile) -> RawConnection:
         "password": profile.password.get_secret_value(),
         "encrypt": profile.encrypt,
     }
+    if profile.connect_timeout_seconds > 0:
+        # Bounds the connect attempt so an unreachable host fails fast instead of hanging the tool
+        # call. hdbcli expects milliseconds.
+        kwargs["connectTimeout"] = int(profile.connect_timeout_seconds * 1000)
+    if profile.communication_timeout_seconds > 0:
+        # Driver-level inactivity bound. Best-effort and complementary to the query budget, which
+        # is the guarantee: this depends on driver/server behaviour, the budget does not.
+        kwargs["communicationTimeout"] = int(profile.communication_timeout_seconds * 1000)
     if profile.encrypt:
         # Certificate validation is on by default; a trust store or explicit opt-out (for
         # internal/self-signed hosts) is set per profile. The channel stays encrypted either way.
@@ -376,7 +520,19 @@ class ReadOnlyConnectionPool:
                     f"could not connect to profile '{profile.name}': " + scrubber.scrub(str(exc))
                 ) from None
 
-            connection = ReadOnlyConnection(raw, scrubber=scrubber, reopen=_connect)
+            connection = ReadOnlyConnection(
+                raw,
+                scrubber=scrubber,
+                reopen=_connect,
+                pool_size=profile.pool_size,
+                slow_query_ms=profile.slow_query_ms,
+            )
+            _LOG.info(
+                "connected profile=%s pool_size=%d read_only_asserted=%s",
+                profile.name,
+                profile.pool_size,
+                profile.read_only_user,
+            )
             self._connections[profile.name] = connection
             return connection
 

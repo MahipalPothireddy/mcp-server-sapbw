@@ -11,12 +11,14 @@ Conventions enforced here:
 - Every tool takes ``system: str``; the server stays stateless across calls (connections pooled).
 """
 
+import functools
 import os
 import re
 import sqlite3
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
@@ -25,9 +27,17 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .connectors.base import ConnectorRegistry
 from .connectors.ecc import EccConnector
+from .core.budget import (
+    DEFAULT_MAX_QUERIES,
+    DEFAULT_MAX_SECONDS,
+    BudgetExceeded,
+    query_budget,
+)
 from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnectionPool
+from .core.logging import configure as configure_logging
+from .core.logging import get_logger
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import (
@@ -94,6 +104,8 @@ _MAX_DOCGEN_PAGES = 5000
 
 mcp: FastMCP = FastMCP(name="sapbw", mask_error_details=True)
 
+_LOG = get_logger("server")
+
 
 # --- server-surface result models --------------------------------------------------------
 
@@ -115,6 +127,24 @@ class RefreshResult(BaseModel):
     system: str
     scope: str
     removed: int
+
+
+class BudgetResult(BaseModel):
+    """A call that stopped at its per-call budget rather than running unbounded.
+
+    Returned instead of raising, so the caller learns *why* the analysis stopped and what it cost.
+    Narrow the request (a pattern, a lower depth, a smaller limit) or raise the budget via
+    ``SAPBW_MAX_QUERIES_PER_CALL`` / ``SAPBW_MAX_SECONDS_PER_CALL``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["budget_exceeded"] = "budget_exceeded"
+    tool: str
+    reason: str
+    queries_spent: int
+    elapsed_seconds: float
+    budget: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChainListResult(BaseModel):
@@ -256,7 +286,13 @@ class ServerRuntime:
         changes the fingerprint, which retires the instance so entries extracted under the old
         release picture are not reused. A cache that cannot be opened (read-only filesystem, locked
         file) is never fatal: the repositories simply run uncached.
+
+        Returns ``None`` when the profile sets ``cache_enabled: false``. Structural extracts include
+        ABAP routine source and query definitions, so an organisation that will not accept customer
+        metadata at rest can switch it off per system and pay the re-read cost instead.
         """
+        if not self._profiles.get(system).cache_enabled:
+            return None
         record = self.capability(system)
         fingerprint = record.discovered_at.isoformat()
         existing = self._caches.get(system)
@@ -409,6 +445,16 @@ class ServerRuntime:
             self._connection(system), self.capability(system), self._cache(system)
         )
 
+    def close(self) -> None:
+        """Release database sessions and cache handles. Called on shutdown; safe to call twice."""
+        for _fingerprint, cache in list(self._caches.values()):
+            with suppress(Exception):
+                cache.close()
+        self._caches.clear()
+        with suppress(Exception):
+            self._pool.close_all()
+        _LOG.info("runtime closed: sessions and cache handles released")
+
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
         for name in self._profiles.names():
@@ -445,11 +491,50 @@ def set_runtime(value: Runtime) -> None:
 
 
 def _readonly_tool(func: Callable[..., Any]) -> Any:
-    """Register a read-only tool, asserting the MCP naming constraint at registration time."""
+    """Register a read-only tool, asserting the MCP naming constraint at registration time.
+
+    Every tool runs inside a :func:`query_budget`, so no single call can issue unbounded statements
+    or run indefinitely against a customer system. Hitting the bound returns a structured
+    :class:`BudgetResult` naming what was spent, which is an honest partial answer rather than a
+    hang or a silent truncation.
+    """
     name = getattr(func, "__name__", "")
     if not _TOOL_NAME_RE.match(name) or len(name) > _MAX_TOOL_NAME:
         raise ValueError(f"tool name {name!r} violates MCP naming (^[a-zA-Z][a-zA-Z0-9_]*$, <=40)")
-    return mcp.tool(annotations={"readOnlyHint": True})(func)
+
+    @functools.wraps(func)
+    def budgeted(*args: Any, **kwargs: Any) -> Any:
+        with query_budget(
+            max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]
+        ) as budget:
+            try:
+                return func(*args, **kwargs)
+            except BudgetExceeded as exc:
+                _LOG.warning("tool=%s stopped on budget: %s", name, exc.reason)
+                return BudgetResult(
+                    tool=name,
+                    reason=exc.reason,
+                    queries_spent=exc.queries,
+                    elapsed_seconds=exc.elapsed_seconds,
+                    budget=cast("dict[str, Any]", budget.snapshot()),
+                )
+
+    return mcp.tool(annotations={"readOnlyHint": True})(budgeted)
+
+
+def _budget_limits() -> tuple[int, float]:
+    """Per-call budget from the environment, so an operator can tune it without a code change."""
+    queries = os.environ.get("SAPBW_MAX_QUERIES_PER_CALL")
+    seconds = os.environ.get("SAPBW_MAX_SECONDS_PER_CALL")
+    try:
+        max_queries = int(queries) if queries else DEFAULT_MAX_QUERIES
+    except ValueError:
+        max_queries = DEFAULT_MAX_QUERIES
+    try:
+        max_seconds = float(seconds) if seconds else DEFAULT_MAX_SECONDS
+    except ValueError:
+        max_seconds = DEFAULT_MAX_SECONDS
+    return max_queries, max_seconds
 
 
 def _clamp_page(limit: int, offset: int) -> tuple[int, int]:
@@ -1204,7 +1289,20 @@ def _load_local_dotenv() -> None:
 def main() -> None:
     """Console entry point: run the MCP server over stdio."""
     _load_local_dotenv()
-    mcp.run()
+    configure_logging()  # stderr only: stdout carries the MCP protocol
+    try:
+        mcp.run()
+    finally:
+        _shutdown()
+
+
+def _shutdown() -> None:
+    """Release database sessions and cache handles on exit rather than relying on process death."""
+    holder = _runtime_holder.get("runtime")
+    closer = getattr(holder, "close", None)
+    if callable(closer):
+        with suppress(Exception):
+            closer()
 
 
 if __name__ == "__main__":

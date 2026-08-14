@@ -62,6 +62,23 @@ class Profile(BaseModel):
     ssl_validate_certificate: bool = True
     ssl_trust_store: str | None = None
     read_only_user: bool = True
+    # Ceiling on concurrent connections for this system. MCP tool functions run in a worker
+    # threadpool, so simultaneous calls need separate connections — a driver connection cannot be
+    # shared across threads. Growth is lazy: one analyst working sequentially only ever opens one.
+    # Raise it for a shared install, lower it to 1 where the database limits sessions per user.
+    pool_size: int = Field(default=4, ge=1, le=32)
+    # Bound the connect attempt so an unreachable host fails fast rather than hanging a tool call.
+    connect_timeout_seconds: float = Field(default=30.0, ge=0)
+    # Driver-level inactivity bound, best-effort: it depends on driver and server behaviour, so the
+    # per-call query budget remains the actual guarantee. 0 disables it.
+    communication_timeout_seconds: float = Field(default=0.0, ge=0)
+    # A statement slower than this is logged at WARNING regardless of level, because on a landscape
+    # you cannot log into, the slow query is what you need to see without enabling debug output.
+    slow_query_ms: float = Field(default=5_000.0, ge=0)
+    # Whether extracted metadata may be cached on local disk. Structural extracts include ABAP
+    # routine source and query definitions — customer intellectual property at rest — so an
+    # organisation that will not accept that can turn it off per system and pay the re-read cost.
+    cache_enabled: bool = True
 
     @property
     def resolve_schema_at_connect(self) -> bool:
