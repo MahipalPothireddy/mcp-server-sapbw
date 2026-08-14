@@ -34,6 +34,7 @@ from ..models.queries import (
     VariableKind,
     VariableProcessingType,
 )
+from ..services.field_lineage import FieldLineageService
 from ..services.lineage import LineageService
 from .base import Repository
 
@@ -368,21 +369,15 @@ class QueriesRepository(Repository):
         )
 
         master = providers[0] if providers else None
-        hops, reaches, advisory = self._provider_hops(master)
-        paths = [
-            FieldLineagePath(
-                iobjnm=iobj,
-                provider=master,
-                hops=hops,
-                reaches_datasource=reaches,
-                has_routine_hop=advisory,
-                provenance=self.provenance("element_range", {"IOBJNM": iobj}),
-            )
-            for iobj in sorted(infoobjects)[:_MAX_LINEAGE_IOBJ]
-        ]
+        paths = self._field_paths(master, sorted(infoobjects)[:_MAX_LINEAGE_IOBJ])
+        field_level = sum(1 for path in paths if path.resolution == "field")
         caveats = [
-            "field lineage is object-level (InfoObject -> provider -> upstream trace to "
-            "DataSource); per-field transformation-rule detail is via bw_get_transformation",
+            f"{field_level} of {len(paths)} InfoObjects resolved to field level (followed rule by "
+            "rule through RSTRANFIELD/RSTRANRULE). The remainder show the provider's upstream "
+            "objects with resolution='provider' and a reason - those are NOT that field's own "
+            "derivation.",
+            "a hop whose rule is a routine is marked advisory: BW records the rule, but what the "
+            "ABAP reads is a heuristic lower bound",
             "customer-exit variable values resolve in ABAP at runtime and are not derivable",
         ]
         if truncated:
@@ -396,6 +391,51 @@ class QueriesRepository(Repository):
             caveats=caveats,
             provenance=self.provenance("query_dir", {"COMPUID": compuid, "OBJVERS": "A"}),
         )
+
+    def _field_paths(self, master: str | None, infoobjects: list[str]) -> list[FieldLineagePath]:
+        """One path per InfoObject: field-level where a rule was found, provider-level otherwise.
+
+        The two are labelled differently on purpose. Returning the provider's upstream objects for
+        every InfoObject makes distinct fields look identically traced, which is how a reader ends
+        up believing a specific source field was identified when it was not.
+        """
+        if master is None:
+            return [
+                FieldLineagePath(
+                    iobjnm=iobj,
+                    provider=None,
+                    resolution="none",
+                    unresolved_reason="the query resolves to no InfoProvider",
+                    provenance=self.provenance("query_provider", {"IOBJNM": iobj}),
+                )
+                for iobj in infoobjects
+            ]
+
+        service = FieldLineageService(self._connection, self.capability, self._cache)
+        fallback: tuple[list[FieldLineageHop], bool, bool] | None = None
+        paths: list[FieldLineagePath] = []
+        for iobj in infoobjects:
+            traced = service.trace_field(master, iobj)
+            if traced.resolution == "field":
+                paths.append(traced)
+                continue
+            # No rule populates this field: fall back to the provider's upstream, but label it.
+            if fallback is None:
+                fallback = self._provider_hops(master)
+            hops, reaches, advisory = fallback
+            paths.append(
+                FieldLineagePath(
+                    iobjnm=iobj,
+                    provider=master,
+                    hops=list(hops),
+                    reaches_datasource=reaches,
+                    has_routine_hop=advisory,
+                    resolution="provider",
+                    unresolved_reason=traced.unresolved_reason,
+                    provenance=self.provenance("element_range", {"IOBJNM": iobj}),
+                )
+            )
+        return paths
 
     def _referenced_infoobjects(
         self, eltuids: list[str], restrictions: dict[str, list[Restriction]]

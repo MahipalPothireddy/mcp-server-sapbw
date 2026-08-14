@@ -181,7 +181,14 @@ class QuerySummary(BaseModel):
 
 
 class FieldLineageHop(BaseModel):
-    """One hop in a field's lineage path (advisory when it passes through a routine)."""
+    """One hop in a field's lineage path (advisory when it passes through a routine).
+
+    When the hop crosses a transformation, the rule-level fields say *how* the field was derived:
+    ``target_field`` is the field being populated, ``rule_type`` is BW's own rule classification
+    (direct, constant, formula, routine, master-data read, time conversion), and ``source_fields``
+    are the inputs the rule reads. A ``routine`` rule carries ``routine_code_id`` and is marked
+    advisory, because what the ABAP actually reads is a heuristic lower bound.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -191,10 +198,31 @@ class FieldLineageHop(BaseModel):
         "transformation"
     )
     advisory: bool = False
+    # Rule-level detail, populated for transformation hops.
+    target_field: str | None = None
+    rule_type: str | None = None
+    source_fields: list[str] = Field(default_factory=list)
+    transformation_id: str | None = None
+    routine_code_id: str | None = None
+    note: str | None = None
 
 
 class FieldLineagePath(BaseModel):
-    """Lineage of one InfoObject used in the query, from provider back toward a DataSource."""
+    """Lineage of one InfoObject used in the query, from provider back toward a DataSource.
+
+    ``resolution`` says how far the walk got, which is the difference between a real answer and a
+    shrug:
+
+    * ``field`` — followed rule by rule through ``RSTRANFIELD``/``RSTRANRULE``: this field's own
+      derivation, not the provider's.
+    * ``provider`` — no rule populating this field was found, so the path falls back to the
+      provider's upstream objects. The field's specific derivation is unknown.
+    * ``none`` — nothing upstream resolved at all.
+
+    A caller must be able to tell these apart: a ``provider``-level path repeated across many
+    InfoObjects looks like field lineage but is not, and treating it as such is how wrong
+    conclusions get drawn about which source field feeds a number.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -203,6 +231,8 @@ class FieldLineagePath(BaseModel):
     hops: list[FieldLineageHop] = Field(default_factory=list)
     reaches_datasource: bool = False
     has_routine_hop: bool = False
+    resolution: Literal["field", "provider", "none"] = "provider"
+    unresolved_reason: str | None = None
     provenance: Provenance | list[Provenance]
 
 
