@@ -81,6 +81,9 @@ class _Profiles:
     def ecc_names(self) -> list[str]:
         return []
 
+    def bi_inventory_path(self) -> str | None:
+        return None
+
 
 def _runtime(tmp_path: Path) -> tuple[ServerRuntime, _Resolver]:
     resolver = _Resolver()

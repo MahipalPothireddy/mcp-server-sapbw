@@ -435,7 +435,7 @@ def test_check_schedule_risk_via_client() -> None:
     result = asyncio.run(_call("bw_check_schedule_risk", {"system": "qa"}))
     body = _report_body(result)
     assert body["scenario"] == "9.7"
-    assert body["connector_required"] == "Tableau/BOBJ"  # no BI connector configured
+    assert body["connector_required"] == "BI platform"  # no BI connector configured
     assert body["findings"][0]["unpopulated_reason"] is not None
 
 

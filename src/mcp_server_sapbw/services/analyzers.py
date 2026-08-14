@@ -23,8 +23,9 @@ from __future__ import annotations
 from typing import Any
 
 from ..connectors.base import ConnectorRegistry
+from ..connectors.bi import BiConnector
 from ..connectors.ecc import EccConnector
-from ..models.chains import FrequencyClass
+from ..models.chains import FrequencyClass, ScheduleMatrixEntry
 from ..models.ecc import ExitInventory
 from ..models.findings import Finding, ScenarioReport, Severity
 from ..models.provenance import Provenance, UnsupportedResult
@@ -1094,11 +1095,19 @@ class Analyzers(Repository):
         if unsupported is not None:
             return unsupported
         matrix = self._chains.get_schedule_matrix(limit=limit)
+        entries_by_provider: dict[str, ScheduleMatrixEntry] = {}
         chains_with_p95 = 0
         if not isinstance(matrix, UnsupportedResult):
             entries, _ = matrix
             chains_with_p95 = sum(1 for e in entries if e.p95_completion is not None)
-        reason = self._registry.unpopulated_reason("tableau")
+            entries_by_provider = {e.chain_id.upper(): e for e in entries}
+
+        # With a BI connector the margins are computable, so compute them.
+        populated = self._schedule_risk_findings(entries_by_provider, limit=limit)
+        if populated is not None:
+            return populated
+
+        reason = self._registry.bi_unpopulated_reason()
         finding = Finding(
             scenario="9.7",
             severity="info",
@@ -1106,9 +1115,10 @@ class Analyzers(Repository):
             affected_objects=[],
             evidence=[],
             recommendation=(
-                "Configure a Tableau or BOBJ connector to compare each report/extract's scheduled "
-                "start against the p95 completion of the chain feeding its provider. Flag negative "
-                "or sub-30-minute margins and switch those reports to event-based triggering."
+                "Configure a BI connector (any platform: export a report inventory to YAML/JSON "
+                "and point 'bi_systems' at it) to compare each report's scheduled start against "
+                "the p95 completion of the chain feeding its provider. Negative or sub-30-minute "
+                "margins are then flagged, and those reports should move to event-based triggering."
             ),
             detail=(
                 f"BW-side feeding-chain p95 completion is available for {chains_with_p95} chain(s);"
@@ -1125,33 +1135,126 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.7"],
             findings=[finding],
             analyzed_count=chains_with_p95,
-            connector_required="Tableau/BOBJ" if reason else None,
+            connector_required="BI platform" if reason else None,
             caveats=[
-                "Safety-margin math is implemented (services.latency) and will populate per report "
-                "once an external BI connector supplies report start times.",
+                "Safety-margin math is implemented (services.latency) and populates per report as "
+                "soon as a BI connector supplies report start times.",
             ],
         )
+
+    def _schedule_risk_findings(
+        self, entries_by_chain: dict[str, ScheduleMatrixEntry], *, limit: int
+    ) -> ScenarioReport | None:
+        """Per-report safety margins, when a BI connector supplies the report side.
+
+        ``None`` when no connector is configured, so the caller emits the gap-reporting finding.
+        """
+        connector = self._registry.bi()
+        if connector is None or not isinstance(connector, BiConnector):
+            return None
+        reports = connector.report_schedules()
+        platform = connector.platform() or "the configured BI platform"
+
+        findings: list[Finding] = []
+        unmatched: list[str] = []
+        for report in reports[:limit]:
+            entry = self._feeding_entry(report.provider, entries_by_chain)
+            if entry is None or entry.p95_completion is None or report.scheduled_start is None:
+                unmatched.append(report.name)
+                continue
+            margin = latency.safety_margin_minutes(report.scheduled_start, entry.p95_completion)
+            severity, why = latency.classify_margin(margin)
+            findings.append(
+                Finding(
+                    scenario="9.7",
+                    severity=severity,
+                    title=f"Report schedule vs feeding chain: {report.name}",
+                    affected_objects=[report.name, entry.chain_id],
+                    evidence=[
+                        self.provenance("log_chain", {"CHAIN_ID": entry.chain_id}),
+                    ],
+                    recommendation=(
+                        "Switch this report to event-based triggering on the feeding chain's "
+                        "completion event rather than a clock time. A clock-based start cannot "
+                        "adapt when the chain runs long."
+                        if severity in {"critical", "high"}
+                        else "Margin is adequate; re-check if the chain's runtime grows."
+                    ),
+                    detail=why,
+                    metrics={
+                        "report": report.name,
+                        "platform": platform,
+                        "provider": report.provider,
+                        "chain_id": entry.chain_id,
+                        "report_start": report.scheduled_start,
+                        "chain_p95_completion": entry.p95_completion,
+                        "safety_margin_minutes": margin,
+                        "min_safe_margin_minutes": latency.MIN_SAFE_MARGIN_MINUTES,
+                    },
+                )
+            )
+
+        caveats = [
+            f"Report side supplied by the {platform} inventory; the BW side is observed p95 "
+            "completion from run history.",
+            "Margins are same-day wall-clock differences: a feeding chain that completes after "
+            "midnight is not resolved, so treat a near-zero margin as advisory.",
+        ]
+        if unmatched:
+            caveats.append(
+                f"{len(unmatched)} report(s) could not be matched to a feeding chain with a p95 "
+                "completion (no provider given, provider not loaded by a chain with run history, "
+                "or no scheduled start); they are excluded rather than assumed safe."
+            )
+        return ScenarioReport(
+            scenario="9.7",
+            title=SCENARIO_TITLES["9.7"],
+            findings=findings,
+            analyzed_count=len(reports[:limit]),
+            truncated=len(reports) > limit,
+            caveats=caveats,
+        )
+
+    def _feeding_entry(
+        self, provider: str | None, entries_by_chain: dict[str, ScheduleMatrixEntry]
+    ) -> ScheduleMatrixEntry | None:
+        """The schedule-matrix entry for the chain that loads ``provider``, if resolvable."""
+        if not provider:
+            return None
+        closure = self._closure.provider_to_chains(provider)
+        if isinstance(closure, UnsupportedResult):
+            return None
+        governing = cadence_of(closure.loading_chains)
+        if governing is None:
+            return None
+        return entries_by_chain.get(governing.chain_id.upper())
 
     # --- 9.8 dashboards on calc views (connector-gated) ----------------------------------
 
     def dashboards_on_calc_views(self, *, limit: int = 100) -> ScenarioReport | UnsupportedResult:
+        populated = self._dashboard_bypass_findings(limit=limit)
+        if populated is not None:
+            return populated
+
         bw_consuming = self._bw_consuming_calc_view_count(limit)
-        reason = self._registry.unpopulated_reason("tableau")
+        reason = self._registry.bi_unpopulated_reason()
         finding = Finding(
             scenario="9.8",
             severity="info",
-            title="Dashboard-to-calc-view bypass detection requires a Tableau connector",
+            title="Dashboard-to-calc-view bypass detection requires a BI connector",
             affected_objects=[],
             evidence=[],
             recommendation=(
-                "Configure a Tableau connector to list dashboards reading calc views directly. For "
-                "each, determine whether its calc view is the same one a CompositeProvider uses: a "
-                "shared view means one change breaks both paths; separate views can silently "
-                "diverge in numbers."
+                "Configure a BI connector (export your platform's dashboard inventory to "
+                "YAML/JSON and point 'bi_systems' at it) to list dashboards reading calc views "
+                "directly. Each is then classified automatically: a view shared with a "
+                "CompositeProvider means one change breaks both paths, while a separate view means "
+                "the two can silently diverge in numbers."
             ),
             detail=(
                 f"{bw_consuming} BW-consuming calc view(s) exist that a dashboard could read "
-                "directly, bypassing BW; matching them to dashboards needs Tableau metadata."
+                "directly, bypassing BW; matching them to dashboards needs your BI platform's "
+                "inventory, which BW does not hold."
             ),
             metrics={"bw_consuming_calc_views": bw_consuming},
             unpopulated_reason=reason,
@@ -1161,13 +1264,97 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.8"],
             findings=[finding],
             analyzed_count=bw_consuming,
-            connector_required="Tableau" if reason else None,
+            connector_required="BI platform" if reason else None,
             caveats=[
                 "Calc views that read BW tables are candidate bypass paths; confirming a dashboard "
                 "actually reads one, and whether it is shared with the CompositeProvider path, "
                 "needs Tableau lineage metadata (mission Known Limitation 2).",
             ],
         )
+
+    def _dashboard_bypass_findings(self, *, limit: int) -> ScenarioReport | None:
+        """Dashboards reading a calc view directly, and whether that view is shared with BW.
+
+        The mission's distinction is the point of the scenario: a dashboard on the **same** calc
+        view a CompositeProvider uses means one change breaks both paths at once; a **separate**
+        view means the two paths can silently diverge in numbers. Both are findings, and which one
+        applies is determined from the calc view's consumers rather than guessed.
+        """
+        connector = self._registry.bi()
+        if connector is None or not isinstance(connector, BiConnector):
+            return None
+        sources = [d for d in connector.dashboard_sources() if d.source_kind != "bw_provider"]
+        platform = connector.platform() or "the configured BI platform"
+
+        findings: list[Finding] = []
+        for dashboard in sources[:limit]:
+            shared_with = self._providers_consuming(dashboard.source_object)
+            if shared_with:
+                severity: Severity = "high"
+                detail = (
+                    f"reads calc view '{dashboard.source_object}' directly, and the same view is "
+                    f"consumed by BW provider(s) {', '.join(shared_with)}. One change to the view "
+                    "affects both the dashboard and the BW path simultaneously."
+                )
+                recommendation = (
+                    "Treat this calc view as a shared contract: changes need both the BW and the "
+                    "dashboard owner in the loop, and BW's where-used list will not warn either of "
+                    "them."
+                )
+            else:
+                severity = "medium"
+                detail = (
+                    f"reads calc view '{dashboard.source_object}' directly, and no BW provider "
+                    "consumes that view. The dashboard and the BW path are therefore independent "
+                    "and can diverge in numbers without either side erroring."
+                )
+                recommendation = (
+                    "Reconcile this dashboard's figures against the BW path deliberately, or point "
+                    "it at the provider's view so both read one definition."
+                )
+            findings.append(
+                Finding(
+                    scenario="9.8",
+                    severity=severity,
+                    title=f"Dashboard bypasses BW: {dashboard.name}",
+                    affected_objects=[dashboard.name, dashboard.source_object, *shared_with],
+                    evidence=[
+                        self.provenance(
+                            "object_dependencies", {"CALC_VIEW": dashboard.source_object}
+                        )
+                    ],
+                    recommendation=recommendation,
+                    detail=detail,
+                    metrics={
+                        "dashboard": dashboard.name,
+                        "platform": platform,
+                        "calc_view": dashboard.source_object,
+                        "shared_with_bw_providers": shared_with,
+                        "path": "shared_view" if shared_with else "separate_view",
+                    },
+                )
+            )
+        return ScenarioReport(
+            scenario="9.8",
+            title=SCENARIO_TITLES["9.8"],
+            findings=findings,
+            analyzed_count=len(sources[:limit]),
+            truncated=len(sources) > limit,
+            caveats=[
+                f"Dashboard side supplied by the {platform} inventory; whether the view is shared "
+                "with BW comes from the generated '0BW:BIA:' provider views in "
+                "SYS.OBJECT_DEPENDENCIES.",
+                "Dashboards reading a BW provider (rather than a calc view) are not bypasses and "
+                "are excluded.",
+            ],
+        )
+
+    def _providers_consuming(self, calc_view: str) -> list[str]:
+        """BW providers whose generated views read ``calc_view`` (empty when none/unresolvable)."""
+        lineage = self._hana.get_calc_view_lineage(calc_view)
+        if isinstance(lineage, UnsupportedResult):
+            return []
+        return [consumer.provider for consumer in lineage.consuming_bw_providers]
 
     def _bw_consuming_calc_view_count(self, limit: int) -> int:
         if not self.capability.is_available("object_dependencies"):

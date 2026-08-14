@@ -302,7 +302,7 @@ def test_schedule_risk_connector_gated() -> None:
     report = _analyzers().schedule_risk()
     assert not isinstance(report, UnsupportedResult)
     assert report.scenario == "9.7"
-    assert report.connector_required == "Tableau/BOBJ"
+    assert report.connector_required == "BI platform"  # vendor-neutral: any platform satisfies it
     assert report.findings[0].unpopulated_reason is not None
 
 
@@ -310,7 +310,7 @@ def test_dashboards_on_calc_views_connector_gated() -> None:
     report = _analyzers().dashboards_on_calc_views()
     assert not isinstance(report, UnsupportedResult)
     assert report.scenario == "9.8"
-    assert report.connector_required == "Tableau"
+    assert report.connector_required == "BI platform"
     # object_dependencies absent in this capability -> no BW-consuming count.
     assert report.findings[0].metrics["bw_consuming_calc_views"] == 0
 

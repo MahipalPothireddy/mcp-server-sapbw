@@ -87,6 +87,35 @@ systems:
 # Requires the optional extra:  pip install 'mcp-server-sapbw[ecc]'
 # The ADT user needs source-display authorisation and an active ADT ICF node.
 
+# OPTIONAL: your BI platform's reporting inventory, for scenarios 9.7 and 9.8.
+#
+# Report schedules and dashboard sources are not in BW, so those two analyses need them from
+# outside. This takes an exported FILE rather than platform credentials - which means it works for
+# any platform (Tableau, Power BI, SAP Analytics Cloud, Looker, Qlik, BOBJ), the export is
+# auditable, and this server keeps its "read-only, BW only" trust boundary.
+#
+# bi_systems:
+#   inventory_path: ${BI_INVENTORY_PATH}     # a local .yaml or .json file
+#
+# Inventory format (unknown keys are ignored, so a raw export usually works as-is):
+#
+#   platform: Power BI               # free text; findings name it as the source
+#   reports:
+#     - name: Daily Sales Extract
+#       provider: SALES_DSO          # the BW provider the report reads
+#       scheduled_start: "06:10"     # local wall clock, 24h
+#       frequency: daily             # optional
+#       owner: someone               # optional
+#   dashboards:
+#     - name: Margin Dashboard
+#       source_object: PKG/SALES_CV  # a calc view, or a BW provider
+#       source_kind: calc_view       # calc_view | bw_provider
+#
+# With this configured, 9.7 computes a safety margin per report (its scheduled start vs the p95
+# completion of the chain feeding its provider) and 9.8 classifies each dashboard's calc view as
+# shared with a CompositeProvider (one change breaks both paths) or separate (the two can silently
+# diverge). Without it, both report exactly what they need instead of guessing.
+
 # Notes:
 # - Capability discovery (release, ABAP schema, object-model variants, log-retention
 #   window) runs on first connect and is cached per profile.

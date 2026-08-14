@@ -20,7 +20,11 @@ from typing import Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict
 
-ConnectorKind = Literal["ecc", "tableau", "bobj"]
+# ``bi`` is the vendor-neutral kind: report schedules and dashboard sources look the same whether
+# they come from Tableau, Power BI, SAP Analytics Cloud, Looker or Qlik, so the analyzers ask for a
+# capability rather than a product. ``tableau`` and ``bobj`` are retained so an existing
+# configuration and the older reason strings keep working.
+ConnectorKind = Literal["ecc", "bi", "tableau", "bobj"]
 
 # What each connector would unlock, named in the "not configured" reason so a gap is actionable.
 CONNECTOR_PURPOSE: dict[ConnectorKind, str] = {
@@ -28,11 +32,19 @@ CONNECTOR_PURPOSE: dict[ConnectorKind, str] = {
         "ECC extractor-enhancement source (CMOD/BAdI ABAP, ROOSOURCE/ROOSFIELD) for scenario 9.6 "
         "enhancement logic"
     ),
+    "bi": (
+        "report/extract schedules and dashboard sources from your BI platform (any of Tableau, "
+        "Power BI, SAP Analytics Cloud, Looker, Qlik, BOBJ) for scenarios 9.7 and 9.8"
+    ),
     "tableau": (
         "Tableau report/extract schedules and calc-view dashboard usage for scenarios 9.7 and 9.8"
     ),
     "bobj": "BusinessObjects report schedules for scenario 9.7",
 }
+
+#: Kinds that satisfy the BI capability, most general first. An analyzer asks for the capability and
+#: takes whichever is configured, so a Tableau-specific setup keeps working unchanged.
+BI_KINDS: tuple[ConnectorKind, ...] = ("bi", "tableau", "bobj")
 
 
 class ConnectorStatus(BaseModel):
@@ -108,3 +120,21 @@ class ConnectorRegistry:
     def unpopulated_reason(self, kind: ConnectorKind) -> str | None:
         """``None`` when the connector is configured, else the reason it cannot be populated."""
         return None if self.is_configured(kind) else unpopulated_reason(kind)
+
+    # --- capability lookup (rather than product lookup) ---------------------------------
+
+    def bi(self) -> ExternalConnector | None:
+        """Whichever configured connector can answer BI questions, or ``None``.
+
+        Analyzers ask for the *capability* so that an organisation on any BI platform is served by
+        the same code path, and an existing ``tableau``/``bobj`` configuration keeps working.
+        """
+        for kind in BI_KINDS:
+            candidate = self._by_kind.get(kind)
+            if candidate is not None and candidate.is_configured():
+                return candidate
+        return None
+
+    def bi_unpopulated_reason(self) -> str | None:
+        """``None`` when some BI connector is configured, else why 9.7/9.8 cannot be populated."""
+        return None if self.bi() is not None else unpopulated_reason("bi")

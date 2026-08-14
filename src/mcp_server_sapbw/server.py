@@ -26,6 +26,7 @@ from fastmcp.utilities.types import Image
 from pydantic import BaseModel, ConfigDict, Field
 
 from .connectors.base import ConnectorRegistry
+from .connectors.bi import FileBiConnector
 from .connectors.ecc import EccConnector
 from .core.budget import (
     DEFAULT_MAX_QUERIES,
@@ -443,12 +444,23 @@ class ServerRuntime:
     def _registry(self) -> ConnectorRegistry:
         """Connector registry for the analyzers.
 
-        The ECC connector appears only when an ``ecc_systems`` profile is configured; otherwise the
-        connector-gated scenarios (9.6/9.7/9.8) report "not configured" rather than guessing.
-        Tableau/BOBJ connectors remain deferred.
+        Each connector appears only when configured; otherwise the connector-gated scenarios report
+        "not configured" with the reason rather than guessing. The BI connector is vendor-neutral —
+        it reads an inventory exported from whatever platform the organisation runs — so 9.7 and 9.8
+        populate for Tableau, Power BI, SAC, Looker or Qlik through the same path.
         """
-        connector = self._ecc_connector()
-        return ConnectorRegistry([connector] if connector.is_configured() else [])
+        configured: list[Any] = []
+        ecc = self._ecc_connector()
+        if ecc.is_configured():
+            configured.append(ecc)
+        inventory = self._profiles.bi_inventory_path()
+        if inventory:
+            bi = FileBiConnector(inventory)
+            if bi.is_configured():
+                configured.append(bi)
+            else:
+                _LOG.warning("BI inventory not usable: %s", bi.status().detail)
+        return ConnectorRegistry(configured)
 
     def analyzers(self, system: str) -> Analyzers:
         return Analyzers(

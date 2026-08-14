@@ -269,6 +269,7 @@ class ProfileManager:
         raw = self._read()
         self._profiles: dict[str, Profile] = self._load_systems(raw)
         self._ecc_profiles: dict[str, EccProfile] = self._load_ecc_systems(raw)
+        self._bi_inventory: str | None = self._load_bi_systems(raw)
 
     @staticmethod
     def _load_local_dotenv(env: Mapping[str, str]) -> None:
@@ -340,6 +341,25 @@ class ProfileManager:
             for name, raw in systems.items()
         }
 
+    def _load_bi_systems(self, data: Mapping[str, Any]) -> str | None:
+        """Parse the optional ``bi_systems`` block: an inventory file path, nothing more.
+
+        Only a path is accepted on purpose. Report schedules and dashboard sources are the same
+        shape whichever platform produced them, and taking an exported file rather than platform
+        credentials keeps this server's trust boundary at "read-only, BW only".
+        """
+        systems = data.get("bi_systems")
+        if systems is None:
+            return None
+        if not isinstance(systems, Mapping):
+            raise ProfileConfigError("'bi_systems' must be a mapping when present")
+        raw_path = systems.get("inventory_path") or systems.get("path")
+        if raw_path is None:
+            raise ProfileConfigError("'bi_systems' needs an 'inventory_path' entry")
+        return _resolve_field(
+            str(raw_path), self._env, field="inventory_path", profile="bi_systems"
+        )
+
     def names(self) -> list[str]:
         """Configured profile names."""
         return sorted(self._profiles)
@@ -361,3 +381,11 @@ class ProfileManager:
             return self._ecc_profiles[name]
         except KeyError:
             raise ProfileNotFoundError(name, self.ecc_names()) from None
+
+    def bi_inventory_path(self) -> str | None:
+        """Path to the BI reporting inventory, when a ``bi_systems`` block configures one.
+
+        Vendor-neutral by design: the file is an export from whatever BI platform the organisation
+        runs, so scenarios 9.7/9.8 work without this server holding BI credentials.
+        """
+        return self._bi_inventory
