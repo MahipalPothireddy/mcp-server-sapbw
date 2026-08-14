@@ -9,11 +9,11 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, risk-analyzer, and knowledge-base subsystems are implemented:
-> **37 tools and 6 prompts**, most of them exercised against a live BW 7.50 system. Still planned:
-> URI-addressable **resources**, and the Tableau/BOBJ connectors for scenarios 9.7/9.8. The ECC
-> source-system connector is implemented (ADT, read-only) but not yet exercised against a live
-> source system. See `PROGRESS.md` for the build log and `.kiro/specs/mcp-server-sapbw/` for the
-> spec.
+> **41 tools, 7 resources and 6 prompts**, most of them exercised against a live BW 7.50 system.
+> Still planned: a BI connector for scenarios 9.7/9.8 (report schedules and dashboards live outside
+> BW, so those two analyses return a template naming the connector required). The ECC source-system
+> connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
+> `PROGRESS.md` for the build log and `.kiro/specs/mcp-server-sapbw/` for the spec.
 
 ## What it does
 
@@ -46,13 +46,30 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 | Release | Status |
 |---|---|
 | BW 7.5 (on HANA) | **Validated live** — the reference system for the build (SAP_BW 7.50) |
-| BW 7.4 (on HANA) | Expected to work; validated at runtime by the capability resolver, not yet tested live |
-| BW/4HANA | Expected to work; runtime-validated, not yet tested live |
+| BW 7.4 (on HANA) | **Not tested live.** Portability rests on the capability resolver, which is tested against absent-table shapes (see below) |
+| BW/4HANA | **Not tested live.** Same as above |
 
 Portability is achieved by a runtime **capability resolver** that discovers which tables and
 object-model variants actually exist before any tool builds SQL — no release is assumed. On a
 release where a table is absent, the affected tool returns a structured "unsupported on this
 release" result naming what is missing, rather than guessing.
+
+Being precise about what that guarantee is worth, since only one release has been seen live:
+
+- **Checked.** `tests/test_release_portability.py` runs all 37 read entry points against seven
+  capability shapes — no advanced DSO / CompositeProvider, no classic cube or BW 3.x stack, no HANA
+  catalogue, no BEx tables, no run history, and one where *nothing* is available. In every shape, no
+  entry point builds SQL naming an absent table and none raises; the affected ones return
+  `UnsupportedResult`. That is the mission's "no tool ever queries a non-existent table" criterion,
+  enforced by the suite rather than by inspection.
+- **Not checked.** Whether those shapes match what SAP actually ships in 7.4 or BW/4HANA. The
+  fixtures deliberately do not claim to be a release inventory — the server's rule against asserting
+  unread metadata applies to its own tests too. What is proven is that *absence is handled*,
+  whichever tables turn out to be absent.
+
+If you run this against a release other than 7.5, `bw_system_profile` reports exactly what it found
+and `99-gaps-and-risks.md` in the generated docs lists what could not be read. Both are worth
+reading first, and we would welcome the capability report as an issue.
 
 ## Quickstart
 
