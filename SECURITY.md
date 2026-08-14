@@ -17,7 +17,53 @@
   intellectual property. It is cached locally (git-ignored) and never committed or distributed. CI
   fails if customer object-naming patterns appear outside `tests/fixtures/`.
 - **No third-party exfiltration.** The server does not transmit project code, credentials, or
-  metadata to any external endpoint.
+  metadata to any external endpoint. Diagram rendering is local; there is no hosted renderer.
+- **Bounded per call.** Every tool runs inside a query and time budget, so a single call cannot
+  issue unbounded statements or hold a database session indefinitely.
+
+## What the server writes to disk
+
+Two things leave memory. Both are local to the machine running the server, and neither is ever
+transmitted anywhere.
+
+### 1. The metadata cache (on by default)
+
+Extracts are cached so repeat questions do not re-read millions of rows. **This means customer
+intellectual property is stored at rest**, specifically:
+
+| Cached object type | What it contains |
+|---|---|
+| `routine_code`, `routine_analysis` | **ABAP routine source** and its parsed dependencies |
+| `query`, `query_lineage` | BEx query definitions, restrictions, variables |
+| `transformation` | Field mappings and rule types |
+| `provider`, `chain`, `calc_view` | Object names, fields, structures |
+| `chain_runtimes` | Run statistics (separate one-hour tier) |
+
+- **Location.** A per-user directory, resolved in this order: `SAPBW_CACHE_DIR`, then
+  `%LOCALAPPDATA%\mcp-server-sapbw\cache` on Windows, then `$XDG_CACHE_HOME/mcp-server-sapbw` or
+  `~/.cache/mcp-server-sapbw`. Per-user rather than system-wide, because the cache inherits the
+  reach of the credentials that filled it. It is never written relative to the working directory.
+- **Retention.** Structural extracts 24 hours, runtime statistics one hour (hard-capped). Entries
+  are also invalidated automatically whenever capability discovery re-runs.
+- **Inspect it.** `bw_cache_status(system)` reports the location, size and entry counts per object
+  type without reading any cached value.
+- **Purge it.** `bw_refresh_cache(system, scope)` — `all`, or one object type from the table above.
+  Deleting the file is equally safe.
+- **Turn it off.** Set `cache_enabled: false` on the profile. Nothing is then written to disk, at
+  the cost of re-reading on every call. Use this where customer metadata at rest is not acceptable.
+
+### 2. Generated documentation (only when you ask)
+
+`bw_generate_docs` writes a markdown knowledge base containing object names, routine source and
+query definitions to a directory you name. It defaults to `output/`, which is git-ignored. Treat
+that directory with the same care as the source system.
+
+## What is never written or logged
+
+- Credentials, host names and connection strings are scrubbed from every error and log record.
+- **Bound query parameters are never logged at any level**, because they carry concrete object
+  names. Query logs record the table, elapsed milliseconds and row count only.
+- Logs go to stderr, never stdout (stdout carries the MCP protocol).
 
 ## Reporting a vulnerability
 

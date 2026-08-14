@@ -40,6 +40,29 @@ systems:
     #   ssl_validate_certificate: false
     read_only_user: true
 
+    # --- optional operational settings (shown here with their defaults) ---------------------
+    #
+    # Ceiling on concurrent connections for this system. MCP tool calls run in a worker
+    # threadpool, so simultaneous calls need separate sessions. Growth is lazy: one analyst
+    # working sequentially only ever opens one. Lower it to 1 where sessions per user are
+    # restricted; raise it for a shared install.
+    #   pool_size: 4
+    #
+    # Fail fast instead of hanging a tool call on an unreachable host.
+    #   connect_timeout_seconds: 30
+    #
+    # Driver-level inactivity bound. Best-effort (it depends on driver and server behaviour);
+    # the per-call query budget is the actual guarantee. 0 disables it.
+    #   communication_timeout_seconds: 0
+    #
+    # Statements slower than this are logged at WARNING regardless of log level.
+    #   slow_query_ms: 5000
+    #
+    # Whether extracted metadata may be cached on local disk. Structural extracts include ABAP
+    # routine source and query definitions - customer IP at rest. Set false to keep nothing on
+    # disk, at the cost of re-reading on every call. See SECURITY.md and bw_cache_status.
+    #   cache_enabled: true
+
 # OPTIONAL: ABAP source systems, reached over ADT (SAP's own HTTP source service).
 #
 # Only needed to read extractor-exit ABAP, which exists in the source system and not in BW.

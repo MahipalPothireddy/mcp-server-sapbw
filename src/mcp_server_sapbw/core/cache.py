@@ -67,6 +67,24 @@ class SqliteCache:
         self._conn.execute(_SCHEMA)
         self._conn.commit()
 
+    @property
+    def structural_ttl(self) -> int:
+        """Seconds a structural extract is served for before it is re-read."""
+        return self._structural_ttl
+
+    @property
+    def runtime_ttl(self) -> int:
+        """Seconds a runtime statistic is served for (hard-capped at one hour)."""
+        return self._runtime_ttl
+
+    def entry_counts(self) -> dict[str, int]:
+        """Entries per object type, for reporting what is at rest without reading any value."""
+        rows = self._conn.execute(
+            "SELECT object_type, COUNT(*) FROM cache_entries WHERE system = ? GROUP BY object_type",
+            (self._system,),
+        ).fetchall()
+        return {str(object_type): int(count) for object_type, count in rows}
+
     def _ttl(self, tier: CacheTier) -> int:
         return self._structural_ttl if tier == "structural" else self._runtime_ttl
 

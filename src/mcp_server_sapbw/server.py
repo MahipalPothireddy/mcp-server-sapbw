@@ -38,6 +38,7 @@ from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnectionPool
 from .core.logging import configure as configure_logging
 from .core.logging import get_logger
+from .core.paths import cache_dir as default_cache_dir
 from .core.profiles import ProfileManager
 from .models.capability import CapabilityRecord
 from .models.chains import (
@@ -127,6 +128,27 @@ class RefreshResult(BaseModel):
     system: str
     scope: str
     removed: int
+
+
+class CacheStatus(BaseModel):
+    """What extracted metadata is cached on disk for one profile.
+
+    ``entries_by_type`` uses the same object-type names as the ``bw_refresh_cache`` scope, so a
+    reader can see what is retained and purge exactly that.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    system: str
+    enabled: bool
+    location: str | None = None  # the directory, never a host or credential
+    exists: bool = False
+    size_bytes: int = 0
+    entries: int = 0
+    entries_by_type: dict[str, int] = Field(default_factory=dict)
+    structural_ttl_seconds: int | None = None
+    runtime_ttl_seconds: int | None = None
+    note: str | None = None
 
 
 class BudgetResult(BaseModel):
@@ -225,6 +247,7 @@ class Runtime(Protocol):
     def capability(self, system: str) -> CapabilityRecord: ...
     def refresh_capabilities(self, system: str) -> CapabilityRecord: ...
     def refresh_cache(self, system: str, scope: str) -> RefreshResult: ...
+    def cache_status(self, system: str) -> CacheStatus: ...
     def chains(self, system: str) -> ChainsRepository: ...
     def providers(self, system: str) -> ProvidersRepository: ...
     def search(self, system: str) -> SearchRepository: ...
@@ -252,8 +275,11 @@ class ServerRuntime:
         profile_manager: ProfileManager,
         pool: ReadOnlyConnectionPool,
         resolver: CapabilityResolver,
-        cache_dir: Path = Path("cache"),
+        cache_dir: Path | None = None,
     ) -> None:
+        # Default to the platform's per-user cache location rather than a path relative to whatever
+        # directory the MCP client happened to launch the process in (see core/paths.py).
+        cache_dir = cache_dir if cache_dir is not None else default_cache_dir()
         self._profiles = profile_manager
         self._pool = pool
         self._resolver = resolver
@@ -318,6 +344,37 @@ class ServerRuntime:
         cache = self._cache(system)
         removed = cache.refresh(scope) if cache is not None else 0
         return RefreshResult(system=system, scope=scope, removed=removed)
+
+    def cache_status(self, system: str) -> CacheStatus:
+        """Report what is cached on disk for a profile, without reading any cached value."""
+        enabled = self._profiles.get(system).cache_enabled
+        path = self._cache_dir / f"{system}.sqlite"
+        if not enabled:
+            return CacheStatus(
+                system=system,
+                enabled=False,
+                note="cache_enabled is false for this profile: no metadata is written to disk",
+            )
+        cache = self._cache(system)
+        if cache is None:
+            return CacheStatus(
+                system=system,
+                enabled=True,
+                location=str(self._cache_dir),
+                note="the cache could not be opened; the server is running uncached",
+            )
+        counts = cache.entry_counts()
+        return CacheStatus(
+            system=system,
+            enabled=True,
+            location=str(self._cache_dir),
+            exists=path.exists(),
+            size_bytes=path.stat().st_size if path.exists() else 0,
+            entries=sum(counts.values()),
+            entries_by_type=counts,
+            structural_ttl_seconds=cache.structural_ttl,
+            runtime_ttl_seconds=cache.runtime_ttl,
+        )
 
     def chains(self, system: str) -> ChainsRepository:
         return ChainsRepository(
@@ -560,6 +617,18 @@ def bw_system_profile(system: str) -> CapabilityRecord:
 def bw_refresh_capabilities(system: str) -> CapabilityRecord:
     """Re-run capability discovery for a system, replacing the cached record."""
     return runtime().refresh_capabilities(system)
+
+
+@_readonly_tool
+def bw_cache_status(system: str) -> CacheStatus:
+    """What extracted metadata is currently cached on local disk, and where.
+
+    Answers the compliance question directly: structural extracts include ABAP routine source and
+    query definitions, so an operator needs to see what is at rest without opening the file. Reports
+    the location, per-object-type entry counts and size. Set ``cache_enabled: false`` on the profile
+    to keep nothing at rest, or call ``bw_refresh_cache`` to purge.
+    """
+    return runtime().cache_status(system)
 
 
 @_readonly_tool

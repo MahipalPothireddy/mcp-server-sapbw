@@ -29,7 +29,7 @@ from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.sources import SourcesRepository
 from mcp_server_sapbw.repositories.threex import ThreeXRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
-from mcp_server_sapbw.server import RefreshResult, SystemStatus
+from mcp_server_sapbw.server import CacheStatus, RefreshResult, SystemStatus
 from mcp_server_sapbw.services.analyzers import Analyzers
 from mcp_server_sapbw.services.docgen import DocGenerator
 from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
@@ -211,6 +211,9 @@ class FakeRuntime:
 
     def refresh_cache(self, system: str, scope: str) -> RefreshResult:
         return RefreshResult(system=system, scope=scope, removed=0)
+
+    def cache_status(self, system: str) -> CacheStatus:
+        return CacheStatus(system=system, enabled=True, location="/tmp/cache")
 
     def chains(self, system: str) -> ChainsRepository:
         return ChainsRepository(_Conn(), self._cap)
