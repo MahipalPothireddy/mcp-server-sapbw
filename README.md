@@ -8,8 +8,9 @@ impact-analysis and incident-triage questions in one call (including dependencie
 own where-used lists), and can render a full markdown knowledge base on demand.
 
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
-> BEx query, HANA, provider-health, risk-analyzer, and knowledge-base subsystems are implemented:
-> **41 tools, 7 resources and 6 prompts**, most of them exercised against a live BW 7.50 system.
+> BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
+> implemented:
+> **45 tools, 7 resources and 6 prompts**, most of them exercised against a live BW 7.50 system.
 > Still planned: a BI connector for scenarios 9.7/9.8 (report schedules and dashboards live outside
 > BW, so those two analyses return a template naming the connector required). The ECC source-system
 > connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
@@ -272,6 +273,41 @@ name and its **type confirmed** against the provider header tables, which yields
 calc-view → CompositeProvider hop that BW's own where-used lists do not report. Each crossing
 carries `resolution` (`bic_table` / `bw_provider_view` / `unresolved`) so an unverified entry is
 never mistaken for a confirmed one.
+
+### Security (analysis authorisations)
+
+| Tool | Parameters | Purpose |
+|---|---|---|
+| `bw_security_overview` | `system`, `limit=200` | Row-level security posture: catch-all authorisations, unrestricted users, coverage gaps. No concrete values |
+| `bw_list_analysis_auths` | `system`, `include_generated=true`, `limit`, `offset` | Authorisations by **shape**: which characteristics, how many ranges, catch-all or not |
+| `bw_get_analysis_auth` | `system`, `name` | One authorisation in full, **including its value ranges** and assigned users |
+| `bw_get_query_auth_exposure` | `system`, `query` | Whether a query returns different data per user, and on which characteristics |
+
+This subsystem reads a different class of data from the rest of the server. `RSECVAL` holds
+permission *values* — "cost centres 1000–1999" is a statement about what a named person may see —
+so three constraints are enforced in code rather than by convention:
+
+- **Nothing here is cached, at any tier.** Every other repository persists extracts to the SQLite
+  cache. This one is constructed without a cache and ignores one if passed: a stale answer to "who
+  can see this" is worse than a slow one, and permission data on disk widens the cache file's blast
+  radius. A regression test asserts the repository has no cache.
+- **Values are opt-in.** Listing and overview return shape only, so a landscape-wide question cannot
+  incidentally place a permission dump into the transcript. Only `bw_get_analysis_auth` returns
+  ranges, and its payload is labelled `contains_data_values`.
+- **Silence is not safety.** These tables are frequently unreadable by a locked-down reporting user —
+  they *are* the authorisation model. Absent or unreadable is reported as a documented gap, never as
+  "no authorisations exist". An unreadable assignment table yields `null` user counts, never `0`.
+
+Special values are decoded rather than passed through: `:` grants **aggregated access only** (a total
+but not the rows behind it, routinely misread as no access), `#` is the unassigned member, `*` is
+everything. A range whose value starts `$` resolves per user at runtime and is flagged, because
+metadata cannot state its effective scope. `0BI_ALL` holders are listed as unrestricted rather than
+counted as governed. Column names are resolved from `DD03L` before any SQL is built, so a release
+with a different `RSEC*` layout degrades to a gap instead of raising.
+
+The finding to look for is `uncovered_characteristics`: a characteristic flagged
+authorisation-relevant that no authorisation covers returns **no data** to every user without a
+catch-all. That is a live configuration fault, and it is invisible unless both sides are compared.
 
 ### Risk analyzers (mission Section 9)
 

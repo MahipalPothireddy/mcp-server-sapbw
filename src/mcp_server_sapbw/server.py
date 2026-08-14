@@ -59,6 +59,12 @@ from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
 from .models.queries import Query, QueryLineage, QueryOriginFilter, QuerySummary, QueryUsage
 from .models.register import RoutineRegister
+from .models.security import (
+    AnalysisAuth,
+    AnalysisAuthSummary,
+    QueryAuthExposure,
+    SecurityOverview,
+)
 from .models.sources import EnhancementInventory, SourceTopology
 from .models.threex import ThreeXFlowReport, TransferRule, UpdateRule
 from .models.transformations import (
@@ -74,6 +80,7 @@ from .repositories.health import HealthRepository
 from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
+from .repositories.security import SecurityRepository
 from .repositories.sources import SourcesRepository
 from .repositories.threex import ThreeXRepository
 from .repositories.transformations import TransformationsRepository
@@ -249,6 +256,19 @@ class CalcViewListResult(BaseModel):
     offset: int
 
 
+class AuthListResult(BaseModel):
+    """Analysis authorisations by shape. Carries no concrete permission values by design."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AnalysisAuthSummary] = Field(default_factory=list)
+    total_count: int
+    limit: int
+    offset: int
+    #: True when the underlying value scan hit its row budget, so ``total_count`` is a lower bound.
+    scan_truncated: bool = False
+
+
 # --- runtime -----------------------------------------------------------------------------
 
 
@@ -273,6 +293,10 @@ class Runtime(Protocol):
     def health(self, system: str) -> HealthRepository: ...
     def sources(self, system: str) -> SourcesRepository: ...
     def threex(self, system: str) -> ThreeXRepository: ...
+    def security(self, system: str) -> SecurityRepository: ...
+    def query_auth_exposure(
+        self, system: str, query: str
+    ) -> QueryAuthExposure | UnsupportedResult: ...
     def routine_register(self, system: str) -> RoutineRegisterService: ...
     def exit_analysis(
         self, ecc_system: str | None
@@ -519,6 +543,61 @@ class ServerRuntime:
             self.capability(system),
             self._cache(system),
         )
+
+    def security(self, system: str) -> SecurityRepository:
+        """Security repository — built **without** a cache, deliberately.
+
+        Permission data is not structural metadata: persisting it widens the blast radius of the
+        cache file, and a stale answer to "who can see this" is worse than a slow one.
+        """
+        return SecurityRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+            None,
+        )
+
+    def query_auth_exposure(self, system: str, query: str) -> QueryAuthExposure | UnsupportedResult:
+        """Join a query's InfoObjects against the authorisation-relevant characteristics.
+
+        Lives on the runtime rather than in either repository because it spans both: the query
+        subsystem knows which characteristics a report touches, and the security subsystem knows
+        which of those make a result user-specific.
+        """
+        security = self.security(system)
+        unsupported = security.require_security()
+        if unsupported is not None:
+            return unsupported
+        lineage = self.queries(system).get_query_lineage(query)
+        if isinstance(lineage, UnsupportedResult):
+            return lineage
+        definition = self.queries(system).get_query(query)
+        auth_variables: list[str] = []
+        if not isinstance(definition, UnsupportedResult):
+            auth_variables = sorted(
+                variable.name
+                for variable in definition.variables
+                if variable.processing_type == "authorization"
+            )
+        exposure = security.query_exposure(
+            compuid=lineage.compuid,
+            compid=lineage.compid,
+            providers=list(lineage.providers),
+            characteristics=[path.iobjnm for path in lineage.paths],
+        )
+        if auth_variables:
+            exposure = exposure.model_copy(
+                update={
+                    "authorization_variables": auth_variables,
+                    "user_specific_result": True,
+                    "caveats": [
+                        *exposure.caveats,
+                        f"{len(auth_variables)} variable(s) are filled from the user's "
+                        "authorisations at runtime (RSZGLOBV.VPROCTP=6): like customer-exit "
+                        "variables these are a metadata dead end, named but not resolvable.",
+                    ],
+                }
+            )
+        return exposure
 
     def routine_register(self, system: str) -> RoutineRegisterService:
         return RoutineRegisterService(
@@ -1287,6 +1366,85 @@ def bw_render_lineage(
         [Image(data=png_bytes, format="png")] if png_bytes else [svg]  # SVG travels as text
     )
     return ToolResult(content=content, structured_content=result.model_dump())
+
+
+# --- security / analysis-authorisation tools ---------------------------------------------
+#
+# These read a different class of data from every other tool: RSECVAL holds permission *values*, not
+# structure. Three deliberate constraints, enforced in the repository rather than by convention:
+# nothing here is cached at any tier; concrete values come only from bw_get_analysis_auth; and an
+# unreadable RSEC* table is reported as a gap, never taken to mean no authorisations exist.
+
+
+@_readonly_tool
+def bw_security_overview(system: str, limit: int = 200) -> SecurityOverview | UnsupportedResult:
+    """Row-level security posture: catch-all authorisations, unrestricted users, coverage gaps.
+
+    Contains no concrete permission values. The finding to look for is
+    ``uncovered_characteristics``: a characteristic flagged authorisation-relevant that no
+    authorisation covers blocks every query touching it for any user without a catch-all — a live
+    configuration fault that is invisible unless both sides are compared.
+    """
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().security(system).overview(limit=limit)
+
+
+@_readonly_tool
+def bw_list_analysis_auths(
+    system: str,
+    *,
+    include_generated: bool = True,
+    limit: int = _DEFAULT_PAGE,
+    offset: int = 0,
+) -> AuthListResult | UnsupportedResult:
+    """Analysis authorisations by shape: which characteristics, how many ranges, catch-all or not.
+
+    Deliberately excludes concrete values, so a landscape-wide question cannot incidentally place a
+    permission dump into context. ``origin`` distinguishes generated authorisations (maintained by a
+    program or DAP, so a manual edit is overwritten on the next run) from hand-maintained ones.
+    Set ``include_generated=False`` to see only what a person maintains.
+    """
+    limit, offset = _clamp_page(limit, offset)
+    result = (
+        runtime()
+        .security(system)
+        .list_authorisations(limit=limit, offset=offset, include_generated=include_generated)
+    )
+    if isinstance(result, UnsupportedResult):
+        return result
+    items, total, scan_truncated = result
+    return AuthListResult(
+        items=items,
+        total_count=total,
+        limit=limit,
+        offset=offset,
+        scan_truncated=scan_truncated,
+    )
+
+
+@_readonly_tool
+def bw_get_analysis_auth(system: str, name: str) -> AnalysisAuth | UnsupportedResult:
+    """One analysis authorisation in full, including its value ranges and assigned users.
+
+    **This is the only tool that returns concrete permission data**, and the result says so
+    (``contains_data_values``). Special values are decoded rather than passed through: ``:`` grants
+    *aggregated* access only (a total, but not the rows behind it - often misread as no access),
+    ``#`` is the unassigned member, ``*`` is everything. A range driven by a variable resolves per
+    user at runtime and is flagged, because metadata cannot state its effective scope.
+    """
+    return runtime().security(system).get_authorisation(name)
+
+
+@_readonly_tool
+def bw_get_query_auth_exposure(system: str, query: str) -> QueryAuthExposure | UnsupportedResult:
+    """Whether a query returns different data per user, and on which characteristics.
+
+    The question behind most BW audit findings: two people comparing figures from one report can
+    both be right if it is restricted on an authorisation-relevant characteristic. Reports the
+    characteristics in play and any authorisation-filled variables; it does **not** resolve what any
+    individual sees, which needs a per-user value join.
+    """
+    return runtime().query_auth_exposure(system, query)
 
 
 # --- risk-analyzer tools (mission Section 9) ---------------------------------------------

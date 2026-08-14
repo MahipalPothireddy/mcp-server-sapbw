@@ -121,6 +121,17 @@ def test_services_receive_a_cache(tmp_path: Path) -> None:
         assert service._cache is not None, f"{type(service).__name__} was built without a cache"
 
 
+def test_security_repository_never_receives_a_cache(tmp_path: Path) -> None:
+    """Permission data must not be persisted to disk, at any tier.
+
+    Deliberately the inverse of every other repository: RSECVAL holds which values a named user may
+    see, so caching it would widen the blast radius of the cache file and could serve a stale answer
+    to "who can see this" after someone changed role or left.
+    """
+    runtime, _ = _runtime(tmp_path)
+    assert runtime.security("qa")._cache is None
+
+
 def test_same_cache_instance_is_reused_across_repositories(tmp_path: Path) -> None:
     """One SQLite connection per system, so writes by one repository are visible to the next."""
     runtime, _ = _runtime(tmp_path)

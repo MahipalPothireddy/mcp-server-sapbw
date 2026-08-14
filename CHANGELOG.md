@@ -6,6 +6,52 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — BW security: analysis authorisations
+
+Row-level security was the largest uncovered area of standard BW: the server could describe every
+object a report reads but not whether that report shows different numbers to different people. Four
+tools (`bw_security_overview`, `bw_list_analysis_auths`, `bw_get_analysis_auth`,
+`bw_get_query_auth_exposure`) read the `RSEC*` family and join it against the characteristics BW
+flags authorisation-relevant. Tool count 41 → 45.
+
+This reads a different **class** of data from the rest of the server, so three constraints are
+enforced in code rather than left to operator discipline:
+
+- **Never cached, at any tier.** `RSECVAL` holds permission *values*, not structure. The repository
+  is built without a cache and ignores one if passed, so the decision holds even if a future call
+  site gets it wrong. Persisting it would widen the cache file's blast radius, and a stale answer to
+  "who can see this" is worse than a slow one. Asserted by
+  `test_security_repository_never_receives_a_cache`.
+- **Values are opt-in.** Listing and overview return *shape* only — which characteristics, how many
+  ranges, catch-all or not — so a landscape-wide question cannot incidentally dump permission data
+  into a transcript. Only `bw_get_analysis_auth` returns ranges, and its payload is labelled
+  `contains_data_values`. A test asserts no concrete value appears in a listing response.
+- **Silence is not safety.** These tables are routinely unreadable by a locked-down reporting user —
+  they *are* the authorisation model. Absent or unreadable is a documented gap, never "no
+  authorisations exist", which would invert the finding. An unreadable assignment table yields `null`
+  user counts rather than `0`.
+
+Decoding decisions, each of which a naive implementation gets wrong:
+
+- `:` is **aggregated access only** (a total, but not the rows behind it) — commonly misread as no
+  access. `#` is the unassigned member; `*` is everything.
+- A value starting `$` resolves per user at runtime, so it is flagged rather than reported as a fixed
+  scope — the same class of dead end as customer-exit variables.
+- `0BI_ALL` holders are listed as unrestricted rather than averaged into the statistics, which would
+  make a landscape look better governed than it is. `0BI_ALL` carries the SAP prefix but is not
+  reported as generated.
+- `RSEC*` column names are resolved from `DD03L` before any SQL is built, so a release with a
+  different layout degrades to a structured gap instead of raising. Nothing about these tables is
+  taken from memory.
+
+The headline finding is `uncovered_characteristics`: a characteristic flagged authorisation-relevant
+that no authorisation covers returns **no data** to every user without a catch-all. It is a live
+configuration fault and invisible unless both sides are compared.
+
+Not covered, and stated as such: what any individual user actually sees. That needs a per-user value
+join across authorisations, roles and variables resolved at runtime; `bw_get_query_auth_exposure`
+reports the characteristics in play and stops there.
+
 ### Fixed — concurrent callers shared a database connection
 
 One raw connection per profile was shared across the worker threadpool that runs synchronous MCP

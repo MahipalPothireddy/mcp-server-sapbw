@@ -136,6 +136,19 @@ ABAP_TABLES: dict[str, str] = {
     "dict_tables_text": "DD02T",
     "dict_columns": "DD03L",
     "dict_dataelement_text": "DD04T",
+    # Analysis authorisations (BW row-level security). Deliberately EXISTENCE-tier by canonical name
+    # AND re-checked per query, because a locked-down reporting user frequently cannot read these at
+    # all: they are the authorisation model itself. An absent or unreadable table is a documented
+    # gap, never an assumption that no authorisations exist.
+    "auth_values": "RSECVAL",  # the permitted value ranges, per authorisation and characteristic
+    "auth_hierarchy": "RSECHIE",  # hierarchy-node authorisations
+    "auth_user": "RSECUSERAUTH",  # authorisation -> user assignment
+    "auth_text": "RSECTXT",  # authorisation descriptions
+    # Classic ABAP authorisation objects, for the S_RS_* / S_RS_AUTH side of the picture.
+    "abap_user_profile": "UST04",  # user -> profile
+    "abap_profile_auth": "UST10S",  # profile -> authorisation
+    "abap_user_role": "AGR_USERS",  # user -> role
+    "abap_role_auth": "AGR_1251",  # role -> authorisation object + field values
 }
 
 # EXISTENCE-tier HANA catalog objects (all in SYS).
@@ -156,6 +169,10 @@ DISCOVER_PATTERNS: dict[str, str] = {
     "transformation_text": "RSTRAN%",
     "extractor": "ROOSOURCE",  # exact, but validated at runtime (lives with extractor metadata)
     "extractor_field": "ROOSFIELD",
+    # The RSEC* family varies across releases and carries generation/DAP tables whose names are not
+    # stable. Discovering the family tells the security repository what is actually available before
+    # it builds any SQL.
+    "analysis_auth": "RSEC%",
 }
 
 

@@ -20,12 +20,15 @@ from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
 from mcp_server_sapbw.core.profiles import EccProfile
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.ecc import ConnectorUnavailable
+from mcp_server_sapbw.models.provenance import UnsupportedResult
+from mcp_server_sapbw.models.security import QueryAuthExposure
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.hana import HanaRepository
 from mcp_server_sapbw.repositories.health import HealthRepository
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
+from mcp_server_sapbw.repositories.security import SecurityRepository
 from mcp_server_sapbw.repositories.sources import SourcesRepository
 from mcp_server_sapbw.repositories.threex import ThreeXRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
@@ -238,6 +241,14 @@ class FakeRuntime:
 
     def threex(self, system: str) -> ThreeXRepository:
         return ThreeXRepository(_Conn(), self._cap)
+
+    def security(self, system: str) -> SecurityRepository:
+        return SecurityRepository(_Conn(), self._cap)
+
+    def query_auth_exposure(self, system: str, query: str) -> QueryAuthExposure | UnsupportedResult:
+        return self.security(system).query_exposure(
+            compuid=query, compid=query, providers=[], characteristics=[]
+        )
 
     def analyzers(self, system: str) -> Analyzers:
         return Analyzers(_Conn(), self._cap)

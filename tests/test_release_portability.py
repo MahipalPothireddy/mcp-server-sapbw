@@ -32,6 +32,7 @@ from mcp_server_sapbw.repositories.health import HealthRepository
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
+from mcp_server_sapbw.repositories.security import SecurityRepository
 from mcp_server_sapbw.repositories.sources import SourcesRepository
 from mcp_server_sapbw.repositories.threex import ThreeXRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
@@ -70,6 +71,7 @@ def _entry_points(connection: EmptyConnection, record: Any) -> dict[str, Callabl
     health = HealthRepository(connection, record)
     sources = SourcesRepository(connection, record)
     threex = ThreeXRepository(connection, record)
+    security = SecurityRepository(connection, record)
 
     return {
         "bw_list_chains": lambda: chains.list_chains(limit=5),
@@ -105,6 +107,9 @@ def _entry_points(connection: EmptyConnection, record: Any) -> dict[str, Callabl
         "bw_list_3x_flows": lambda: threex.list_flows(limit=3),
         "bw_get_transfer_rules": lambda: threex.get_transfer_rules("ANY_TS"),
         "bw_list_update_rules": lambda: threex.list_update_rules(limit=3),
+        "bw_security_overview": lambda: security.overview(limit=3),
+        "bw_list_analysis_auths": lambda: security.list_authorisations(limit=3),
+        "bw_get_analysis_auth": lambda: security.get_authorisation("ANY_AUTH"),
         **{
             f"scenario_{scenario}": (lambda s=scenario: analyzers.run_scenario(s, limit=3))  # type: ignore[misc]
             for scenario in ("9.1", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8")

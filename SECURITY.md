@@ -58,6 +58,29 @@ intellectual property is stored at rest**, specifically:
 query definitions to a directory you name. It defaults to `output/`, which is git-ignored. Treat
 that directory with the same care as the source system.
 
+## Authorisation data is never cached
+
+The four security tools (`bw_security_overview`, `bw_list_analysis_auths`,
+`bw_get_analysis_auth`, `bw_get_query_auth_exposure`) read a different class of data from the rest of
+the server. `RSECVAL` holds permission *values* — "cost centres 1000–1999, company code DE01" states
+what a named person may see, and joined to a user id it is personal data.
+
+So, by exception to the section above:
+
+- **Nothing read by the security repository is cached, at any tier.** It is constructed without a
+  cache and ignores one if passed, so the guarantee holds even if a future call site gets it wrong.
+  Persisting permission data would widen this file's blast radius, and a stale answer to "who can see
+  this" is worse than a slow one. A test asserts the repository has no cache.
+- **Concrete values are opt-in.** Listing and overview return shape only (which characteristics, how
+  many ranges, catch-all or not), so a landscape-wide question cannot place a permission dump into a
+  transcript. Only `bw_get_analysis_auth` returns ranges, and its payload is labelled
+  `contains_data_values` so that is auditable after the fact.
+- **`bw_get_query_auth_exposure` never resolves who sees what.** It reports the characteristics that
+  make a query user-specific. Per-user value resolution is deliberately out of scope.
+
+Note that these tables are often unreadable by a locked-down reporting user — they *are* the
+authorisation model. That is reported as a documented gap, never as "no authorisations exist".
+
 ## What is never written or logged
 
 - Credentials, host names and connection strings are scrubbed from every error and log record.
