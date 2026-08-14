@@ -1,7 +1,9 @@
 """Customer-metadata leak check (mission Section 10) - reusable, cross-platform.
 
-Fails if a customer object-naming pattern appears outside ``tests/fixtures/`` in the WORKING TREE
-or ANYWHERE IN GIT HISTORY (a clean tip commit is meaningless if an earlier commit leaked a name).
+Fails if a customer object-naming pattern appears outside ``tests/fixtures/`` in anything that could
+be COMMITTED (tracked files plus untracked-but-not-ignored ones) or ANYWHERE IN GIT HISTORY (a clean
+tip commit is meaningless if an earlier commit leaked a name). Git-ignored files are out of scope:
+they cannot reach a commit, and reporting them trains people to ignore the check.
 Two patterns:
 
 1. generated tables:  ``/BIC/<name>`` or ``/BI0/<name>`` (3+ name chars);
@@ -91,12 +93,48 @@ def _tokens(text: str) -> set[str]:
     return {m.group(0) for m in _COMBINED.finditer(normalized)} - ALLOW
 
 
+def _committable_paths() -> list[Path] | None:
+    """Files that could end up in a commit: tracked, plus untracked-but-not-ignored.
+
+    The check is about what gets *committed*, so a git-ignored file (``profiles.yaml``,
+    ``landscape.local.md``, ``tmp_*``) is out of scope by definition — it cannot reach a commit.
+    Asking git rather than re-implementing ``.gitignore`` keeps the two from drifting, and a check
+    that reports unactionable hits is a check people learn to ignore.
+
+    Returns ``None`` when git is unavailable, so the caller can fall back to a filesystem walk.
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    return [_ROOT / name for name in proc.stdout.split("\0") if name]
+
+
+def _walk_paths() -> list[Path]:
+    """Fallback filesystem walk (no git): skips known artefact directories."""
+    return [
+        path
+        for path in _ROOT.rglob("*")
+        if path.is_file() and not any(part in SKIP_DIRS for part in path.relative_to(_ROOT).parts)
+    ]
+
+
 def scan_working_tree() -> set[str]:
+    paths = _committable_paths()
+    git_aware = paths is not None
+    if paths is None:
+        paths = _walk_paths()
     found: set[str] = set()
-    for path in _ROOT.rglob("*"):
+    for path in paths:
         if not path.is_file():
             continue
         rel = path.relative_to(_ROOT)
+        # tests/fixtures/ holds deliberately synthetic sample names.
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
         if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in _ALWAYS_SCAN_NAMES:
@@ -109,6 +147,8 @@ def scan_working_tree() -> set[str]:
         if hits:
             print(f"  working tree {rel}: {sorted(hits)}")
             found |= hits
+    if not git_aware:
+        print("  (git unavailable: scanned the filesystem, so git-ignored files were included)")
     return found
 
 

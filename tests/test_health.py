@@ -160,7 +160,48 @@ def test_timestamps_are_parsed() -> None:
     health = _repo().get_health("FIN_ADSO")
     started = health.last_request.started_at  # type: ignore[union-attr]
     assert started is not None
-    assert started.isoformat() == "2026-07-28T12:00:00"
+    # Offset-bearing, per RFC 3339 - see test_timestamps_are_rfc3339 for why that matters.
+    assert started.isoformat() == "2026-07-28T12:00:00+00:00"
+    # The wall-clock reading itself must be untouched by the tz labelling.
+    assert started.strftime("%Y%m%d%H%M%S") == "20260728120000"
+
+
+def test_timestamps_are_rfc3339() -> None:
+    """Request timestamps must carry a UTC offset, or the whole tool response is rejected.
+
+    Regression test for a real outage of this tool. ``strptime`` returns a *naive* datetime,
+    which serialises as ``2026-07-28T12:00:00`` with no offset. JSON Schema's
+    ``format: date-time`` is RFC 3339, which requires an offset, so a strict client-side
+    validator rejected the entire response - meaning volume and currency were unreadable for
+    every provider that had ever been loaded. The failure was total, not partial, and it looked
+    like missing data rather than a serialisation defect.
+    """
+    health = _repo().get_health("FIN_ADSO")
+
+    stamps = [
+        ("last_request.started_at", health.last_request.started_at),  # type: ignore[union-attr]
+        ("last_request.ended_at", health.last_request.ended_at),  # type: ignore[union-attr]
+    ]
+    stamps += [
+        (f"recent_requests[{i}].{f}", getattr(r, f))
+        for i, r in enumerate(health.recent_requests)
+        for f in ("started_at", "ended_at")
+    ]
+
+    checked = 0
+    for label, value in stamps:
+        if value is None:
+            continue
+        checked += 1
+        assert value.tzinfo is not None, f"{label} is naive; RFC 3339 requires an offset"
+        assert value.utcoffset() is not None, f"{label} has tzinfo but no resolvable offset"
+        # What actually goes on the wire, and the shape the validator enforces.
+        emitted = health.model_dump(mode="json")
+        assert emitted["last_request"]["started_at"].endswith(("Z", "+00:00")), (
+            "serialised timestamp lacks a UTC offset"
+        )
+
+    assert checked > 0, "fixture produced no timestamps, so this test proved nothing"
 
 
 def test_failed_latest_load_is_flagged_and_age_uses_last_success() -> None:

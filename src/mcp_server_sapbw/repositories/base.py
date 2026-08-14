@@ -3,18 +3,30 @@
 Every repository method checks the capability record before building SQL (returning a structured
 ``UnsupportedResult`` when a table is absent), executes through the read-only connection, and stamps
 each record with provenance. Repositories hold no tool registration and no cross-domain logic.
+
+Expensive per-object extracts go through :meth:`Repository.cached_model` /
+:meth:`Repository.cached_model_list`, which read and write the per-profile SQLite cache. Structural
+metadata changes slowly, so it carries a long TTL; runtime statistics use the ``"runtime"`` tier,
+hard-capped at one hour (mission Section 3). The ``object_type`` passed in doubles as the
+``bw_refresh_cache`` scope for that family of objects.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+import json
+from collections.abc import Callable, Mapping
+from typing import Any, TypeVar, cast
+
+from pydantic import BaseModel, ValidationError
 
 from ..core.cache import CacheTier, SqliteCache
 from ..core.capabilities import SupportsSelect, unsupported_result
 from ..core.dialect import SelectQuery, SqlDialect
 from ..models.capability import CapabilityRecord
 from ..models.provenance import Provenance, UnsupportedResult
+
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
+_ResultT = TypeVar("_ResultT")  # a builder's full return union (model | not-found | unsupported)
 
 
 class Repository:
@@ -82,3 +94,70 @@ class Repository:
     ) -> None:
         if self._cache is not None:
             self._cache.put(object_type, object_id, value, tier=tier)
+
+    # --- cached extraction ---
+    #
+    # These are the only two entry points repositories use to cache. Both cache *successes* only:
+    # an UnsupportedResult is capability state (already keyed by the cache fingerprint, and cheap to
+    # recompute) and a None is a not-found, which may become found once an object is transported.
+    # Caching either would freeze a transient answer into a long TTL.
+    #
+    # A stored value that no longer validates is treated as a miss and rebuilt, so a model change
+    # shipped in a new server version can never surface as a validation error to the caller.
+
+    def cached_model(
+        self,
+        object_type: str,
+        object_id: str,
+        *,
+        model: type[_ModelT],
+        build: Callable[[], _ResultT],
+        cache_when: Callable[[_ModelT], bool] | None = None,
+        tier: CacheTier = "structural",
+    ) -> _ResultT:
+        """Serve one model from the cache, else build it and store the result.
+
+        Only an instance of ``model`` is stored, so the other members of a builder's return union
+        (``UnsupportedResult``, ``ObjectNotFound``, ``None``) pass through uncached by construction.
+
+        ``cache_when`` guards the case where "nothing found" is expressed *as* the model rather than
+        as a separate type — an absent object yields an empty shell, and caching that would answer
+        "does not exist" for the whole TTL after it was transported. Repositories whose builder can
+        return such a shell pass a predicate that recognises a real extract.
+        """
+        if self._cache is None:
+            return build()
+        raw = self.cache_get(object_type, object_id, tier=tier)
+        if raw is not None:
+            try:
+                return cast("_ResultT", model.model_validate_json(raw))
+            except ValidationError:
+                pass  # shape changed since it was stored -> rebuild
+        built = build()
+        if isinstance(built, model) and (cache_when is None or cache_when(built)):
+            self.cache_put(object_type, object_id, built.model_dump_json(), tier=tier)
+        return built
+
+    def cached_model_list(
+        self,
+        object_type: str,
+        object_id: str,
+        *,
+        model: type[_ModelT],
+        build: Callable[[], list[_ModelT] | UnsupportedResult],
+        tier: CacheTier = "structural",
+    ) -> list[_ModelT] | UnsupportedResult:
+        """Serve a list of models from the cache, else build it and store the result."""
+        if self._cache is None:
+            return build()
+        raw = self.cache_get(object_type, object_id, tier=tier)
+        if raw is not None:
+            try:
+                return [model.model_validate(item) for item in json.loads(raw)]
+            except (ValidationError, ValueError, TypeError):
+                pass  # shape changed or value corrupt -> rebuild
+        built = build()
+        if isinstance(built, list):
+            payload = json.dumps([item.model_dump(mode="json") for item in built])
+            self.cache_put(object_type, object_id, payload, tier=tier)
+        return built

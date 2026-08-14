@@ -70,6 +70,45 @@ class QueryError(Exception):
     """A query failed at the driver (message is scrubbed of secrets)."""
 
 
+# --- Connection-loss detection -----------------------------------------------------------
+#
+# A long analysis run does not fit in one database session: the server closed the session ~34
+# minutes into a whole-system documentation generation, which loses the run rather than slowing it.
+# Retrying is only correct for a *transport* failure, though. A rejected column name or a missing
+# table is deterministic, and retrying it would burn the same time again to reach the same answer,
+# so only these signatures are treated as retryable.
+_CONNECTION_LOST_MARKERS = frozenset(
+    {
+        "forcibly closed",  # observed live: HANA closed an idle/long-running session
+        "connection reset",
+        "connection closed",
+        "connection to the server was lost",
+        "connection lost",
+        "lost connection",
+        "broken pipe",
+        "not connected",
+        "no connection",
+        "socket closed",
+        "session not connected",
+        "cannot send data",
+        "receive failed",
+        "communication link failure",
+        "-10709",  # hdbcli: connection failed
+        "-10807",  # hdbcli: connection down / sqldbc
+        "-10108",  # hdbcli: session has been terminated
+    }
+)
+# Attempts after the first failure. Two is enough to cross a server-side session recycle without
+# masking a host that is genuinely down.
+_MAX_RECONNECT_ATTEMPTS = 2
+
+
+def is_connection_lost(error: BaseException) -> bool:
+    """True when an error looks like the transport dropped rather than the query being wrong."""
+    text = str(error).lower()
+    return any(marker in text for marker in _CONNECTION_LOST_MARKERS)
+
+
 def _strip_leading_noise(sql: str) -> str:
     """Remove leading whitespace and leading SQL comments (line and block)."""
     current = sql
@@ -200,26 +239,70 @@ def verify_read_only_grants(connection: RawConnection, *, profile_name: str) -> 
 
 
 class ReadOnlyConnection:
-    """Wraps a raw connection so every query passes the statement guard before the driver."""
+    """Wraps a raw connection so every query passes the statement guard before the driver.
 
-    def __init__(self, raw: RawConnection, *, scrubber: SecretScrubber) -> None:
+    Reconnects transparently when the transport drops. ``reopen`` must reproduce the *full* connect
+    path including the read-only grant check — otherwise a reconnect would be a way to end up on a
+    connection that never passed the gate, which is the one thing this layer exists to prevent.
+    """
+
+    def __init__(
+        self,
+        raw: RawConnection,
+        *,
+        scrubber: SecretScrubber,
+        reopen: Callable[[], RawConnection] | None = None,
+    ) -> None:
         self._raw = raw
         self._scrubber = scrubber
+        self._reopen = reopen
+        self._reconnect_lock = threading.Lock()
+        self.reconnect_count = 0
 
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
         """Run a read-only query. Raises :class:`ReadOnlyViolation` for anything not SELECT/WITH."""
         assert_read_only(sql)  # BEFORE the driver — the load-bearing check
+        bound = list(parameters) if parameters is not None else []
+        attempts = _MAX_RECONNECT_ATTEMPTS if self._reopen is not None else 0
+        for attempt in range(attempts + 1):
+            try:
+                return self._run(sql, bound)
+            except QueryError as exc:
+                retryable = is_connection_lost(exc) and attempt < attempts
+                if not retryable:
+                    raise
+                if not self._reconnect():
+                    raise
+        raise AssertionError("unreachable")  # pragma: no cover - loop always returns or raises
+
+    def _run(self, sql: str, bound: list[Any]) -> list[tuple[Any, ...]]:
         cursor = self._raw.cursor()
         try:
-            cursor.execute(sql, list(parameters) if parameters is not None else [])
+            cursor.execute(sql, bound)
             return cursor.fetchall()
         except Exception as exc:
             raise QueryError(self._scrubber.scrub(str(exc))) from None
         finally:
             with suppress(Exception):
                 cursor.close()
+
+    def _reconnect(self) -> bool:
+        """Replace the dropped raw connection. False when reopening is impossible."""
+        if self._reopen is None:
+            return False
+        with self._reconnect_lock:
+            with suppress(Exception):
+                self._raw.close()
+            try:
+                self._raw = self._reopen()
+            except Exception:
+                # Includes ReadOnlyViolation from the re-run grant check. Report the original
+                # transport failure rather than this, so the caller sees why the query failed.
+                return False
+            self.reconnect_count += 1
+            return True
 
     def close(self) -> None:
         with suppress(Exception):
@@ -267,22 +350,33 @@ class ReadOnlyConnectionPool:
                 return existing
 
             scrubber = SecretScrubber.for_profile(profile)
-            try:
+
+            def _connect(profile: Profile = profile) -> RawConnection:
+                """The whole connect path, including the fail-closed grant check.
+
+                Shared by the first connect and every reconnect so the two can never diverge: a
+                reconnect that skipped the grant check would be a hole in the read-only guarantee.
+                """
                 raw = self._factory(profile)
+                if profile.read_only_user:
+                    try:
+                        verify_read_only_grants(raw, profile_name=profile.name)
+                    except ReadOnlyViolation:
+                        with suppress(Exception):
+                            raw.close()
+                        raise
+                return raw
+
+            try:
+                raw = _connect()
+            except ReadOnlyViolation:
+                raise
             except Exception as exc:
                 raise ConnectionFailure(
                     f"could not connect to profile '{profile.name}': " + scrubber.scrub(str(exc))
                 ) from None
 
-            if profile.read_only_user:
-                try:
-                    verify_read_only_grants(raw, profile_name=profile.name)
-                except ReadOnlyViolation:
-                    with suppress(Exception):
-                        raw.close()
-                    raise
-
-            connection = ReadOnlyConnection(raw, scrubber=scrubber)
+            connection = ReadOnlyConnection(raw, scrubber=scrubber, reopen=_connect)
             self._connections[profile.name] = connection
             return connection
 

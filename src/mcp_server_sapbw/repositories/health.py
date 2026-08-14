@@ -15,7 +15,7 @@ codes (``@08@`` green / ``@09@`` yellow / ``@0A@`` red) decoded here from the di
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from ..models.health import LoadRequest, ProviderHealth, RequestStatus, TableVolume
@@ -59,7 +59,23 @@ def _clean(value: Any) -> str | None:
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
-    """Parse an RSSTATMANPART ``YYYYMMDDHHMMSS`` timestamp."""
+    """Parse an RSSTATMANPART ``YYYYMMDDHHMMSS`` timestamp into a tz-aware datetime.
+
+    The UTC tzinfo is not a claim about the instant - it is required for the wire format.
+    ``strptime`` returns a naive datetime, which serialises as ``2026-08-05T19:09:31`` with no
+    offset. JSON Schema's ``format: date-time`` is RFC 3339, which *requires* an offset, so a
+    strict client-side validator rejects every naive value. That rejection is total: it fails
+    the whole tool response, so volume and currency became unreadable for any provider with a
+    populated request ledger - which is every loaded provider.
+
+    RSSTATMANPART stores SAP application-server wall-clock time with no offset recorded, so the
+    true offset is not knowable from this table. Labelling UTC keeps the response valid and
+    matches how the rest of the server emits time (see ``discovered_at``, which is genuinely
+    UTC). The consequence is that these values are correct as *wall-clock readings of the BW
+    server* and must not be compared against timestamps from another timezone, nor read as true
+    UTC instants. ``data_age_days`` is unaffected: it subtracts two values from this same table,
+    so any constant offset cancels.
+    """
     text = _clean(value)
     if text is None:
         text = ""
@@ -67,7 +83,7 @@ def _parse_timestamp(value: Any) -> datetime | None:
     if len(digits) != _TS_DIGITS or not digits.isdigit():
         return None
     try:
-        return datetime.strptime(digits, "%Y%m%d%H%M%S")
+        return datetime.strptime(digits, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
     except ValueError:
         return None
 

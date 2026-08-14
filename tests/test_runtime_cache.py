@@ -1,0 +1,169 @@
+"""Tests that ServerRuntime actually hands a cache to the repositories it builds.
+
+This is the plumbing half of the cache fix. The read paths can be wired perfectly and still cache
+nothing if the runtime constructs every repository with ``cache=None`` — which is what it did: the
+only ``SqliteCache`` in the process was the throwaway one built inside ``refresh_cache``, so
+``bw_refresh_cache`` cleared a store nothing ever wrote to.
+
+Offline: the pool and resolver are fakes, so no BW system is contacted.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from pydantic import SecretStr
+
+from mcp_server_sapbw.core.profiles import Profile
+from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from mcp_server_sapbw.server import ServerRuntime
+
+SCHEMA = "TESTSCHEMA"
+
+
+class _Conn:
+    def execute_select(
+        self, sql: str, parameters: Sequence[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        return []
+
+
+class _Pool:
+    def acquire(self, profile: Profile) -> _Conn:
+        return _Conn()
+
+
+class _Resolver:
+    """Returns a capability record whose ``discovered_at`` is the cache fingerprint."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        # "Now", so the record is not expired and capability() does not re-resolve on every call.
+        self._base = datetime.now(UTC)
+
+    def resolve(self, profile: Profile, connection: object) -> CapabilityRecord:
+        self.calls += 1
+        return CapabilityRecord(
+            system=profile.name,
+            bw_release="7.50",
+            abap_schema=SCHEMA,
+            # A distinct timestamp per resolve, so an explicit refresh changes the fingerprint.
+            discovered_at=self._base + timedelta(microseconds=self.calls),
+            tables={
+                "transformation": TableStatus(
+                    logical_name="transformation",
+                    resolved_name="RSTRAN",
+                    present=True,
+                    schema_name=SCHEMA,
+                )
+            },
+        )
+
+
+class _Profiles:
+    def get(self, name: str) -> Profile:
+        return Profile(
+            name=name,
+            host="host.invalid",
+            port=30015,
+            user="TESTER",
+            password=SecretStr("unused-in-this-test"),
+            abap_schema=SCHEMA,
+            read_only_user=False,
+        )
+
+    def names(self) -> list[str]:
+        return ["qa"]
+
+    def ecc_names(self) -> list[str]:
+        return []
+
+
+def _runtime(tmp_path: Path) -> tuple[ServerRuntime, _Resolver]:
+    resolver = _Resolver()
+    runtime = ServerRuntime(
+        _Profiles(),  # type: ignore[arg-type]
+        _Pool(),  # type: ignore[arg-type]
+        resolver,  # type: ignore[arg-type]
+        cache_dir=tmp_path / "cache",
+    )
+    return runtime, resolver
+
+
+def test_repositories_receive_a_cache(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path)
+    for repo in (
+        runtime.transformations("qa"),
+        runtime.queries("qa"),
+        runtime.providers("qa"),
+        runtime.chains("qa"),
+        runtime.hana("qa"),
+        runtime.search("qa"),
+    ):
+        assert repo._cache is not None, f"{type(repo).__name__} was built without a cache"
+
+
+def test_services_receive_a_cache(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path)
+    for service in (
+        runtime.lineage("qa"),
+        runtime.analyzers("qa"),
+        runtime.load_closure("qa"),
+        runtime.routine_register("qa"),
+        runtime.docgen("qa"),
+    ):
+        assert service._cache is not None, f"{type(service).__name__} was built without a cache"
+
+
+def test_same_cache_instance_is_reused_across_repositories(tmp_path: Path) -> None:
+    """One SQLite connection per system, so writes by one repository are visible to the next."""
+    runtime, _ = _runtime(tmp_path)
+    assert runtime.transformations("qa")._cache is runtime.queries("qa")._cache
+
+
+def test_cache_file_is_created_under_the_cache_dir(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path)
+    runtime.transformations("qa")
+    assert (tmp_path / "cache" / "qa.sqlite").exists()
+
+
+def test_capability_refresh_retires_the_cache(tmp_path: Path) -> None:
+    """A new release picture must not serve extracts taken under the old one."""
+    runtime, _ = _runtime(tmp_path)
+    first = runtime.transformations("qa")._cache
+    runtime.refresh_capabilities("qa")
+    second = runtime.transformations("qa")._cache
+    assert first is not second
+    # The retired instance must stay usable: a repository built before the refresh still holds it.
+    assert first is not None
+    first.put("routine_code", "T1", "[]")  # would raise if the connection had been closed
+
+
+def test_refresh_cache_uses_the_live_store(tmp_path: Path) -> None:
+    """bw_refresh_cache must clear the store the repositories write to, not a fresh one."""
+    runtime, _ = _runtime(tmp_path)
+    cache = runtime.transformations("qa")._cache
+    assert cache is not None
+    cache.put("routine_code", "T1", "[]")
+    result = runtime.refresh_cache("qa", "routine_code")
+    assert result.removed == 1
+    assert cache.get("routine_code", "T1") is None
+
+
+def test_unwritable_cache_dir_degrades_instead_of_failing(tmp_path: Path) -> None:
+    """A cache that cannot be opened is never fatal: repositories just run uncached."""
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory", encoding="utf-8")
+    resolver = _Resolver()
+    runtime = ServerRuntime(
+        _Profiles(),  # type: ignore[arg-type]
+        _Pool(),  # type: ignore[arg-type]
+        resolver,  # type: ignore[arg-type]
+        cache_dir=blocker / "cache",  # parent is a file -> mkdir fails
+    )
+    assert runtime._cache("qa") is None
+    assert runtime.transformations("qa")._cache is None  # still usable
+    assert runtime.refresh_cache("qa", "all").removed == 0

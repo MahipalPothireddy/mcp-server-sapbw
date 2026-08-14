@@ -165,6 +165,14 @@ class TransformationsRepository(Repository):
         super().__init__(connection, capability, cache)
         self._texts = TextsRepository(connection, capability, cache)
         self._parser = RoutineParser()
+        # Per-instance memo for analyze_routines. Analysing a routine means fetching its ABAP
+        # source from RSAABAP (2.3M rows on the reference system) and parsing every line, and the
+        # lineage walk asks for the same transformation repeatedly: once per node it appears
+        # against, and again on every page whose graph overlaps. Measured at ~12s per node without
+        # this. Safe because the repository reads metadata only, so a transformation's analysis
+        # cannot change under a live instance; the memo dies with the instance, so a later tool
+        # call re-reads.
+        self._analysis_memo: dict[str, list[RoutineAnalysis] | UnsupportedResult] = {}
 
     # --- listing -------------------------------------------------------------------------
 
@@ -240,6 +248,17 @@ class TransformationsRepository(Repository):
     # --- structure -----------------------------------------------------------------------
 
     def get_transformation(self, tran_id: str) -> Transformation | UnsupportedResult:
+        """Header, field mappings and routine references. Cached (scope ``transformation``)."""
+        return self.cached_model(
+            "transformation",
+            tran_id,
+            model=Transformation,
+            build=lambda: self._get_transformation_uncached(tran_id),
+            # No header row yields an empty shell; it may be transported later, so never cache it.
+            cache_when=lambda tran: tran.source is not None or tran.target is not None,
+        )
+
+    def _get_transformation_uncached(self, tran_id: str) -> Transformation | UnsupportedResult:
         unsupported = self.require("transformation")
         if unsupported is not None:
             return unsupported
@@ -573,6 +592,20 @@ class TransformationsRepository(Repository):
         return refs
 
     def get_routine_code(self, tran_id: str) -> list[RoutineCode] | UnsupportedResult:
+        """Full ABAP for every routine of a transformation. Cached (scope ``routine_code``).
+
+        RSAABAP is the largest table the server reads (millions of source lines on a real system)
+        and routine source only changes when a transformation is re-activated, so this is the
+        highest-value entry in the cache.
+        """
+        return self.cached_model_list(
+            "routine_code",
+            tran_id,
+            model=RoutineCode,
+            build=lambda: self._get_routine_code_uncached(tran_id),
+        )
+
+    def _get_routine_code_uncached(self, tran_id: str) -> list[RoutineCode] | UnsupportedResult:
         unsupported = self.require("transformation", "routine_source")
         if unsupported is not None:
             return unsupported
@@ -627,6 +660,25 @@ class TransformationsRepository(Repository):
         return [("" if r[0] is None else str(r[0])) for r in rows]
 
     def analyze_routines(self, tran_id: str) -> list[RoutineAnalysis] | UnsupportedResult:
+        """Parsed dependencies / anti-patterns per routine. Cached (scope ``routine_analysis``).
+
+        Two levels: an in-process memo for repeat hits inside one call (the analyzers and the
+        routine register re-ask for the same transformation), and the SQLite cache so a later call
+        does not re-read RSAABAP and re-parse the source.
+        """
+        memoised = self._analysis_memo.get(tran_id)
+        if memoised is not None:
+            return memoised
+        analyses = self.cached_model_list(
+            "routine_analysis",
+            tran_id,
+            model=RoutineAnalysis,
+            build=lambda: self._analyze_routines_uncached(tran_id),
+        )
+        self._analysis_memo[tran_id] = analyses
+        return analyses
+
+    def _analyze_routines_uncached(self, tran_id: str) -> list[RoutineAnalysis] | UnsupportedResult:
         codes = self.get_routine_code(tran_id)
         if isinstance(codes, UnsupportedResult):
             return codes

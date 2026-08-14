@@ -14,7 +14,9 @@ serialize an entire large system.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..connectors.base import ConnectorRegistry
 from ..models.capability import CapabilityRecord
+from ..models.chains import LoadedProvider
 from ..models.description import Description
 from ..models.hana import HanaCrossingReport
 from ..models.lineage import LineageGraph
@@ -32,15 +35,52 @@ from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
 from ..repositories.providers import ProvidersRepository
 from ..repositories.queries import QueriesRepository
+from ..repositories.threex import ThreeXRepository
 from ..repositories.transformations import TransformationsRepository
 from .analyzers import SCENARIO_TITLES, Analyzers
 from .lineage import LineageService
+from .load_closure import LoadClosureService
 
 # A stored description and a synthesized one must never look identical (mission Rule 7).
 GENERATED_MARKER = "**[GENERATED - synthesized from metadata, not stored in BW]**"
 
 _PROVIDER_KINDS = {"dso", "adso", "infocube", "multiprovider", "compositeprovider", "infoobject"}
 _SCENARIOS = ("9.1", "9.2", "9.3", "9.4", "9.5", "9.6", "9.7", "9.8", "layer_violations")
+
+# Header table + id column per InfoProvider family, for the independent coverage denominator.
+# InfoObjects are excluded: they are loaded like providers but counted separately, and RSDIOBJ runs
+# to thousands of rows, most of them SAP-delivered and never loaded.
+_PROVIDER_HEADERS: tuple[tuple[str, str], ...] = (
+    ("dso_header", "ODSOBJECT"),
+    ("adso_header", "ADSONM"),
+    ("cube_header", "INFOCUBE"),
+    ("composite_header", "HCPRNM"),
+)
+# A provider enumeration that hit this bound is reported as a lower bound rather than a count.
+_ENUMERATION_CAP = 5000
+# Loading chains listed inline in a coverage-table cell before the rest are summarised as a count.
+_CHAINS_PER_CELL = 4
+# Hops to walk for a per-object lineage page. Four covers the deepest flow shape this documentation
+# set is asked about - EDW DSO -> ADM DSO -> calc view -> CompositeProvider -> BEx query, which is
+# four hops - and the graph still reports when it truncates. Deeper walks cost disproportionately:
+# expanding a node means analysing the routines of every transformation targeting it, and node count
+# grows with the fan-out, so depth 6 measured at roughly 3x the time of depth 3 for redundant
+# breadth that the neighbouring objects' own pages already cover.
+_LINEAGE_DEPTH = 4
+# Section writers, in output order. Exposed so a long run can be split across processes: a
+# full-system generation takes hours and the HANA session is closed by the server well before that.
+SECTIONS: tuple[str, ...] = (
+    "inventory",
+    "load-coverage",
+    "chains",
+    "lineage",
+    "providers",
+    "transformations",
+    "transfer-rules",
+    "queries",
+    "hana",
+    "scenarios",
+)
 
 # Writing docs into the tracked repo tree would risk committing customer metadata (mission Section
 # 10). Paths under these components (or entirely outside any git repo) are allowed.
@@ -115,6 +155,43 @@ class _Gaps:
         if total > shown:
             self.add(section, f"showing {shown} of {total}; the rest were not rendered")
 
+    def absorb(self, entries: list[str]) -> None:
+        """Merge already-recorded entries in, keeping this run's first and de-duplicating."""
+        for entry in entries:
+            if entry not in self.items:
+                self.items.append(entry)
+
+
+class _LoadClosure:
+    """Every object the chains load, unioned across all chains.
+
+    This is the authoritative answer to "what is loaded periodically", and it is a different
+    question from "what appears in the transformation catalogue". A DTP can load a provider with no
+    transformation at all (a 1:1 move), and a CompositeProvider consumes its parts through a
+    generated calc view rather than a transformation - so a transformation-derived object list can
+    never be complete no matter how high its cap is raised. The path here is
+    ``RSPCCHAIN`` -> DTP id -> ``RSBKDTP``, walked recursively through nested sub-chains.
+    """
+
+    def __init__(self) -> None:
+        self.targets: dict[str, LoadedProvider] = {}
+        self.chains_by_target: dict[str, list[str]] = defaultdict(list)
+        self.modes_by_target: dict[str, set[str]] = defaultdict(set)
+        self.frequency_by_target: dict[str, set[str]] = defaultdict(set)
+        self.chains_walked = 0
+        self.chains_total = 0
+        self.resolved = False
+
+    @property
+    def names(self) -> list[str]:
+        """Loaded object names, ordered so the reading is stable across runs."""
+        return sorted(self.targets)
+
+    def periodic_names(self) -> list[str]:
+        """Names loaded by at least one chain with an observed repeating cadence."""
+        periodic = {"multiple_daily", "daily", "weekly", "monthly"}
+        return sorted(n for n in self.targets if self.frequency_by_target[n] & periodic)
+
 
 class DocGenerator(Repository):
     """Renders the mission Section 8 markdown tree by composing all repositories/services."""
@@ -129,31 +206,89 @@ class DocGenerator(Repository):
         self._queries = QueriesRepository(connection, capability, cache)
         self._hana = HanaRepository(connection, capability, cache)
         self._lineage = LineageService(connection, capability, cache)
+        self._loads = LoadClosureService(connection, capability, cache)
+        self._threex = ThreeXRepository(connection, capability, cache)
         self._analyzers = Analyzers(
             connection, capability, cache, registry=registry or ConnectorRegistry()
         )
         self._gaps = _Gaps()
         self._files: list[str] = []
         self._truncated = False
+        self._skip_existing = False
+        self._skipped = 0
 
     # --- orchestration -------------------------------------------------------------------
 
     def generate(
-        self, output_dir: str | Path, *, limit: int = 15, catalog_cap: int = 200
+        self,
+        output_dir: str | Path,
+        *,
+        limit: int = 15,
+        catalog_cap: int = 200,
+        sections: Sequence[str] | None = None,
+        resume: bool = False,
     ) -> DocGenResult:
+        """Render the tree. ``sections`` restricts which section writers run.
+
+        Both extra arguments exist for one practical reason: a full-system generation runs for
+        hours, and the database closes the session long before it finishes. ``sections`` splits the
+        work into runs short enough to complete; ``resume`` skips detail pages already on disk, so
+        re-running a section that was cut off continues instead of starting over. Generation only
+        ever adds files, so separate runs compose into the same tree. Defaults reproduce the
+        original single-pass behaviour.
+        """
         base = _safe_output_dir(output_dir)
+        self._skip_existing = resume
         cap: CapabilityRecord = self.capability
+        wanted = set(SECTIONS if sections is None else sections)
+        unknown = wanted - set(SECTIONS)
+        if unknown:
+            raise DocGenError(
+                f"unknown section(s): {', '.join(sorted(unknown))}. "
+                f"Valid sections: {', '.join(SECTIONS)}"
+            )
+
+        # Every section fetches its catalogue with ``limit=catalog_cap`` and then slices that list
+        # by ``limit`` for the detail pages. Python slicing clamps silently, so a caller asking for
+        # more pages than the catalogue holds used to get ``min(limit, catalog_cap)`` with no
+        # indication the request had been reduced. Widening the catalogue to match keeps the two
+        # knobs independent in the only direction that matters.
+        catalog_cap = max(catalog_cap, limit)
 
         self._write(base, "index.md", self._index_page(cap))
-        self._section_inventory(base)
-        self._section_chains(base, limit, catalog_cap)
-        self._section_lineage(base, limit)
-        self._section_providers(base, limit, catalog_cap)
-        self._section_transformations(base, limit, catalog_cap)
-        self._section_queries(base, limit, catalog_cap)
-        self._section_hana(base, limit, catalog_cap)
-        self._section_scenarios(base, limit)
-        # The gaps register is always written last and is always non-empty.
+        # Resolved once and shared: what the chains actually load, from RSBKDTP. This is the
+        # authoritative set of periodically-loaded objects, and it drives provider and lineage
+        # selection so that nothing a chain loads can be crowded out by a catalogue cap. Skipped
+        # entirely when no section needs it, since walking every chain is not free.
+        needs_closure = bool(wanted & {"inventory", "load-coverage", "lineage", "providers"})
+        closure = self._resolve_load_closure(catalog_cap) if needs_closure else _LoadClosure()
+
+        if "inventory" in wanted:
+            self._section_inventory(base, closure)
+        if "load-coverage" in wanted:
+            self._section_load_coverage(base, closure)
+        if "chains" in wanted:
+            self._section_chains(base, limit, catalog_cap)
+        if "lineage" in wanted:
+            self._section_lineage(base, limit, closure)
+        if "providers" in wanted:
+            self._section_providers(base, limit, catalog_cap, closure)
+        if "transformations" in wanted:
+            self._section_transformations(base, limit, catalog_cap)
+        if "transfer-rules" in wanted:
+            self._section_transfer_rules(base, limit)
+        if "queries" in wanted:
+            self._section_queries(base, limit, catalog_cap)
+        if "hana" in wanted:
+            self._section_hana(base, limit, catalog_cap)
+        if "scenarios" in wanted:
+            self._section_scenarios(base, limit)
+        # The gaps register is always written last and is always non-empty. In a staged run it must
+        # accumulate: each page is built exactly once across the sequence, so the run that builds it
+        # is the only one that can record its caveats, and a plain overwrite would leave the file
+        # holding just the final section's findings.
+        if resume:
+            self._gaps.absorb(self._existing_gap_entries(base))
         self._write(base, "99-gaps-and-risks.md", self._gaps_page())
 
         return DocGenResult(
@@ -166,6 +301,50 @@ class DocGenerator(Repository):
             generated_at=datetime.now(UTC),
         )
 
+    # --- load closure (drives object selection) ------------------------------------------
+
+    def _resolve_load_closure(self, catalog_cap: int) -> _LoadClosure:
+        """Union what every chain loads, so selection follows loads rather than transformations."""
+        closure = _LoadClosure()
+        listed = self._unwrap("load-closure", self._chains.list_chains(limit=catalog_cap))
+        if listed is None:
+            return closure
+        chains, total = listed
+        closure.chains_total = total
+        self._gaps.truncated("load-closure", len(chains), total)
+        self._truncated = self._truncated or total > len(chains)
+
+        for summary in chains:
+            result = self._loads.chain_to_providers(summary.chain_id)
+            if isinstance(result, UnsupportedResult):
+                # Capability-gated for the whole system, not for this one chain: stop rather than
+                # retry 280 times, and say so plainly instead of reporting an empty closure.
+                self._gaps.unsupported("load-closure", result)
+                return closure
+            closure.chains_walked += 1
+            for loaded in result.providers_loaded:
+                closure.targets.setdefault(loaded.name, loaded)
+                # One chain can load the same provider through several DTPs (often one per
+                # sub-chain), which would list the chain repeatedly. Record it once: the question
+                # this answers is which chains load the object, not how many DTPs each uses.
+                chains = closure.chains_by_target[loaded.name]
+                if summary.chain_id not in chains:
+                    chains.append(summary.chain_id)
+                if loaded.update_mode:
+                    closure.modes_by_target[loaded.name].add(loaded.update_mode)
+                if summary.frequency:
+                    closure.frequency_by_target[loaded.name].add(summary.frequency)
+            for caveat in result.caveats:
+                self._gaps.add(f"load closure {summary.chain_id}", caveat)
+            if result.truncated_recursion:
+                self._gaps.add(
+                    f"load closure {summary.chain_id}",
+                    "sub-chain recursion hit its depth/step bound, so this chain's load list is a "
+                    "lower bound",
+                )
+        closure.resolved = closure.chains_walked > 0
+        return closure
+
     # --- writing + shared page furniture -------------------------------------------------
 
     def _write(self, base: Path, relpath: str, content: str) -> None:
@@ -173,6 +352,38 @@ class DocGenerator(Repository):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         self._files.append(relpath.replace("\\", "/"))
+
+    @staticmethod
+    def _existing_gap_entries(base: Path) -> list[str]:
+        """Gap bullets already recorded on disk, so a staged run's register stays cumulative.
+
+        Reads back the register's own bullet format rather than keeping a side-car file: the page is
+        the record, and a missing or unreadable one simply means nothing to merge.
+        """
+        target = base / "99-gaps-and-risks.md"
+        if not target.is_file():
+            return []
+        try:
+            text = target.read_text(encoding="utf-8")
+        except OSError:
+            return []
+        return [line for line in text.splitlines() if line.startswith("- **")]
+
+    def _write_page(self, base: Path, relpath: str, builder: Callable[[], str]) -> None:
+        """Write a per-object detail page, skipping the *build* in resume mode.
+
+        Takes a callable rather than a string because building one of these pages is the expensive
+        part - a lineage page walks the graph and analyses routines - so a resume has to avoid the
+        work, not just the write.
+        """
+        rel = relpath.replace("\\", "/")
+        if self._skip_existing and (base / relpath).is_file():
+            # Already produced by an earlier run. Recorded in the manifest anyway, so the counts
+            # describe the tree on disk rather than this call's share of it.
+            self._files.append(rel)
+            self._skipped += 1
+            return
+        self._write(base, relpath, builder())
 
     @staticmethod
     def _backlinks(depth: int) -> str:
@@ -230,6 +441,7 @@ class DocGenerator(Repository):
                 "3. [Lineage](03-lineage/index.md)",
                 "4. [Providers](04-providers/index.md)",
                 "5. [Transformations](05-transformations/index.md)",
+                "5b. [Transfer rules — BW 3.x dataflow](09-transfer-rules/index.md)",
                 "6. [Queries](06-queries/index.md)",
                 "7. [HANA layer](07-hana/index.md)",
                 "8. [Risk scenarios](08-scenarios/index.md)",
@@ -241,7 +453,7 @@ class DocGenerator(Repository):
 
     # --- 01 inventory --------------------------------------------------------------------
 
-    def _section_inventory(self, base: Path) -> None:
+    def _section_inventory(self, base: Path, closure: _LoadClosure) -> None:
         rows = [
             "| Object type | Count | Source |",
             "|---|---|---|",
@@ -250,6 +462,10 @@ class DocGenerator(Repository):
             f"| BEx queries | {self._query_total()} | RSZCOMPDIR |",
             f"| Calc views | {self._calcview_total()} | SYS.VIEWS |",
         ]
+        if closure.resolved:
+            rows.append(
+                f"| Objects loaded by chains | {len(closure.targets)} | RSPCCHAIN + RSBKDTP |"
+            )
         for logical, label in (
             ("dso_header", "Classic DSOs"),
             ("adso_header", "Advanced DSOs"),
@@ -270,6 +486,9 @@ class DocGenerator(Repository):
             "`SYS.M_TABLES` (cheap, approximate).",
             "",
             *rows,
+            "",
+            "See **[load coverage](load-coverage.md)** for every object a chain loads, its update "
+            "mode, and which enumerated providers no chain loads.",
             self._citation("RSPCCHAINATTR, RSTRAN, RSZCOMPDIR, SYS.VIEWS, SYS.M_TABLES"),
         ]
         self._write(base, "01-inventory/index.md", "\n".join(page))
@@ -292,6 +511,133 @@ class DocGenerator(Repository):
             self._gaps.unsupported("inventory/hana", result)
             return 0
         return result[1]
+
+    # --- 01 inventory / load coverage -----------------------------------------------------
+
+    def _section_load_coverage(self, base: Path, closure: _LoadClosure) -> None:
+        """Every loaded object with its update mode, plus providers no chain loads.
+
+        The completeness artefact. Coverage claims are only worth anything if the denominator is
+        stated, so this enumerates providers from their header tables and reports the difference
+        both ways: loaded objects (from the chains), and enumerated providers nothing loads.
+        """
+        lines = [
+            "# Load coverage",
+            "",
+            self._backlinks(1),
+            "",
+        ]
+        if not closure.resolved:
+            self._gaps.add(
+                "load-coverage",
+                "the chain -> DTP -> provider closure could not be resolved, so no coverage "
+                "statement is possible; object selection fell back to the transformation catalogue",
+            )
+            lines.append("_Load closure unavailable on this connection; see the gaps register._")
+            self._write(base, "01-inventory/load-coverage.md", "\n".join(lines))
+            return
+
+        enumerated = self._enumerate_providers()
+        loaded = set(closure.targets)
+        periodic = set(closure.periodic_names())
+        unloaded = sorted(n for n in enumerated if n not in loaded)
+        loaded_not_enumerated = sorted(n for n in loaded if n not in enumerated)
+
+        lines += [
+            f"Walked **{closure.chains_walked} of {closure.chains_total}** chains and unioned "
+            f"every DTP target they reach, including through nested sub-chains.",
+            "",
+            "| Measure | Count |",
+            "|---|---|",
+            f"| Chains walked | {closure.chains_walked} |",
+            f"| Distinct objects loaded | {len(loaded)} |",
+            f"| Of those, loaded by a chain with a repeating cadence | {len(periodic)} |",
+            f"| Providers enumerated from header tables | {len(enumerated)} |",
+            f"| Enumerated providers **no** chain loads | {len(unloaded)} |",
+            f"| Loaded objects not in the provider enumeration | {len(loaded_not_enumerated)} |",
+            "",
+            "A loaded object outside the provider enumeration is normally an InfoObject: master "
+            "data is loaded by DTP like any other target, but InfoObjects are enumerated "
+            "separately from InfoProviders.",
+            "",
+            "## Objects loaded by chains",
+            "",
+            "`Update mode` comes from the DTP, so full vs delta here is declared, not inferred. "
+            "Where an object shows both, different chains load it differently - worth a look.",
+            "",
+            "| Object | Type | Update mode | Loading chains | Cadence |",
+            "|---|---|---|---|---|",
+        ]
+        for name in closure.names:
+            loaded_provider = closure.targets[name]
+            chains = closure.chains_by_target[name]
+            modes = ", ".join(sorted(closure.modes_by_target[name])) or "-"
+            freqs = ", ".join(sorted(closure.frequency_by_target[name])) or "-"
+            extra = len(chains) - _CHAINS_PER_CELL
+            shown = ", ".join(chains[:_CHAINS_PER_CELL]) + (f" (+{extra})" if extra > 0 else "")
+            lines.append(
+                f"| {name} | {loaded_provider.type_code or '-'} | {modes} | {shown} | {freqs} |"
+            )
+
+        lines += ["", "## Enumerated providers no chain loads", ""]
+        if unloaded:
+            lines += [
+                "Each of these exists in BW but no walked chain loads it. That is a **candidate** "
+                "reading, not a verdict: it may be loaded by a DTP run outside a chain, by a "
+                "process the walk could not resolve, or be a view-like provider "
+                "(a CompositeProvider holds no data of its own and is not a DTP target).",
+                "",
+            ]
+            lines += [f"- {name}" for name in unloaded]
+            self._gaps.add(
+                "load-coverage",
+                f"{len(unloaded)} enumerated provider(s) are loaded by no walked chain; "
+                "listed in 01-inventory/load-coverage.md",
+            )
+        else:
+            lines.append("_Every enumerated provider is loaded by at least one walked chain._")
+
+        lines.append(self._citation("RSPCCHAIN, RSBKDTP, RSDODSO, RSOADSO, RSDCUBE, RSOHCPR"))
+        self._write(base, "01-inventory/load-coverage.md", "\n".join(lines))
+
+    def _enumerate_providers(self) -> set[str]:
+        """Provider names straight from their header tables, as a coverage denominator.
+
+        Deliberately not derived from transformations or chains: the point is an independent count
+        to measure those against.
+        """
+        names: set[str] = set()
+        for logical, column in _PROVIDER_HEADERS:
+            if not self.capability.is_available(logical):
+                self._gaps.add(
+                    "load-coverage",
+                    f"`{logical}` is unavailable on this release, so its providers are missing "
+                    "from the coverage denominator",
+                )
+                continue
+            # OBJVERS = 'A' is auto-injected by the dialect for the RSD*/RSO* families, so it is
+            # deliberately not repeated here.
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=[column],
+                        from_logical=logical,
+                        order_by=[column],
+                    ),
+                    limit=_ENUMERATION_CAP,
+                )
+            )
+            if len(rows) >= _ENUMERATION_CAP:
+                self._gaps.add(
+                    "load-coverage",
+                    f"`{logical}` enumeration hit its {_ENUMERATION_CAP}-row bound, so the "
+                    "coverage denominator is a lower bound",
+                )
+            for row in rows:
+                value = row[0]
+                if value and str(value).strip():
+                    names.add(str(value).strip())
+        return names
 
     # --- 02 process chains ---------------------------------------------------------------
 
@@ -322,10 +668,10 @@ class DocGenerator(Repository):
         ]
         self._write(base, "02-process-chains/index.md", "\n".join(page))
         for chain in chains[:limit]:
-            self._write(
+            self._write_page(
                 base,
                 f"02-process-chains/{_slug(chain.chain_id)}.md",
-                self._chain_page(chain.chain_id),
+                partial(self._chain_page, chain.chain_id),
             )
 
     def _chain_page(self, chain_id: str) -> str:
@@ -358,22 +704,23 @@ class DocGenerator(Repository):
 
     # --- 03 lineage ----------------------------------------------------------------------
 
-    def _section_lineage(self, base: Path, limit: int) -> None:
-        seeds = self._lineage_seeds(limit)
+    def _section_lineage(self, base: Path, limit: int, closure: _LoadClosure) -> None:
+        seeds = self._lineage_seeds(limit, closure)
         index = [
             "# Lineage",
             "",
             self._backlinks(1),
             "",
-            "End-to-end data-flow graphs (Mermaid diagram + graph JSON) traced from a sample of "
-            "objects. Routine-derived edges are advisory (dashed).",
+            "End-to-end data-flow graphs (Mermaid diagram + graph JSON). Seeded from every object "
+            "the chains load, so anything loaded periodically has a flow page; topped up from the "
+            "transformation catalogue. Routine-derived edges are advisory (dashed).",
             "",
         ]
         if not seeds:
             self._gaps.add(
                 "lineage",
-                "no seed objects were derivable from the transformation catalogue; "
-                "no flow pages generated",
+                "no seed objects were derivable from the load closure or the transformation "
+                "catalogue; no flow pages generated",
             )
             index.append("_No lineage flows generated._")
             self._write(base, "03-lineage/index.md", "\n".join(index))
@@ -381,12 +728,14 @@ class DocGenerator(Repository):
         for name in seeds:
             slug = _slug(name)
             index.append(f"- [{name}]({slug}.md)")
-            self._write(base, f"03-lineage/{slug}.md", self._lineage_page(name))
+            self._write_page(base, f"03-lineage/{slug}.md", partial(self._lineage_page, name))
         self._write(base, "03-lineage/index.md", "\n".join(index))
 
     def _lineage_page(self, name: str) -> str:
         lines = [f"# Lineage: {name}", "", self._backlinks(1), ""]
-        graph = self._unwrap("lineage", self._lineage.get_lineage(name, direction="both", depth=6))
+        graph = self._unwrap(
+            "lineage", self._lineage.get_lineage(name, direction="both", depth=_LINEAGE_DEPTH)
+        )
         if graph is None:
             return "\n".join([*lines, "_lineage unavailable_"])
         lines += ["## Flow diagram", "", self._mermaid(graph), ""]
@@ -416,61 +765,93 @@ class DocGenerator(Repository):
         lines.append("```")
         return "\n".join(lines)
 
-    def _lineage_seeds(self, limit: int) -> list[str]:
-        """A sample of provider-typed transformation targets to root lineage flows at."""
-        result = self._unwrap("lineage", self._transformations.list_transformations(limit=100))
+    def _lineage_seeds(self, limit: int, closure: _LoadClosure) -> list[str]:
+        """Objects to root lineage flows at: everything loaded first, transformations after.
+
+        Load-closure targets lead because they are the objects that actually move data on a
+        schedule. The transformation catalogue then tops the list up, which still catches an object
+        that has a transformation but no chain loading it - itself worth seeing.
+        """
+        seen: list[str] = list(closure.names)
+        if len(seen) >= limit:
+            return seen[:limit]
+        result = self._unwrap("lineage", self._transformations.list_transformations(limit=limit))
         if result is None:
-            return []
-        seen: list[str] = []
+            return seen
+        known = set(seen)
         for summary in result[0]:
             name = summary.target_name
-            if name and summary.target_kind in _PROVIDER_KINDS and name not in seen:
+            if name and summary.target_kind in _PROVIDER_KINDS and name not in known:
                 seen.append(name)
+                known.add(name)
             if len(seen) >= limit:
                 break
         return seen
 
     # --- 04 providers --------------------------------------------------------------------
 
-    def _section_providers(self, base: Path, limit: int, catalog_cap: int) -> None:
-        names, trans_in, trans_out = self._provider_names_and_edges(catalog_cap)
+    def _section_providers(
+        self, base: Path, limit: int, catalog_cap: int, closure: _LoadClosure
+    ) -> None:
+        derived, trans_in, trans_out = self._provider_names_and_edges(catalog_cap)
+        # Loaded objects lead the list so that a cap can only ever cost a provider nothing loads.
+        names = list(closure.names)
+        known = set(names)
+        names += [n for n in derived if n not in known]
         query_by_provider = self._query_by_provider(catalog_cap)
-        calcviews_by_object = self._calcviews_by_object()
+        calcviews_by_object = self._calcviews_by_object(catalog_cap)
         index = [
             "# Providers",
             "",
             self._backlinks(1),
             "",
-            "Providers sampled from the transformation catalogue (BW has no 'list all providers' "
-            "call). Each page lists sources, targets, load edges, calc views reading it, and "
+            "BW has no 'list all providers' call, so this list is assembled: every object the "
+            "chains load (from `RSBKDTP`), then every provider-typed transformation endpoint. "
+            "Loaded objects are listed first, so truncation can only drop a provider that nothing "
+            "loads. Each page lists sources, targets, load edges, calc views reading it, and "
             "reports depending on it.",
+            "",
+            f"Loaded by a chain: **{len(closure.names)}**. "
+            f"Added from the transformation catalogue: **{len(names) - len(closure.names)}**. "
+            f"See [load coverage](../01-inventory/load-coverage.md) for the completeness audit.",
             "",
         ]
         if not names:
-            self._gaps.add("providers", "no provider names derivable from transformations")
+            self._gaps.add(
+                "providers", "no provider names derivable from the load closure or transformations"
+            )
             index.append("_No providers rendered._")
             self._write(base, "04-providers/index.md", "\n".join(index))
             return
         for name in names[:limit]:
             slug = _slug(name)
             index.append(f"- [{name}]({slug}.md)")
-            self._write(
+            self._write_page(
                 base,
                 f"04-providers/{slug}.md",
-                self._provider_page(
-                    name, trans_in, trans_out, query_by_provider, calcviews_by_object
+                partial(
+                    self._provider_page,
+                    name,
+                    trans_in=trans_in,
+                    trans_out=trans_out,
+                    query_by_provider=query_by_provider,
+                    calcviews_by_object=calcviews_by_object,
+                    closure=closure,
                 ),
             )
         self._gaps.truncated("providers", min(limit, len(names)), len(names))
+        self._truncated = self._truncated or len(names) > limit
         self._write(base, "04-providers/index.md", "\n".join(index))
 
     def _provider_page(
         self,
         name: str,
+        *,
         trans_in: dict[str, list[str]],
         trans_out: dict[str, list[str]],
         query_by_provider: dict[str, list[str]],
         calcviews_by_object: dict[str, list[str]],
+        closure: _LoadClosure,
     ) -> str:
         lines = [f"# Provider {name}", "", self._backlinks(1), ""]
         provider = self._unwrap("providers", self._providers.describe(name))
@@ -491,6 +872,35 @@ class DocGenerator(Repository):
             ]
             for caveat in provider.caveats:
                 self._gaps.add(f"provider {name}", caveat)
+        loaded = closure.targets.get(name)
+        if loaded is not None:
+            chains = closure.chains_by_target[name]
+            modes = sorted(closure.modes_by_target[name])
+            freqs = sorted(closure.frequency_by_target[name])
+            via = f" (via sub-chain {loaded.via_subchain})" if loaded.via_subchain else ""
+            lines += [
+                "## How it is loaded",
+                f"- Loading chains: {', '.join(chains) or '-'}",
+                f"- Observed cadence of those chains: {', '.join(freqs) or 'unknown'}",
+                f"- Update mode (declared on the DTP): **{', '.join(modes) or 'unknown'}**",
+                f"- Example DTP: {loaded.dtp_id or '-'}{via}",
+                f"- Target type code: {loaded.type_code or '-'}",
+                "",
+            ]
+            if len(modes) > 1:
+                self._gaps.add(
+                    f"provider {name}",
+                    f"loaded in more than one update mode ({', '.join(modes)}), so full and delta "
+                    "loads both write here - check which chain wins on a given day",
+                )
+        elif closure.resolved:
+            lines += [
+                "## How it is loaded",
+                "_No walked chain loads this provider._ It may be loaded by a DTP run outside a "
+                "chain, or be a view-like provider that holds no data of its own. See the "
+                "[load coverage](../01-inventory/load-coverage.md) audit.",
+                "",
+            ]
         lines += [
             "## Load edges",
             f"- Inbound transformations (target this): {', '.join(trans_in.get(name, [])) or '-'}",
@@ -541,8 +951,10 @@ class DocGenerator(Repository):
                 mapping[q.provider].append(q.compid or q.compuid)
         return dict(mapping)
 
-    def _calcviews_by_object(self) -> dict[str, list[str]]:
-        report = self._hana.get_hana_crossings(limit=500)
+    def _calcviews_by_object(self, cap: int) -> dict[str, list[str]]:
+        # Scales with the catalogue cap: a fixed bound here silently dropped the calc views of
+        # every provider past it, which reads on the page as "no calc view reads this".
+        report = self._hana.get_hana_crossings(limit=max(cap, 500))
         mapping: dict[str, list[str]] = defaultdict(list)
         if isinstance(report, UnsupportedResult):
             return dict(mapping)
@@ -584,10 +996,10 @@ class DocGenerator(Repository):
         ]
         self._write(base, "05-transformations/index.md", "\n".join(page))
         for s in summaries[:limit]:
-            self._write(
+            self._write_page(
                 base,
                 f"05-transformations/{_slug(s.tran_id)}.md",
-                self._transformation_page(s.tran_id),
+                partial(self._transformation_page, s.tran_id),
             )
 
     def _transformation_page(self, tran_id: str) -> str:
@@ -622,6 +1034,92 @@ class DocGenerator(Repository):
         lines.append(self._citation("RSTRAN, RSTRANRULE, RSTRANFIELD, RSAABAP"))
         return "\n".join(lines)
 
+    # --- 09 transfer rules (BW 3.x dataflow) ---------------------------------------------
+
+    def _section_transfer_rules(self, base: Path, limit: int) -> None:
+        """The 3.x layer: DataSources that reach BW without any 7.x transformation.
+
+        Kept as its own section rather than folded into transformations, because these are a
+        different mechanism with different tables, and conflating them would make a DataSource on a
+        transfer rule look like it had no load logic at all.
+        """
+        report = self._unwrap("transfer-rules", self._threex.list_flows(limit=max(limit, 1)))
+        if report is None:
+            self._write(
+                base, "09-transfer-rules/index.md", self._empty_section("Transfer rules (BW 3.x)")
+            )
+            return
+        page = [
+            "# Transfer rules (BW 3.x dataflow)",
+            "",
+            self._backlinks(1),
+            "",
+            "The 3.x path is `DataSource -> InfoSource -> transfer structure (transfer rules) -> "
+            "communication structure -> update rules -> target`, against the 7.x path's single "
+            "transformation plus DTP. Where a DataSource has no 7.x transformation, these rules "
+            "**are** the live load logic.",
+            "",
+            "| Measure | Count |",
+            "|---|---|",
+            f"| DataSource -> transfer-structure routes | {report.total_count} |",
+            f"| Active transfer structures | {report.active_transfer_structures} |",
+            f"| Distinct DataSources on a 3.x route | {report.datasources_with_3x_route} |",
+            f"| Of those, also having a 7.x transformation | "
+            f"{report.datasources_with_7x_transformation} |",
+            f"| **3.x only — no 7.x path at all** | **{report.datasources_3x_only}** |",
+            f"| Active update rules | {report.active_update_rules} |",
+            "",
+        ]
+        if report.datasources_3x_only:
+            only = report.datasources_3x_only
+            self._gaps.add(
+                "transfer-rules",
+                f"{only} DataSource route(s) have no 7.x transformation, so their load logic "
+                "lives in transfer rules; lineage from RSTRAN alone stops short of them",
+            )
+
+        update_rules = self._unwrap("transfer-rules", self._threex.list_update_rules(limit=200))
+        if update_rules:
+            page += [
+                "## Active update rules",
+                "",
+                "`target` is `RSUPDINFO.INFOCUBE`, which despite the column name also carries "
+                "InfoObject targets for master-data flows.",
+                "",
+                "| InfoSource | Target | Start routine | Expert | Routines |",
+                "|---|---|---|---|---|",
+            ]
+            for rule in update_rules:
+                page.append(
+                    f"| {rule.infosource or '-'} | {rule.target or '-'} | "
+                    f"{'yes' if rule.has_start_routine else 'no'} | "
+                    f"{'yes' if rule.expert_mode else 'no'} | {rule.routine_count} |"
+                )
+            page.append("")
+
+        page += [
+            "## Flows",
+            "",
+            "`rules` is the field-rule count; the rest say how those fields are derived. A flow "
+            "with routines or formulas holds logic outside these tables.",
+            "",
+            "| DataSource | Source system | Transfer structure | Rules | Routine | Formula | "
+            "Constant | Start routine | Update targets |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for flow in report.flows:
+            page.append(
+                f"| {flow.datasource} | {flow.logical_system or '-'} | "
+                f"{flow.transfer_structure or '-'} | {flow.rule_count} | {flow.rules_with_routine} "
+                f"| {flow.rules_with_formula} | {flow.rules_with_constant} | "
+                f"{'yes' if flow.has_start_routine else 'no'} | "
+                f"{', '.join(flow.update_rule_targets) or '-'} |"
+            )
+        for caveat in report.caveats:
+            self._gaps.add("transfer-rules", caveat)
+        page.append(self._citation("RSISOSMAP, RSTS, RSTSRULES, RSUPDINFO, RSUPDROUT, RSAROUT"))
+        self._write(base, "09-transfer-rules/index.md", "\n".join(page))
+
     # --- 06 queries ----------------------------------------------------------------------
 
     def _section_queries(self, base: Path, limit: int, catalog_cap: int) -> None:
@@ -651,7 +1149,11 @@ class DocGenerator(Repository):
         self._write(base, "06-queries/index.md", "\n".join(page))
         for q in summaries[:limit]:
             label = q.compid or q.compuid
-            self._write(base, f"06-queries/{_slug(label)}.md", self._query_page(q.compuid, label))
+            self._write_page(
+                base,
+                f"06-queries/{_slug(label)}.md",
+                partial(self._query_page, q.compuid, label),
+            )
 
     def _query_page(self, compuid: str, label: str) -> str:
         lines = [f"# Query {label}", "", self._backlinks(1), ""]

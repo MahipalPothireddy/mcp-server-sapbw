@@ -6,6 +6,58 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — the SQLite metadata cache was never used
+
+`core/cache.py`, the `cache_get`/`cache_put` helpers and the `bw_refresh_cache` tool all existed, but
+no read path consulted them *and* `ServerRuntime` built every repository with `cache=None`. The only
+cache in the process was a throwaway created inside `refresh_cache`, so the tool cleared a store
+nothing ever wrote to and every call re-queried the system.
+
+- `Repository.cached_model` / `cached_model_list` wrap the expensive per-object extracts, and
+  `ServerRuntime._cache(system)` keeps one SQLite connection per profile, tied to the capability
+  fingerprint, passing it to every repository and service.
+- Cached: `transformation`, `routine_code`, `routine_analysis`, `query`, `query_lineage`,
+  `provider`, `chain`, `calc_view` (structural, 24h TTL) and `chain_runtimes` (runtime tier, hard
+  capped at one hour per mission Section 3). The `object_type` doubles as the `bw_refresh_cache`
+  scope, now documented on the tool.
+- Successes only. An `UnsupportedResult` is capability state, and an object absent today may be
+  transported tomorrow — caching either would freeze a transient answer for the whole TTL. A
+  `cache_when` guard covers the repositories whose "not found" is an empty model rather than a
+  distinct type; a regression test caught exactly that case.
+- A retired cache (after a capability refresh) is dereferenced but **not closed**: a repository built
+  moments earlier may still hold it, and closing the connection under it raised mid-call.
+- A cache that cannot be opened (read-only filesystem, locked file) is never fatal — the server
+  degrades to uncached reads.
+
+### Added — test coverage for the scenario 9.1 latency contract
+
+The contract (does a looked-up object refresh at least as often as the load that reads it?) was
+implemented but **untested**: the shared analyzer fixture has no `chain_edges` capability, so
+`provider_to_chains` returned `UnsupportedResult` and every cadence resolved to `unknown`. The
+comparison could have been inverted and nothing would have failed.
+
+`tests/test_latency_contract.py` builds a landscape that produces all three verdicts from observed
+run history — a consumer at 3 runs/day reading an hourly object (safe), a once-daily object (flagged)
+and one with no resolvable loading chain (reported as unknown, never assumed safe) — and covers
+degradation when `RSPCLOGCHAIN` or `RSPCCHAIN` is absent.
+
+### Fixed — tooling
+
+- Customer-metadata scan: the working-tree pass now asks git which files could actually be committed
+  (`git ls-files --cached --others --exclude-standard`) rather than walking the filesystem, so
+  git-ignored files such as `profiles.yaml` no longer produce unactionable failures. A check that
+  cries wolf is a check people stop reading.
+- `tests/test_server.py`'s `FakeRuntime` gained the `threex` member it was missing, clearing 26
+  pre-existing mypy errors.
+
+### Security
+
+- Removed a concrete customer query name from two tracked probe scripts (they now take the object
+  name as an argument) and from a 3.x test fixture (now synthetic). Added `tmp_*` to `.gitignore`:
+  probe scripts run against a live system and routinely carry real object names.
+  **Outstanding:** one customer query name remains in git history, and therefore on the remote.
+  Purging it needs `git filter-repo` plus a force-push — see PROGRESS.md.
+
 ### Added — capability merge from two script-based BW analysis projects
 
 Eight vertical slices, each with offline tests. Where a source project's claim disagreed with the
@@ -104,8 +156,79 @@ system, the system won and the correction is noted.
   risks out of the page entirely. Such candidates are now excluded from the findings and counted in
   the caveats (a parser lower bound, not proof of no lookup), scanning continues past them within a
   parse budget, and severity scales with the number of looked-up objects.
+- **`bw_get_provider_health` returned nothing for any provider that had ever loaded.** Request
+  timestamps were parsed with `datetime.strptime` and stayed naive, but the model field declares
+  `format: date-time`, which is RFC 3339 and requires a UTC offset. A client validating formats
+  strictly rejected the *entire* response, so volume and currency were unreadable for exactly the
+  providers worth asking about — an empty request ledger returned fine, which is why the defect read
+  as "the tool works, that provider just has no history". `_parse_timestamp` now attaches `UTC`.
+  The offset is a wire-format requirement, not a claim about the instant: `RSSTATMANPART` stores SAP
+  server wall-clock with no offset recorded, and that is stated in the function docstring so the
+  value is not later mistaken for a true UTC reading. `data_age_days` is unaffected — it subtracts
+  two values from the same table, so a constant offset cancels. Changing the field to `str` was
+  rejected: it would lose type safety and break `.date()` arithmetic downstream. The audit for the
+  same defect elsewhere found none; the only other exposed datetimes (`capability.discovered_at`,
+  `ecc.fetched_at`) already came from `datetime.now(UTC)`, and the remaining `strptime` calls return
+  `date` or never leave the process.
+
+- **Doc generation sampled the system instead of covering it, and said it had not.** Three caps
+  stacked: `bw_generate_docs` ran `limit` through `_clamp_page` (max 500), `catalog_cap` was fixed
+  at 200 and not a tool parameter, and each section then sliced its 200-row catalogue by `limit` —
+  so `limit=300` produced 200 pages and reported success. On the reference system that meant 200 of
+  1,270 transformations and 200 of 1,062 queries, with the excess absent from the catalogue table
+  too, not merely lacking a detail page. `catalog_cap` is now a parameter defaulting to `limit`,
+  `generate` widens it to `max(catalog_cap, limit)` so the slice can no longer silently shorten a
+  request, docgen gets its own far higher page bound (pages go to disk; only a manifest is
+  returned), and the hardcoded `limit=100` lineage seed and `limit=500` calc-view scans scale with
+  the cap. **Correction:** raising the caps is necessary but not sufficient — see the next entry.
+- **Providers were derived from transformations, so periodically-loaded objects could be missed at
+  any cap.** Provider and lineage selection harvested names from the transformation catalogue. A DTP
+  can load a provider with no transformation at all, and a CompositeProvider consumes its parts
+  through a generated calc view rather than a transformation, so that list is structurally
+  incomplete rather than merely truncated. Selection is now driven by what the chains actually load:
+  every chain is walked through `LoadClosureService` (`RSPCCHAIN` → DTP → `RSBKDTP`, recursively
+  through nested sub-chains), the targets are unioned, and those objects lead the provider and
+  lineage lists so a cap can only ever cost a provider that nothing loads. Because a coverage claim
+  is worthless without its denominator, `01-inventory/load-coverage.md` also enumerates providers
+  independently from their four header tables and names every one that no walked chain loads,
+  escalating the count to the gaps register. Update mode (full/delta) on those pages is read from
+  the DTP rather than inferred, and a provider loaded in more than one mode is flagged.
+
+- **A long run could not survive its own database session.** A whole-system documentation
+  generation runs for hours; the reference server closed the session about 34 minutes in, losing the
+  work rather than slowing it. `ReadOnlyConnection` now reconnects and retries, but only for
+  transport failures — a rejected column name is deterministic and retrying it would spend the same
+  time to reach the same answer, so retry is gated on a fixed set of connection-loss signatures and
+  bounded at two attempts. **The reconnect goes through the same connect path as the first
+  connection, including the fail-closed grant check**: a reconnect that skipped it would be a way
+  onto a connection that never passed the read-only gate, and the statement guard still runs before
+  any of this. Doc generation additionally gained `sections` and `resume`, so a run can be split
+  into pieces that each complete, and a section cut off mid-way continues instead of rebuilding; the
+  gaps register merges across staged runs, since each page is built exactly once and only the run
+  that builds it can record its caveats.
+- **Lineage was too slow to run at system scale, and the reason was not the obvious one.**
+  `RSAABAP` holds 2.3M rows on the reference system, but its scan costs 0.2s — the cost was
+  re-analysing the same routines, at roughly 12s per graph node, making a depth-6 lineage page 587s.
+  Full coverage would have taken over a day. Three per-instance memos over read-only metadata
+  (routine analysis, node expansion, reverse routine consumers) make the total work scale with the
+  number of distinct objects in the system instead of the number of pages: the memo grew from 215 to
+  276 entries across eight pages while per-page time fell from 587s to 2-19s. Lineage depth also
+  dropped from 6 to 4, which is the depth the deepest documented flow shape actually needs.
 
 ### Added
+- **BW 3.x dataflow: transfer rules, update rules, InfoSource routing (`bw_list_3x_flows`,
+  `bw_get_transfer_rules`, `bw_list_update_rules`).** These tables were absent from the table map, so
+  the 3.x layer was invisible — and it is not legacy trivia on 7.50: on the reference system **1,090
+  DataSource routes reach BW through a transfer structure with no 7.x transformation at all**, almost
+  all master data, and the two eras turn out to be completely disjoint. Lineage built only from
+  `RSTRAN` stopped dead at every one of them. Per flow the rule profile counts how fields are derived
+  (routine / formula / constant / direct assignment) so a flow whose logic lives outside metadata is
+  visible without reading every rule. **Correction:** `RSTS` keys on `TRANSTRU` and has no
+  `OLTPSOURCE` — `TSTPNM` is the transport package, not a join key — so the DataSource association
+  exists only via `RSISOSMAP`. And none of these families match the dialect's active-version prefix
+  (`RSD`/`RSO`/`RSZ`/`RSTRAN`), so every query states `OBJVERS = 'A'` itself; omitting it silently
+  returns modified and delivered versions alongside the active one. A transfer structure carrying no
+  rules is excluded as a PSA shell rather than reported as a dataflow.
 - **Calc view → InfoProvider resolution (`0BW:BIA:` views).** BW generates a per-InfoProvider HANA
   view named `0BW:BIA:<PROVIDER>` (with `:J1.CALC.n` / `.CONV*` internal nodes), and that is what
   sits on the BW side of a `bw_reads_hana` crossing — previously left unresolved. The provider is

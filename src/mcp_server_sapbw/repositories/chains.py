@@ -257,6 +257,20 @@ class ChainsRepository(Repository):
     def get_chain(
         self, chain_id: str, *, resolve_subchains: bool = True, max_depth: int = 5
     ) -> Chain | UnsupportedResult:
+        """Chain structure with sub-chains resolved. Cached (scope ``chain``).
+
+        The key carries the recursion options, because they change the shape of the result.
+        """
+        return self.cached_model(
+            "chain",
+            f"{chain_id}|{int(resolve_subchains)}|{max_depth}",
+            model=Chain,
+            build=lambda: self._get_chain_uncached(chain_id, resolve_subchains, max_depth),
+        )
+
+    def _get_chain_uncached(
+        self, chain_id: str, resolve_subchains: bool, max_depth: int
+    ) -> Chain | UnsupportedResult:
         unsupported = self.require("chain_edges", "chain_attr")
         if unsupported is not None:
             return unsupported
@@ -357,6 +371,24 @@ class ChainsRepository(Repository):
 
     def get_chain_runtimes(
         self, chain_id: str, *, days: int = 90
+    ) -> ChainRuntimes | UnsupportedResult:
+        """Runtime statistics over the retained window. Cached on the ``runtime`` tier.
+
+        Runtime figures move with every run, so they use the runtime tier (hard-capped at one hour,
+        mission Section 3) rather than the long structural TTL. RSPCPROCESSLOG is the largest table
+        the server reads, so even a one-hour cache removes most of the cost of repeated questions
+        about the same chain.
+        """
+        return self.cached_model(
+            "chain_runtimes",
+            f"{chain_id}|{days}",
+            model=ChainRuntimes,
+            build=lambda: self._get_chain_runtimes_uncached(chain_id, days),
+            tier="runtime",
+        )
+
+    def _get_chain_runtimes_uncached(
+        self, chain_id: str, days: int
     ) -> ChainRuntimes | UnsupportedResult:
         unsupported = self.require("log_chain", "process_log")
         if unsupported is not None:

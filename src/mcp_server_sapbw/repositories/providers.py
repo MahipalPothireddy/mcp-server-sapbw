@@ -157,7 +157,23 @@ class ProvidersRepository(Repository):
     def describe(
         self, name: str, object_type: ProviderType | None = None
     ) -> Provider | ObjectNotFound | UnsupportedResult:
-        """Resolve a provider/InfoObject by name (auto-detecting the type unless one is given)."""
+        """Resolve a provider/InfoObject by name. Cached (scope ``provider``).
+
+        The cache key includes the requested type, since an explicit type skips auto-detection and
+        can therefore resolve differently from a bare name. A not-found is never cached — the object
+        may simply not be transported yet.
+        """
+        key = f"{name.strip()}|{object_type or 'auto'}"
+        return self.cached_model(
+            "provider",
+            key,
+            model=Provider,
+            build=lambda: self._describe_uncached(name, object_type),
+        )
+
+    def _describe_uncached(
+        self, name: str, object_type: ProviderType | None = None
+    ) -> Provider | ObjectNotFound | UnsupportedResult:
         name = name.strip()
         if object_type is not None:
             return self._describe_typed(name, object_type)

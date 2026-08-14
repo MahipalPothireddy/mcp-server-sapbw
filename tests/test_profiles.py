@@ -146,7 +146,9 @@ def test_path_from_env(tmp_path: Path) -> None:
     assert mgr.get("qa").host == "qa.example.invalid"
 
 
-def test_loads_local_dotenv_when_no_env_is_provided(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_loads_local_dotenv_when_no_env_is_provided(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
         "BW_PROFILES_PATH=./profiles.yaml\n"

@@ -35,3 +35,8 @@ Thumbs.db
 
 # local landscape reference (internal endpoints; never commit)
 landscape.local.md
+
+# ad-hoc probe/verification scratch scripts and their output. These run against a live system and
+# routinely carry concrete object names, so they must never be committed (see SECURITY.md).
+tmp_*
+

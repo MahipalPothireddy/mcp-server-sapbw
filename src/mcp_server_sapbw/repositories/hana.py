@@ -140,6 +140,19 @@ class HanaRepository(Repository):
     # --- calc-view lineage ---------------------------------------------------------------
 
     def get_calc_view_lineage(self, view_name: str) -> CalcViewLineage | UnsupportedResult:
+        """Base tables and consuming providers for a calc view. Cached (scope ``calc_view``)."""
+        return self.cached_model(
+            "calc_view",
+            view_name,
+            model=CalcViewLineage,
+            build=lambda: self._get_calc_view_lineage_uncached(view_name),
+            # An unknown view resolves to nothing; a view activated later must not read as empty.
+            cache_when=lambda lineage: bool(lineage.base_tables or lineage.consuming_bw_providers),
+        )
+
+    def _get_calc_view_lineage_uncached(
+        self, view_name: str
+    ) -> CalcViewLineage | UnsupportedResult:
         unsupported = self.require("object_dependencies")
         if unsupported is not None:
             return unsupported

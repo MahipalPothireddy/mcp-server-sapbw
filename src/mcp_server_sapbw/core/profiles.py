@@ -93,6 +93,13 @@ class EccProfile(BaseModel):
     # Separate, deliberate opt-in: without it, use_tls=False is rejected outright.
     allow_plain_http: bool = False
     ssl_validate_certificate: bool = True
+    # A second deliberate opt-in, and a much smaller concession than allow_plain_http. Older SAP
+    # ICM releases offer only static-RSA cipher suites, which OpenSSL 3.x excludes at its default
+    # security level, so the TLS handshake fails outright even though the certificate is valid and
+    # the bulk cipher is AES-GCM. Setting this admits those suites: the channel stays encrypted and
+    # the certificate is still checked, and what is given up is forward secrecy. Off by default so
+    # the weaker handshake is always a recorded choice.
+    allow_legacy_tls_ciphers: bool = False
     timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     # ADT service root. Configurable because some landscapes expose ICF nodes under a prefix.
     adt_root: str = "/sap/bc/adt"
@@ -213,6 +220,7 @@ def _build_ecc_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]
             use_tls=bool(raw.get("use_tls", True)),
             allow_plain_http=bool(raw.get("allow_plain_http", False)),
             ssl_validate_certificate=bool(raw.get("ssl_validate_certificate", True)),
+            allow_legacy_tls_ciphers=bool(raw.get("allow_legacy_tls_ciphers", False)),
             timeout_seconds=float(raw.get("timeout_seconds", 30.0)),
             adt_root=adt_root or "/sap/bc/adt",
         )

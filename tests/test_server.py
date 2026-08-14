@@ -27,6 +27,7 @@ from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.sources import SourcesRepository
+from mcp_server_sapbw.repositories.threex import ThreeXRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import RefreshResult, SystemStatus
 from mcp_server_sapbw.services.analyzers import Analyzers
@@ -231,6 +232,9 @@ class FakeRuntime:
 
     def hana(self, system: str) -> HanaRepository:
         return HanaRepository(_Conn(), self._cap)
+
+    def threex(self, system: str) -> ThreeXRepository:
+        return ThreeXRepository(_Conn(), self._cap)
 
     def analyzers(self, system: str) -> Analyzers:
         return Analyzers(_Conn(), self._cap)

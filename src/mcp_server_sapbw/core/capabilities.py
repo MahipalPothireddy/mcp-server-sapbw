@@ -112,6 +112,25 @@ ABAP_TABLES: dict[str, str] = {
     "global_variable": "RSZGLOBV",
     "element_prop": "RSZELTPROP",
     "report_dir": "RSRREPDIR",
+    # BW 3.x dataflow (transfer rules / update rules). Still load-bearing on 7.50: on the reference
+    # system 1,090 DataSources route through a transfer structure with no 7.x transformation at all,
+    # almost all of them master data. Ignoring these tables makes that whole layer invisible.
+    # RSTS keys on TRANSTRU (TSTPNM is the transport package, not a join key) and has no OLTPSOURCE;
+    # RSISOSMAP is the DataSource <-> InfoSource <-> transfer-structure bridge.
+    "transfer_structure": "RSTS",
+    "transfer_structure_field": "RSTSFIELD",
+    "transfer_rule": "RSTSRULES",
+    "infosource_map": "RSISOSMAP",
+    "infosource_header": "RSIS",
+    "infosource_text": "RSIST",
+    "comm_structure": "RSKS",
+    "comm_structure_field": "RSKSFIELDNEW",
+    "update_rule": "RSUPDINFO",
+    "update_rule_keyfigure": "RSUPDDAT",
+    "update_rule_key": "RSUPDKEY",
+    "update_rule_routine": "RSUPDROUT",
+    "routine_source_3x": "RSAROUT",
+    "routine_text_3x": "RSAROUTT",
     # dictionary
     "dict_tables": "DD02L",
     "dict_tables_text": "DD02T",

@@ -13,6 +13,7 @@ Conventions enforced here:
 
 import os
 import re
+import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -47,6 +48,7 @@ from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
 from .models.queries import Query, QueryLineage, QueryOriginFilter, QuerySummary, QueryUsage
 from .models.register import RoutineRegister
 from .models.sources import EnhancementInventory, SourceTopology
+from .models.threex import ThreeXFlowReport, TransferRule, UpdateRule
 from .models.transformations import (
     RoutineAnalysis,
     RoutineCode,
@@ -61,6 +63,7 @@ from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
 from .repositories.sources import SourcesRepository
+from .repositories.threex import ThreeXRepository
 from .repositories.transformations import TransformationsRepository
 from .services.analyzers import Analyzers
 from .services.diagram import build_layout, png_available, render_png, render_svg
@@ -85,6 +88,9 @@ def _slug_for_file(name: str) -> str:
 _MAX_TOOL_NAME = 40
 _MAX_PAGE = 500
 _DEFAULT_PAGE = 100
+# Doc generation writes pages to disk and returns only a manifest of filenames, so the row bound
+# that protects the reply size on the list tools does not apply. Bounded only to stop a runaway.
+_MAX_DOCGEN_PAGES = 5000
 
 mcp: FastMCP = FastMCP(name="sapbw", mask_error_details=True)
 
@@ -201,6 +207,7 @@ class Runtime(Protocol):
     def load_closure(self, system: str) -> LoadClosureService: ...
     def health(self, system: str) -> HealthRepository: ...
     def sources(self, system: str) -> SourcesRepository: ...
+    def threex(self, system: str) -> ThreeXRepository: ...
     def routine_register(self, system: str) -> RoutineRegisterService: ...
     def exit_analysis(
         self, ecc_system: str | None
@@ -222,6 +229,8 @@ class ServerRuntime:
         self._resolver = resolver
         self._cache_dir = cache_dir
         self._capabilities: dict[str, CapabilityRecord] = {}
+        # system -> (capability fingerprint, open cache). Retired when the fingerprint changes.
+        self._caches: dict[str, tuple[str, SqliteCache]] = {}
 
     @classmethod
     def from_env(cls) -> "ServerRuntime":
@@ -240,39 +249,79 @@ class ServerRuntime:
     def refresh_capabilities(self, system: str) -> CapabilityRecord:
         return self.capability(system, refresh=True)
 
-    def refresh_cache(self, system: str, scope: str) -> RefreshResult:
+    def _cache(self, system: str) -> SqliteCache | None:
+        """The per-profile metadata cache, tied to the current capability fingerprint.
+
+        One SQLite connection is kept per system for the process's lifetime. A capability refresh
+        changes the fingerprint, which retires the instance so entries extracted under the old
+        release picture are not reused. A cache that cannot be opened (read-only filesystem, locked
+        file) is never fatal: the repositories simply run uncached.
+        """
         record = self.capability(system)
-        cache = SqliteCache(
-            self._cache_dir / f"{system}.sqlite",
-            system=system,
-            fingerprint=record.discovered_at.isoformat(),
-        )
-        removed = cache.refresh(scope)
-        cache.close()
+        fingerprint = record.discovered_at.isoformat()
+        existing = self._caches.get(system)
+        if existing is not None:
+            if existing[0] == fingerprint:
+                return existing[1]
+            # Drop the reference but do NOT close it: a repository built moments ago may still hold
+            # this instance, and closing the connection under it would raise mid-call. The retired
+            # entries are unreachable anyway — they carry the old fingerprint, so they always miss.
+            del self._caches[system]
+        try:
+            cache = SqliteCache(
+                self._cache_dir / f"{system}.sqlite",
+                system=system,
+                fingerprint=fingerprint,
+            )
+        except (sqlite3.Error, OSError):
+            return None
+        self._caches[system] = (fingerprint, cache)
+        return cache
+
+    def refresh_cache(self, system: str, scope: str) -> RefreshResult:
+        cache = self._cache(system)
+        removed = cache.refresh(scope) if cache is not None else 0
         return RefreshResult(system=system, scope=scope, removed=removed)
 
     def chains(self, system: str) -> ChainsRepository:
-        return ChainsRepository(self._connection(system), self.capability(system))  # type: ignore[arg-type]
+        return ChainsRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+            self._cache(system),
+        )
 
     def providers(self, system: str) -> ProvidersRepository:
-        return ProvidersRepository(self._connection(system), self.capability(system))
+        return ProvidersRepository(
+            self._connection(system), self.capability(system), self._cache(system)
+        )
 
     def search(self, system: str) -> SearchRepository:
-        return SearchRepository(self._connection(system), self.capability(system))  # type: ignore[arg-type]
+        return SearchRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+            self._cache(system),
+        )
 
     def transformations(self, system: str) -> TransformationsRepository:
-        return TransformationsRepository(self._connection(system), self.capability(system))
+        return TransformationsRepository(
+            self._connection(system), self.capability(system), self._cache(system)
+        )
 
     def lineage(self, system: str) -> LineageService:
-        return LineageService(self._connection(system), self.capability(system))
+        return LineageService(
+            self._connection(system), self.capability(system), self._cache(system)
+        )
 
     def queries(self, system: str) -> QueriesRepository:
-        return QueriesRepository(self._connection(system), self.capability(system))
+        return QueriesRepository(
+            self._connection(system), self.capability(system), self._cache(system)
+        )
 
     def hana(self, system: str) -> HanaRepository:
         return HanaRepository(
             self._connection(system),  # type: ignore[arg-type]
             self.capability(system),
+            self._cache(system),
         )
 
     def _ecc_connector(self, name: str | None = None) -> EccConnector:
@@ -301,6 +350,7 @@ class ServerRuntime:
         return Analyzers(
             self._connection(system),
             self.capability(system),
+            self._cache(system),
             registry=self._registry(),
         )
 
@@ -308,6 +358,7 @@ class ServerRuntime:
         return DocGenerator(
             self._connection(system),
             self.capability(system),
+            self._cache(system),
             registry=self._registry(),
         )
 
@@ -328,22 +379,35 @@ class ServerRuntime:
         return ExitAnalysisService(connector)
 
     def load_closure(self, system: str) -> LoadClosureService:
-        return LoadClosureService(self._connection(system), self.capability(system))
+        return LoadClosureService(
+            self._connection(system), self.capability(system), self._cache(system)
+        )
 
     def health(self, system: str) -> HealthRepository:
         return HealthRepository(
             self._connection(system),  # type: ignore[arg-type]
             self.capability(system),
+            self._cache(system),
         )
 
     def sources(self, system: str) -> SourcesRepository:
         return SourcesRepository(
             self._connection(system),  # type: ignore[arg-type]
             self.capability(system),
+            self._cache(system),
+        )
+
+    def threex(self, system: str) -> ThreeXRepository:
+        return ThreeXRepository(
+            self._connection(system),  # type: ignore[arg-type]
+            self.capability(system),
+            self._cache(system),
         )
 
     def routine_register(self, system: str) -> RoutineRegisterService:
-        return RoutineRegisterService(self._connection(system), self.capability(system))
+        return RoutineRegisterService(
+            self._connection(system), self.capability(system), self._cache(system)
+        )
 
     def list_systems(self) -> list[SystemStatus]:
         result: list[SystemStatus] = []
@@ -415,7 +479,15 @@ def bw_refresh_capabilities(system: str) -> CapabilityRecord:
 
 @_readonly_tool
 def bw_refresh_cache(system: str, scope: str = "all") -> RefreshResult:
-    """Invalidate cached extracts for a system by scope (all | <object_type> | <object_id>)."""
+    """Invalidate cached extracts for a system by scope, returning how many entries were removed.
+
+    ``scope`` is ``all``, one object type, or a single object id. Cached object types:
+    ``transformation``, ``routine_code``, ``routine_analysis``, ``query``, ``query_lineage``,
+    ``provider``, ``chain``, ``chain_runtimes``, ``calc_view``.
+
+    Only needed after a transport: structural extracts carry a 24h TTL, runtime statistics one hour,
+    and everything is dropped automatically when capability discovery re-runs.
+    """
     return runtime().refresh_cache(system, scope)
 
 
@@ -747,6 +819,70 @@ def bw_get_source_systems(system: str) -> SourceTopology | UnsupportedResult:
     return runtime().sources(system).get_topology()
 
 
+# --- BW 3.x dataflow tools (scenario 5) --------------------------------------------------
+
+
+@_readonly_tool
+def bw_list_3x_flows(
+    system: str,
+    datasource: str | None = None,
+    only_without_transformation: bool = False,
+    limit: int = 100,
+    offset: int = 0,
+) -> ThreeXFlowReport | UnsupportedResult:
+    """DataSources that reach BW through a BW 3.x transfer structure, with their rule profile.
+
+    The 3.x path is ``DataSource -> InfoSource -> transfer structure (transfer rules) ->
+    communication structure -> update rules -> target``, against the 7.x path's single
+    transformation plus DTP. On a 7.50 system this is not legacy trivia: where a DataSource has no
+    7.x transformation, its transfer rules *are* the live load logic, and lineage that ignores them
+    stops dead at that DataSource.
+
+    ``has_seven_x_transformation`` is the field to read first. False means there is no 7.x path at
+    all. Set ``only_without_transformation`` to list just those. Transfer structures carrying no
+    rules are excluded, since a rule-less structure is a PSA shell rather than a dataflow.
+
+    Per flow the rule profile counts how the fields are derived — routine, formula, constant — so a
+    flow whose logic lives outside metadata is visible without reading every rule.
+    """
+    limit, offset = _clamp_page(limit, offset)
+    return (
+        runtime()
+        .threex(system)
+        .list_flows(
+            datasource=datasource,
+            only_without_transformation=only_without_transformation,
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+@_readonly_tool
+def bw_get_transfer_rules(
+    system: str, transfer_structure: str
+) -> list[TransferRule] | UnsupportedResult:
+    """Field-level BW 3.x transfer rules for one transfer structure.
+
+    Each rule says how a transfer-structure field becomes an InfoObject. A constant or a direct
+    assignment is fully described by the rule itself; a conversion routine (``CONVROUT_G`` global /
+    ``CONVROUT_L`` local) or a formula holds its logic elsewhere, so those are reported as the
+    mechanism rather than as resolved logic.
+    """
+    return runtime().threex(system).get_transfer_rules(transfer_structure)
+
+
+@_readonly_tool
+def bw_list_update_rules(system: str, limit: int = 100) -> list[UpdateRule] | UnsupportedResult:
+    """Active BW 3.x update rules: InfoSource -> target, the step a 7.x transformation replaced.
+
+    ``target`` comes from ``RSUPDINFO.INFOCUBE``, which despite the column name also carries
+    InfoObject targets for master-data flows.
+    """
+    limit, _ = _clamp_page(limit, 0)
+    return runtime().threex(system).list_update_rules(limit=limit)
+
+
 @_readonly_tool
 def bw_list_extractor_enhancements(
     system: str, limit: int = 50
@@ -987,17 +1123,44 @@ def bw_review_scenario(
 
 
 @_readonly_tool
-def bw_generate_docs(system: str, output_dir: str | None = None, limit: int = 15) -> DocGenResult:
+def bw_generate_docs(
+    system: str,
+    output_dir: str | None = None,
+    *,
+    limit: int = 15,
+    catalog_cap: int | None = None,
+    sections: list[str] | None = None,
+    resume: bool = False,
+) -> DocGenResult:
     """Render the full markdown knowledge base (mission Section 8) to a git-ignored directory.
 
     Writes an index, per-section catalogues and detail pages (chains, lineage with Mermaid,
     providers, transformations, queries, HANA, the eight risk scenarios), and a non-empty
     gaps-and-risks register. ``output_dir`` must be outside the tracked repo tree; it defaults to
     ``output/docs/<system>``. Returns a manifest of the files written.
+
+    ``limit`` is how many per-object detail pages each section renders; ``catalog_cap`` is how many
+    rows its index catalogue fetches. ``catalog_cap`` defaults to ``limit`` so that asking for more
+    detail pages widens the catalogue too — otherwise the detail loop would slice a shorter
+    catalogue list and silently return fewer pages than asked for. Pass a large ``limit`` (e.g.
+    5000) for full coverage of a system; the page bound here is deliberately far higher than the
+    row bound on the list tools, because these pages go to disk rather than into the reply.
+
+    ``sections`` restricts which sections are written, from: inventory, load-coverage, chains,
+    lineage, providers, transformations, queries, hana, scenarios. Use it to split a full-coverage
+    run across several calls — the database closes the session before a whole-system run finishes,
+    and because generation only ever adds files, separate calls compose into the same tree.
+    ``resume`` skips detail pages already on disk, so a section cut off mid-run continues rather
+    than rebuilding what it already produced.
     """
-    limit, _ = _clamp_page(limit, 0)
+    limit = max(1, min(limit, _MAX_DOCGEN_PAGES))
+    cap = limit if catalog_cap is None else max(1, min(catalog_cap, _MAX_DOCGEN_PAGES))
     target = output_dir or f"output/docs/{system}"
-    return runtime().docgen(system).generate(target, limit=limit)
+    return (
+        runtime()
+        .docgen(system)
+        .generate(target, limit=limit, catalog_cap=cap, sections=sections, resume=resume)
+    )
 
 
 # --- prompts (analyst workflows composing the read-only tools) ---------------------------

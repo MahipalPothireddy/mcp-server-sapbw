@@ -93,7 +93,14 @@ class LineageService(Repository):
         super().__init__(connection, capability, cache)
         self._transformations = TransformationsRepository(connection, capability, cache)
         self._providers = ProvidersRepository(connection, capability, cache)
-        self._queries = None
+        # Built lazily in _query_repo(): QueriesRepository imports this module, so importing it
+        # here would be circular. Typed Any because the concrete class cannot be named yet.
+        self._queries: Any = None
+        # Per-instance memos over read-only metadata; see _expand for why these matter.
+        self._expand_memo: dict[tuple[str, LineageDirection, bool], list[_Hop]] = {}
+        self._node_type_memo: dict[str, LineageNodeType] = {}
+        self._consumers_memo: dict[str, list[tuple[str, LineageNodeType, str]]] = {}
+        self._trace_memo: dict[tuple[str, int], TraceToSource] = {}
 
     # --- public API ----------------------------------------------------------------------
 
@@ -108,10 +115,24 @@ class LineageService(Repository):
         return self._graph(name, direction, depth, nodes, edges, truncated=truncated)
 
     def trace_to_source(self, name: str, *, depth: int = 8) -> TraceToSource | UnsupportedResult:
+        """Walk upstream to the DataSource boundary. Memoised, like :meth:`_expand`.
+
+        Query field lineage calls this once per InfoObject in the query, and the same InfoObjects
+        recur across hundreds of queries, so without a memo a full-system generation re-walks the
+        same upstream graphs repeatedly.
+        """
         unsupported = self.require("transformation")
         if unsupported is not None:
             return unsupported
         depth = max(1, min(depth, _MAX_DEPTH))
+        cached = self._trace_memo.get((name, depth))
+        if cached is not None:
+            return cached
+        traced = self._trace_uncached(name, depth)
+        self._trace_memo[(name, depth)] = traced
+        return traced
+
+    def _trace_uncached(self, name: str, depth: int) -> TraceToSource:
         nodes, edges, truncated = self._bfs(name, "upstream", depth, include_routine=True)
         graph = self._graph(name, "upstream", depth, nodes, edges, truncated=truncated)
         datasources = [n.name for n in nodes.values() if n.object_type == "datasource"]
@@ -215,6 +236,25 @@ class LineageService(Repository):
     def _expand(
         self, name: str, direction: LineageDirection, *, include_routine: bool
     ) -> list[_Hop]:
+        """Every hop out of one node. Memoised: this is where the walk's cost lives.
+
+        Expanding a node means several metadata queries plus, upstream, analysing the routines of
+        every transformation targeting it — measured at seconds per node. A single walk never
+        revisits a node, but consecutive walks overlap heavily (a DSO stack's middle layers appear
+        in every graph through them), so without a memo a full-system generation re-derives the
+        same nodes hundreds of times. Keyed by the arguments that change the answer.
+        """
+        memo_key = (name, direction, include_routine)
+        cached = self._expand_memo.get(memo_key)
+        if cached is not None:
+            return cached
+        hops = self._expand_uncached(name, direction, include_routine=include_routine)
+        self._expand_memo[memo_key] = hops
+        return hops
+
+    def _expand_uncached(
+        self, name: str, direction: LineageDirection, *, include_routine: bool
+    ) -> list[_Hop]:
         hops: list[_Hop] = []
         if direction in ("downstream", "both"):
             hops.extend(self._declared_hops(name, downstream=True))
@@ -233,8 +273,17 @@ class LineageService(Repository):
 
         Neighbour types come free with each hop (RSTRAN carries the *other* endpoint's RSTLOGO
         code), but the root has no inbound hop to learn from. One bounded lookup asks RSTRAN for a
-        row where the object is an endpoint and reads its own type code from that side.
+        row where the object is an endpoint and reads its own type code from that side. Memoised
+        because a full-system generation asks for the same objects repeatedly.
         """
+        cached = self._node_type_memo.get(name)
+        if cached is not None:
+            return cached
+        resolved = self._node_type_uncached(name)
+        self._node_type_memo[name] = resolved
+        return resolved
+
+    def _node_type_uncached(self, name: str) -> LineageNodeType:
         for own_type_col, key_col in (("SOURCETYPE", "SOURCENAME"), ("TARGETTYPE", "TARGETNAME")):
             rows = self.select(
                 self.dialect.paginate(
@@ -275,7 +324,9 @@ class LineageService(Repository):
 
     def _query_repo(self) -> Any:
         if self._queries is None:
-            from ..repositories.queries import QueriesRepository
+            # Deliberately deferred: repositories.queries imports LineageService at module level,
+            # so a top-level import here is a genuine cycle rather than a style slip.
+            from ..repositories.queries import QueriesRepository  # noqa: PLC0415
 
             self._queries = QueriesRepository(self._connection, self.capability, self._cache)
         return self._queries
@@ -539,7 +590,20 @@ class LineageService(Repository):
         return [str(r[0]).strip() for r in rows if str(r[0]).strip()]
 
     def _routine_consumers_of(self, name: str) -> list[tuple[str, LineageNodeType, str]]:
-        """Reverse: (target, type, tran_id) for transformations whose routines reference name."""
+        """Reverse: (target, type, tran_id) for transformations whose routines reference name.
+
+        Memoised for the same reason as :meth:`_expand`: this scans the ABAP source table and then
+        resolves the owning transformations' targets, and impact analysis asks for the same objects
+        repeatedly across a full-system generation.
+        """
+        cached = self._consumers_memo.get(name)
+        if cached is not None:
+            return cached
+        resolved = self._routine_consumers_uncached(name)
+        self._consumers_memo[name] = resolved
+        return resolved
+
+    def _routine_consumers_uncached(self, name: str) -> list[tuple[str, LineageNodeType, str]]:
         if not self.capability.is_available("routine_source"):
             return []
         code_ids = self._codeids_referencing(name)

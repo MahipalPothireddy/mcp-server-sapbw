@@ -207,6 +207,21 @@ class QueriesRepository(Repository):
     # --- full definition -----------------------------------------------------------------
 
     def get_query(self, identifier: str) -> Query | UnsupportedResult:
+        """Full query definition. Cached (scope ``query``).
+
+        The recursive RSZELTXREF walk plus the RSZELTTXT/RSZSELECT/RSZRANGE/RSZCALC joins are the
+        most query-heavy read in the server, and a query definition only changes on re-activation.
+        """
+        return self.cached_model(
+            "query",
+            identifier,
+            model=Query,
+            build=lambda: self._get_query_uncached(identifier),
+            # A not-found shell carries no COMPID; never cache "does not exist".
+            cache_when=lambda query: query.compid is not None,
+        )
+
+    def _get_query_uncached(self, identifier: str) -> Query | UnsupportedResult:
         unsupported = self.require("query_dir", "element_dir", "element_xref")
         if unsupported is not None:
             return unsupported
@@ -315,6 +330,16 @@ class QueriesRepository(Repository):
     # --- field-level lineage -------------------------------------------------------------
 
     def get_query_lineage(self, identifier: str) -> QueryLineage | UnsupportedResult:
+        """Per-InfoObject lineage toward the DataSource. Cached (scope ``query_lineage``)."""
+        return self.cached_model(
+            "query_lineage",
+            identifier,
+            model=QueryLineage,
+            build=lambda: self._get_query_lineage_uncached(identifier),
+            cache_when=lambda lineage: lineage.compid is not None,
+        )
+
+    def _get_query_lineage_uncached(self, identifier: str) -> QueryLineage | UnsupportedResult:
         unsupported = self.require("query_dir", "element_xref", "transformation")
         if unsupported is not None:
             return unsupported

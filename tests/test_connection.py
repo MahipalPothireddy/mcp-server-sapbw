@@ -19,6 +19,7 @@ from mcp_server_sapbw.core.connection import (
     ReadOnlyViolation,
     SecretScrubber,
     assert_read_only,
+    is_connection_lost,
     verify_read_only_grants,
 )
 from mcp_server_sapbw.core.profiles import Profile
@@ -238,3 +239,161 @@ def test_pool_scrubs_connection_error() -> None:
 def test_secret_scrubber_longest_first() -> None:
     scrubber = SecretScrubber(["abc", "abcdef"])
     assert scrubber.scrub("abcdef and abc") == "<redacted> and <redacted>"
+
+
+# --- Reconnect on transport loss -----------------------------------------------------------
+#
+# A whole-system analysis run does not fit in one database session: the reference system closed the session ~34
+# minutes into a documentation generation. Retrying has to be limited to transport failures, and a
+# reconnect must not become a way onto a connection that never passed the grant check.
+
+_LOST = "Connection to the server was lost: forcibly closed by the remote host"
+
+
+class FlakyConnection:
+    """Fails the first ``fail_times`` executes with a connection-loss error, then succeeds."""
+
+    def __init__(self, fail_times: int, rows: list[tuple[Any, ...]] | None = None) -> None:
+        self.remaining_failures = fail_times
+        self.rows = rows if rows is not None else [("ok",)]
+        self.closed = False
+        self.execute_count = 0
+
+    def cursor(self) -> Any:
+        return _FlakyCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FlakyCursor:
+    def __init__(self, owner: FlakyConnection) -> None:
+        self._owner = owner
+
+    def execute(self, operation: str, parameters: Any = None) -> None:
+        self._owner.execute_count += 1
+        if self._owner.remaining_failures > 0:
+            self._owner.remaining_failures -= 1
+            raise RuntimeError(_LOST)
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self._owner.rows)
+
+    def close(self) -> None:
+        return None
+
+
+def test_connection_loss_is_distinguished_from_a_bad_query() -> None:
+    assert is_connection_lost(RuntimeError(_LOST))
+    assert is_connection_lost(RuntimeError("sql error -10709 connection failed"))
+    # A deterministic SQL error must not be retried: the same query would fail the same way.
+    assert not is_connection_lost(RuntimeError("invalid column name: OBJVERS"))
+    assert not is_connection_lost(RuntimeError("invalid table name: RSNOSUCH"))
+
+
+def test_dropped_session_reconnects_and_the_query_succeeds() -> None:
+    dropped = FlakyConnection(fail_times=1, rows=[("recovered",)])
+    replacement = FakeConnection(FakeCursor(rows=[("recovered",)]))
+
+    def reopen() -> Any:
+        return replacement
+
+    conn = ReadOnlyConnection(dropped, scrubber=SecretScrubber([]), reopen=reopen)
+    assert conn.execute_select("SELECT 1") == [("recovered",)]
+    assert conn.reconnect_count == 1
+    assert dropped.closed  # the dead connection is not left open
+
+
+def test_reconnect_gives_up_rather_than_looping_forever() -> None:
+    always_dead = FlakyConnection(fail_times=99)
+
+    def reopen() -> Any:
+        return FlakyConnection(fail_times=99)
+
+    conn = ReadOnlyConnection(always_dead, scrubber=SecretScrubber([]), reopen=reopen)
+    with pytest.raises(QueryError):
+        conn.execute_select("SELECT 1")
+    # Bounded: the initial attempt plus a fixed number of retries, not an unbounded loop.
+    assert conn.reconnect_count == 2
+
+
+def test_a_bad_query_is_not_retried() -> None:
+    cursor = FakeCursor(raise_on_execute=RuntimeError("invalid column name: NOPE"))
+    reopened = False
+
+    def reopen() -> Any:
+        nonlocal reopened
+        reopened = True
+        return FakeConnection()
+
+    conn = ReadOnlyConnection(FakeConnection(cursor), scrubber=SecretScrubber([]), reopen=reopen)
+    with pytest.raises(QueryError):
+        conn.execute_select("SELECT NOPE FROM T")
+    assert not reopened
+    assert conn.reconnect_count == 0
+
+
+def test_write_guard_still_runs_before_any_reconnect_path() -> None:
+    """The statement guard is the load-bearing check and must not be reachable around."""
+    conn = ReadOnlyConnection(
+        FlakyConnection(fail_times=1), scrubber=SecretScrubber([]), reopen=FakeConnection
+    )
+    with pytest.raises(ReadOnlyViolation):
+        conn.execute_select("DELETE FROM T")
+    assert conn.reconnect_count == 0
+
+
+def test_reconnect_reruns_the_grant_check_and_refuses_a_write_capable_user() -> None:
+    """A reconnect must not be a way onto a connection that never passed the gate."""
+    profile = make_profile(read_only_user=True)
+    attempts: list[int] = []
+
+    def factory(_: Profile) -> Any:
+        attempts.append(len(attempts))
+        if len(attempts) == 1:
+            # First connect: read-only, and its queries drop the session.
+            return _GrantedThenFlaky(privileges=[("SELECT",)])
+        # The reconnect lands on a user that now reports a write privilege.
+        return FakeConnection(FakeCursor(rows=[("SELECT",), ("INSERT",)]))
+
+    pool = ReadOnlyConnectionPool(factory=factory)
+    conn = pool.acquire(profile)
+    # The query fails: the transport dropped, and the reconnect was refused by the grant check.
+    with pytest.raises(QueryError):
+        conn.execute_select("SELECT 1 FROM DUMMY")
+    assert len(attempts) == 2  # it did try to reconnect
+    assert conn.reconnect_count == 0  # but the gate rejected it
+
+
+class _GrantedThenFlaky:
+    """Passes the grant check, then loses the session on the first real query."""
+
+    def __init__(self, privileges: list[tuple[Any, ...]]) -> None:
+        self._privileges = privileges
+        self._grant_checked = False
+        self.closed = False
+
+    def cursor(self) -> Any:
+        return _GrantedThenFlakyCursor(self)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _GrantedThenFlakyCursor:
+    def __init__(self, owner: _GrantedThenFlaky) -> None:
+        self._owner = owner
+        self._is_grant_query = False
+
+    def execute(self, operation: str, parameters: Any = None) -> None:
+        if "EFFECTIVE_PRIVILEGES" in operation:
+            self._is_grant_query = True
+            self._owner._grant_checked = True
+            return
+        raise RuntimeError(_LOST)
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return list(self._owner._privileges) if self._is_grant_query else []
+
+    def close(self) -> None:
+        return None

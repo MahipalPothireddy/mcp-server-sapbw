@@ -40,6 +40,7 @@ Every failure is therefore re-raised as :class:`AdtError` naming only the profil
 
 from __future__ import annotations
 
+import ssl
 from collections.abc import Mapping
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -95,6 +96,33 @@ class AdtFetcher(Protocol):
     def get_text(self, path: str, params: Mapping[str, str]) -> AdtResponse: ...
 
 
+def _legacy_cipher_context(validate_certificate: bool) -> ssl.SSLContext:
+    """TLS context that also admits the cipher suites older SAP ICM releases still offer.
+
+    **The problem this solves.** OpenSSL 3.x, at its default security level, refuses static-RSA
+    key exchange. An ICM that advertises no ECDHE suite is therefore unreachable with ``httpx``'s
+    default settings: the server rejects the ClientHello and OpenSSL surfaces the confusingly
+    generic ``SSLV3_ALERT_HANDSHAKE_FAILURE``. This is easy to misread as the host being down,
+    especially since ``curl`` on Windows uses Schannel, not OpenSSL, and connects to the very same
+    port without complaint. Dropping to security level 1 re-admits those suites.
+
+    **What this does not do.** It does not disable encryption, and it does not disable certificate
+    checking - validation still follows ``ssl_validate_certificate``, and the negotiated bulk
+    cipher is still AES-GCM. The single concession is forward secrecy: static RSA has none, so a
+    recorded session becomes readable to anyone who later obtains the server's private key. That is
+    a real cost, which is why the profile flag is opt-in rather than a silent fallback.
+
+    The durable fix belongs on the SAP side - give the ICM an ECDHE-capable cipher suite list
+    (``ssl/ciphersuites``, with a current CommonCryptoLib) - after which the flag can be removed.
+    """
+    context = ssl.create_default_context()
+    if not validate_certificate:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    context.set_ciphers("DEFAULT@SECLEVEL=1")
+    return context
+
+
 class HttpxAdtFetcher:
     """``httpx``-backed ADT transport. GET-only; no CSRF token; stateless ADT session.
 
@@ -117,7 +145,9 @@ class HttpxAdtFetcher:
                 "reading source-system ABAP over ADT needs the 'ecc' extra: "
                 "pip install 'mcp-server-sapbw[ecc]'"
             ) from exc
-        verify: bool | str = self._profile.ssl_validate_certificate
+        verify: bool | str | ssl.SSLContext = self._profile.ssl_validate_certificate
+        if self._profile.use_tls and self._profile.allow_legacy_tls_ciphers:
+            verify = _legacy_cipher_context(self._profile.ssl_validate_certificate)
         self._client = httpx.Client(
             base_url=self._profile.base_url,
             auth=(self._profile.user, self._profile.password.get_secret_value()),
