@@ -72,6 +72,44 @@ class ExitBranch(BaseModel):
     unresolved_call_count: int = 0
 
 
+class ExitSatellite(BaseModel):
+    """A per-DataSource exit program reached by dynamic dispatch from ``ZXRSAU0n``.
+
+    Some sites keep no logic in the exit include at all: it derives a program name from
+    ``I_DATASOURCE`` and calls it (``PERFORM ... IN PROGRAM (name)``). ABAP resolves that name at
+    runtime, so no static read of the include can follow it - the include looks nearly empty and the
+    enhancement's real table reads, ``FOR ALL ENTRIES`` and per-record ``SELECT``s are invisible.
+
+    Each satellite is one program serving exactly one DataSource, so unlike :class:`ExitBranch`
+    there is no attribution problem: everything the program does belongs to that DataSource.
+
+    ``available=False`` with reason ``absent`` is the ordinary case and is not a defect - it means
+    this DataSource has no satellite, which is a genuine finding. Any other reason means unknown.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    program_name: str
+    datasource: str
+    # The prefix that produced the candidate name, so the naming rule used is auditable.
+    prefix: str
+    # Which exit slot's dispatch contributed the prefix; None when it came from configuration.
+    dispatched_from: ExitDataKind | None = None
+    available: bool
+    unavailable_reason: ExitUnavailableReason | None = None
+    line_count: int = 0
+    source: str | None = None
+    table_reads: list[str] = Field(default_factory=list)
+    per_record_selects: int = 0
+    # FOR ALL ENTRIES with no is-not-initial guard: an empty driver table reads the whole table.
+    unguarded_for_all_entries: int = 0
+    anti_pattern_kinds: list[str] = Field(default_factory=list)
+    unresolved_call_count: int = 0
+    analysis: RoutineAnalysis | None = None
+    provenance: AdtProvenance | None = None
+    note: str | None = None
+
+
 class ExitSource(BaseModel):
     """One extractor-exit slot: its ABAP, the DataSources it dispatches on, and its risk signals."""
 
@@ -88,6 +126,11 @@ class ExitSource(BaseModel):
     # delegated to a subroutine or class, will not appear here.
     handled_datasources: list[str] = Field(default_factory=list)
     branches: list[ExitBranch] = Field(default_factory=list)
+    # True when the include calls a program whose name is computed at runtime. This is the signal
+    # that the include's own emptiness proves nothing about the enhancement.
+    dynamic_dispatch: bool = False
+    # Literal prefixes the include concatenates with I_DATASOURCE to build that program name.
+    satellite_prefixes: list[str] = Field(default_factory=list)
     # Whole-include analysis, for the "what does this exit do overall" view.
     analysis: RoutineAnalysis | None = None
     provenance: AdtProvenance | None = None
@@ -95,7 +138,7 @@ class ExitSource(BaseModel):
 
 
 class ExitInventory(BaseModel):
-    """All four extractor-exit slots for one source system."""
+    """All four extractor-exit slots for one source system, plus any satellite programs found."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -105,6 +148,13 @@ class ExitInventory(BaseModel):
     available_count: int = 0
     # Union of every DataSource named across the four exits.
     handled_datasources: list[str] = Field(default_factory=list)
+    # Per-DataSource satellite programs, present only when candidates were supplied and a naming
+    # rule was known. Programs that do not exist are included with reason 'absent', because "no
+    # satellite" is a result worth citing and its absence from the list would be ambiguous.
+    satellites: list[ExitSatellite] = Field(default_factory=list)
+    satellite_prefixes: list[str] = Field(default_factory=list)
+    satellites_found_count: int = 0
+    satellite_candidates_considered: int = 0
     caveats: list[str] = Field(default_factory=list)
 
 

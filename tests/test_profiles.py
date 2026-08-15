@@ -284,3 +284,57 @@ def test_ecc_error_never_echoes_the_password(tmp_path: Path) -> None:
     with pytest.raises(ProfileConfigError) as excinfo:
         ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)
     assert "s3cr3t-src" not in str(excinfo.value)
+
+
+# --- ECC profile -> BW system declaration ------------------------------------------------
+#
+# A landscape with several ECC profiles used to leave the connector-gated scenarios permanently
+# unpopulated: the resolver refused to guess which source feeds which BW system, which was right,
+# but the consequence was "connector not configured" on a landscape where a connector worked.
+
+
+# Distinct name: _ECC_ENV is already defined above for the shared ECC fixtures, and redefining it
+# here would shadow it for every test in the file.
+_SERVES_ENV = {"PW": "secret", "EPW": "esecret", "SPW": "ssecret"}
+
+
+def _write_serves_profiles(tmp_path: Path, ecc_block: str) -> Path:
+    """Minimal valid profiles file. Passwords are ${VAR} refs because inline ones are refused."""
+    profiles = tmp_path / "profiles.yaml"
+    profiles.write_text(
+        "systems:\n"
+        "  prd:\n"
+        "    host: h\n"
+        "    port: 30015\n"
+        "    user: u\n"
+        "    password: ${PW}\n"
+        "ecc_systems:\n" + ecc_block,
+        encoding="utf-8",
+    )
+    return profiles
+
+
+def test_ecc_profile_serves_defaults_to_empty(tmp_path: Path) -> None:
+    """Empty is the safe default: a sandbox must not be picked up as a real source."""
+    profiles = _write_serves_profiles(
+        tmp_path,
+        "  ecc_sandbox:\n"
+        "    host: sh\n    port: 8001\n    client: '300'\n    user: su\n    password: ${SPW}\n",
+    )
+    manager = ProfileManager(profiles, env=_SERVES_ENV)
+    assert manager.get_ecc("ecc_sandbox").serves == []
+
+
+def test_ecc_profile_declares_which_bw_systems_it_serves(tmp_path: Path) -> None:
+    profiles = _write_serves_profiles(
+        tmp_path,
+        "  ecc_dev:\n"
+        "    host: eh\n    port: 8443\n    client: '300'\n    user: eu\n    password: ${EPW}\n"
+        "    serves: [prd]\n"
+        "  ecc_sandbox:\n"
+        "    host: sh\n    port: 8001\n    client: '300'\n    user: su\n    password: ${SPW}\n",
+    )
+    manager = ProfileManager(profiles, env=_SERVES_ENV)
+    assert manager.get_ecc("ecc_dev").serves == ["prd"]
+    # The sandbox declares nothing, so it can never be resolved as the source for a BW system.
+    assert manager.get_ecc("ecc_sandbox").serves == []

@@ -238,12 +238,18 @@ class EccConnector:
 
     # --- source retrieval ------------------------------------------------------------------
 
-    def fetch_source(self, object_name: str) -> tuple[AdtResponse, str]:
-        """Fetch one ABAP include's source, returning the response and the path that served it.
+    def fetch_source(
+        self, object_name: str, *, order: tuple[str, ...] = ("includes", "programs")
+    ) -> tuple[AdtResponse, str]:
+        """Fetch one ABAP object's source, returning the response and the path that served it.
 
         Tries the include path first, then the program path: a customer exit include is registered
         as an include on most systems but as a program on some, and guessing wrong looks identical
         to "the enhancement does not exist".
+
+        ``order`` reverses that preference for objects known to be standalone programs - a satellite
+        exit program, for instance. The wrong order still finds the object, but spends an extra 404
+        round trip per object, which matters when hundreds are probed.
         """
         if self._profile is None or self._fetcher is None:
             raise AdtError("ECC connector is not configured")
@@ -251,14 +257,24 @@ class EccConnector:
         root = self._profile.adt_root.rstrip("/")
         attempted: list[str] = []
         response: AdtResponse | None = None
-        for segment in ("includes", "programs"):
+        for segment in order:
             path = f"{root}/programs/{segment}/{object_name.lower()}/source/main"
             attempted.append(path)
             response = self._fetcher.get_text(path, params)
             if response.status != _NOT_FOUND:
                 return response, path
-        # Both 404: report the include path, which is the conventional location.
+        # Every candidate 404: report the first, which is the conventional location for this kind.
         return (response or AdtResponse(_NOT_FOUND, "")), attempted[0]
+
+    @property
+    def satellite_program_prefixes(self) -> list[str]:
+        """Configured satellite-program prefixes; empty when the profile declares none."""
+        return list(self._profile.satellite_program_prefixes) if self._profile else []
+
+    @property
+    def max_satellite_fetches(self) -> int:
+        """Ceiling on satellite probe requests per inventory call."""
+        return self._profile.max_satellite_fetches if self._profile else 0
 
     @staticmethod
     def classify_status(status: int) -> ExitUnavailableReason | None:

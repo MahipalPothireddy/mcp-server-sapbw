@@ -453,20 +453,41 @@ class ServerRuntime:
             self._cache(system),
         )
 
-    def _ecc_connector(self, name: str | None = None) -> EccConnector:
-        """Build the ECC connector for a named profile, or the sole one if only one is configured.
+    def _ecc_connector(
+        self, name: str | None = None, *, bw_system: str | None = None
+    ) -> EccConnector:
+        """Build the ECC connector: a named profile, the one declaring ``bw_system``, or none.
 
-        With several ECC profiles and no name, no connector is returned: which source system feeds a
-        given BW system is not derivable from the profiles file, and picking one would be a guess.
+        Resolution order, most explicit first:
+
+        1. ``name`` - the caller named a profile.
+        2. ``bw_system`` - exactly one profile declares ``serves: [<that system>]``.
+        3. the sole configured profile, when there is only one.
+
+        Anything else returns an unconfigured connector, so a connector-gated scenario reports why
+        rather than reading the wrong system. What changed here: several ECC profiles and no name
+        previously *always* fell through to unconfigured, which left scenario 9.6 permanently
+        unpopulated even though a working connector was present. The mapping is now declared in the
+        profile rather than guessed or given up on.
         """
         names = self._profiles.ecc_names()
-        chosen = name or (names[0] if len(names) == 1 else None)
+        chosen = name
+        if chosen is None and bw_system is not None:
+            serving = [n for n in names if bw_system in self._profiles.get_ecc(n).serves]
+            # Exactly one, or it is ambiguous again and declining is still the right answer.
+            chosen = serving[0] if len(serving) == 1 else None
+        if chosen is None and len(names) == 1:
+            chosen = names[0]
         if chosen is None:
             return EccConnector()
         return EccConnector(self._profiles.get_ecc(chosen))
 
-    def _registry(self) -> ConnectorRegistry:
-        """Connector registry for the analyzers.
+    def _registry(self, bw_system: str | None = None) -> ConnectorRegistry:
+        """Connector registry for the analyzers, for a given BW system.
+
+        ``bw_system`` lets the ECC connector be resolved from the profile that declares it serves
+        that system, which is what makes the connector-gated scenarios populate on a landscape with
+        several source systems configured.
 
         Each connector appears only when configured; otherwise the connector-gated scenarios report
         "not configured" with the reason rather than guessing. The BI connector is vendor-neutral —
@@ -474,7 +495,7 @@ class ServerRuntime:
         populate for Tableau, Power BI, SAC, Looker or Qlik through the same path.
         """
         configured: list[Any] = []
-        ecc = self._ecc_connector()
+        ecc = self._ecc_connector(bw_system=bw_system)
         if ecc.is_configured():
             configured.append(ecc)
         inventory = self._profiles.bi_inventory_path()
@@ -491,7 +512,7 @@ class ServerRuntime:
             self._connection(system),
             self.capability(system),
             self._cache(system),
-            registry=self._registry(),
+            registry=self._registry(system),
         )
 
     def docgen(self, system: str) -> DocGenerator:
@@ -499,7 +520,7 @@ class ServerRuntime:
             self._connection(system),
             self.capability(system),
             self._cache(system),
-            registry=self._registry(),
+            registry=self._registry(system),
         )
 
     def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
@@ -1236,7 +1257,9 @@ def bw_list_extractor_enhancements(
 
 @_readonly_tool
 def bw_get_extractor_exit_code(
-    ecc_system: str | None = None, include_source: bool = False
+    ecc_system: str | None = None,
+    include_source: bool = False,
+    datasources: list[str] | None = None,
 ) -> ExitInventory | ConnectorUnavailable:
     """The ABAP behind extractor enhancements, read from the source system over ADT.
 
@@ -1247,6 +1270,16 @@ def bw_get_extractor_exit_code(
     exist is reported as absent, which means no enhancement of that DataSource kind is implemented;
     a slot that could not be read is reported as unknown rather than absent.
 
+    **When the include looks empty, do not conclude the enhancement is trivial.** A common pattern
+    builds a program name from the DataSource and calls it (``PERFORM ... IN PROGRAM (name)``),
+    which ABAP resolves at runtime, so the logic is unreachable from the include. That dispatch is
+    detected and reported as ``dynamic_dispatch``, and passing ``datasources`` resolves each
+    ``<prefix><DATASOURCE>`` program and analyses it — one program per DataSource, so its table
+    reads and per-record SELECTs attribute exactly. Use the output of
+    ``bw_get_enhancement_inventory`` for that list. Each candidate is one request against the source
+    system, bounded by the profile's ``max_satellite_fetches``; when the bound binds, the shortfall
+    is reported as a caveat.
+
     The connection is GET-only and takes no ADT locks. ``ecc_system`` names an ``ecc_systems``
     profile and may be omitted when exactly one is configured. Full ABAP is opt-in via
     ``include_source`` and is capped; the analysis always covers the whole include.
@@ -1254,7 +1287,7 @@ def bw_get_extractor_exit_code(
     service = runtime().exit_analysis(ecc_system)
     if isinstance(service, ConnectorUnavailable):
         return service
-    return service.inventory(include_source=include_source)
+    return service.inventory(include_source=include_source, datasources=datasources)
 
 
 @_readonly_tool

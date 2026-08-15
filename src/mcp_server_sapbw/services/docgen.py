@@ -436,6 +436,11 @@ class DocGenerator(Repository):
                 "",
                 "## Sections",
                 "",
+                # 00-requirements is not written by this generator - it is where hand-written
+                # scenario answers live. Linked anyway, and first, because those pages are the
+                # narrative entry point and an unlinked page is one nobody finds. The link is
+                # harmless when the directory is absent.
+                "0. [Requirement answers](00-requirements/) - hand-written, per scenario",
                 "1. [Inventory](01-inventory/index.md)",
                 "2. [Process chains](02-process-chains/index.md)",
                 "3. [Lineage](03-lineage/index.md)",
@@ -1294,11 +1299,15 @@ class DocGenerator(Repository):
         lines.append("")
         for finding in report.findings:
             objects = ", ".join(finding.affected_objects[:8]) or "-"
-            lines += [
-                f"### [{finding.severity}] {finding.title}",
-                f"- Affected: {objects}",
-                f"- Recommendation: {finding.recommendation}",
-            ]
+            lines.append(f"### [{finding.severity}] {finding.title}")
+            lines.append(f"- Affected: {objects}")
+            # Detail carries the evidence behind the finding - the measured values, which code was
+            # read, and what was checked and found absent. Omitting it left the page with a
+            # recommendation and no way to see what it rested on, which is the opposite of the
+            # provenance the corpus exists to provide.
+            if finding.detail:
+                lines.append(f"- Evidence: {finding.detail}")
+            lines.append(f"- Recommendation: {finding.recommendation}")
             if finding.unpopulated_reason:
                 lines.append(f"- Unpopulated: {finding.unpopulated_reason}")
             lines.append("")

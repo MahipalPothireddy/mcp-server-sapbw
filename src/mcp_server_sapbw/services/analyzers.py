@@ -26,7 +26,7 @@ from ..connectors.base import ConnectorRegistry
 from ..connectors.bi import BiConnector
 from ..connectors.ecc import EccConnector
 from ..models.chains import FrequencyClass, ScheduleMatrixEntry
-from ..models.ecc import ExitInventory
+from ..models.ecc import ExitBranch, ExitInventory
 from ..models.findings import Finding, ScenarioReport, Severity
 from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
@@ -87,10 +87,15 @@ def _clean(value: Any) -> str | None:
 
 
 def _exit_index(exits: Any) -> dict[str, list[Any]]:
-    """``{datasource: [branch, ...]}`` across every readable exit slot.
+    """``{datasource: [(code_id, branch), ...]}`` across every readable exit slot and satellite.
 
     Keyed on the branch rather than the slot so a finding's risk reflects only the code that runs
-    for that DataSource. ``exit_include`` is carried on the branch tuple for citation.
+    for that DataSource. ``code_id`` is the include or satellite program name, carried for citation.
+
+    A satellite program is folded in as a branch of its own. It is a stronger form of the same fact
+    - one DataSource's exit logic, isolated - so the aggregation downstream needs no special case,
+    and a DataSource whose include branch is empty because the logic was dispatched at runtime stops
+    reading as "enhanced but does nothing".
     """
     index: dict[str, list[Any]] = {}
     if exits is None:
@@ -100,6 +105,36 @@ def _exit_index(exits: Any) -> dict[str, list[Any]]:
             continue
         for branch in slot.branches:
             index.setdefault(branch.datasource, []).append((slot.include_name, branch))
+    for satellite in getattr(exits, "satellites", []):
+        if not satellite.available:
+            continue
+        index.setdefault(satellite.datasource, []).append(
+            (
+                satellite.program_name,
+                ExitBranch(
+                    datasource=satellite.datasource,
+                    resolved=True,
+                    line_count=satellite.line_count,
+                    table_reads=satellite.table_reads,
+                    per_record_selects=satellite.per_record_selects,
+                    anti_pattern_kinds=satellite.anti_pattern_kinds,
+                    unresolved_call_count=satellite.unresolved_call_count,
+                ),
+            )
+        )
+    return index
+
+
+def _satellite_index(exits: Any) -> dict[str, list[Any]]:
+    """``{datasource: [satellite, ...]}`` including the ones that turned out not to exist.
+
+    A probe that came back ``absent`` is kept because it changes what can be said: "no satellite
+    program exists for this DataSource" is a measurement, whereas omitting it would leave the reader
+    unable to tell a checked absence from an unchecked one.
+    """
+    index: dict[str, list[Any]] = {}
+    for satellite in getattr(exits, "satellites", []) or []:
+        index.setdefault(satellite.datasource, []).append(satellite)
     return index
 
 
@@ -915,11 +950,17 @@ class Analyzers(Repository):
         if isinstance(inventory, UnsupportedResult):
             return inventory
         reason = self._registry.unpopulated_reason("ecc")
-        exits = None if reason else self._exit_evidence()
+        # BW holds the authoritative list of enhanced DataSources, so it is BW that supplies the
+        # satellite candidates. Under runtime dispatch a satellite can exist for a DataSource the
+        # exit include never names, which is precisely the case a source-only list would miss.
+        candidates = [item.datasource for item in inventory.enhanced if item.datasource]
+        exits = None if reason else self._exit_evidence(candidates)
         exit_index = _exit_index(exits)
 
+        satellite_index = _satellite_index(exits)
         findings = [
-            self._enhancement_finding(item, exit_index, reason) for item in inventory.enhanced
+            self._enhancement_finding(item, exit_index, satellite_index, reason)
+            for item in inventory.enhanced
         ]
         caveats = [
             *inventory.caveats,
@@ -935,6 +976,13 @@ class Analyzers(Repository):
                 f"{exits.client}: {exits.available_count} of 4 slot(s) implemented, dispatching on "
                 f"{len(exits.handled_datasources)} DataSource(s)."
             )
+            if exits.satellite_prefixes:
+                caveats.append(
+                    f"{exits.satellites_found_count} per-DataSource exit program(s) found from "
+                    f"{exits.satellite_candidates_considered} candidate(s). Candidates are the "
+                    "DataSources BW reports as enhanced, so a satellite program serving a "
+                    "DataSource with no appended field is not probed and would not appear here."
+                )
         return ScenarioReport(
             scenario="9.6",
             title=SCENARIO_TITLES["9.6"],
@@ -945,22 +993,28 @@ class Analyzers(Repository):
             caveats=caveats,
         )
 
-    def _exit_evidence(self) -> ExitInventory | None:
+    def _exit_evidence(self, datasources: list[str] | None = None) -> ExitInventory | None:
         """Read the extractor-exit ABAP, or ``None`` when the connector cannot supply it."""
         connector = self._registry.get("ecc")
         if not isinstance(connector, EccConnector):
             return None
         try:
-            return ExitAnalysisService(connector).inventory()
+            return ExitAnalysisService(connector).inventory(datasources=datasources)
         except Exception:
             # A source-system outage must not fail a BW scenario; the finding degrades to the
             # BW-only evidence instead, and the caveat list simply omits the exit summary.
             return None
 
     def _enhancement_finding(
-        self, item: Any, exit_index: dict[str, list[Any]], reason: str | None
+        self,
+        item: Any,
+        exit_index: dict[str, list[Any]],
+        satellite_index: dict[str, list[Any]],
+        reason: str | None,
     ) -> Finding:
         entries = exit_index.get(item.datasource, [])
+        satellites = satellite_index.get(item.datasource, [])
+        live_satellites = [s for s in satellites if s.available]
         confirmed = bool(entries)
         detail = (
             f"{item.customer_field_count} customer-namespace field(s) appended to the "
@@ -986,46 +1040,12 @@ class Analyzers(Repository):
             "Re-verify after any source-system upgrade."
         )
         if confirmed:
-            reads, per_record, resolved = _exit_risk(entries)
-            includes = sorted({include for include, _ in entries})
-            metrics["exit_confirmed"] = True
-            metrics["exit_includes"] = includes
-            metrics["exit_branch_resolved"] = resolved
-            metrics["exit_table_reads"] = reads
-            metrics["exit_per_record_selects"] = per_record
-            detail += (
-                f" The exit code was read: {', '.join(includes)} dispatches on this DataSource"
+            suffix, severity, recommendation = self._exit_evidence_detail(
+                entries, live_satellites, metrics, severity
             )
-            if resolved:
-                detail += f" and its branch reads {len(reads)} table(s)."
-            else:
-                detail += (
-                    ", but its branch could not be delimited, so no table read is attributed to it."
-                )
-            if per_record:
-                severity = "high"
-                detail += (
-                    f" {per_record} SELECT(s) sit inside a LOOP in that branch, so the read cost "
-                    "scales with extract volume."
-                )
-                recommendation = (
-                    "Rework the per-record SELECT(s) in the exit into a single set-based read "
-                    "before the loop (FOR ALL ENTRIES or a sorted buffer table). Confirm the "
-                    f"table(s) read belong to this functional area: {', '.join(reads) or 'none'}."
-                )
-            elif resolved:
-                recommendation = (
-                    "Confirm the table(s) the exit branch reads belong to this functional area — a "
-                    f"read into another team's data is a coordination risk: "
-                    f"{', '.join(reads) or 'none'}."
-                )
+            detail += suffix
         elif reason is None:
-            metrics["exit_confirmed"] = False
-            detail += (
-                " The exit code was read but does not dispatch on this DataSource, so the "
-                "enhancement is implemented elsewhere (a BAdI, a different include, or a dynamic "
-                "dispatch this parser cannot follow)."
-            )
+            detail += self._exit_absent_detail(satellites, metrics)
         return Finding(
             scenario="9.6",
             severity=severity,
@@ -1038,6 +1058,103 @@ class Analyzers(Repository):
             detail=detail,
             metrics=metrics,
             unpopulated_reason=reason,
+        )
+
+    @staticmethod
+    def _exit_evidence_detail(
+        entries: list[Any],
+        live_satellites: list[Any],
+        metrics: dict[str, Any],
+        severity: Severity,
+    ) -> tuple[str, Severity, str]:
+        """Describe what the exit code does for one DataSource, and re-rate it accordingly."""
+        reads, per_record, resolved = _exit_risk(entries)
+        satellite_names = sorted(s.program_name for s in live_satellites)
+        code_ids = sorted({code_id for code_id, _ in entries})
+        includes = [name for name in code_ids if name not in satellite_names]
+        unguarded_fae = sum(s.unguarded_for_all_entries for s in live_satellites)
+        metrics.update(
+            exit_confirmed=True,
+            exit_includes=includes,
+            exit_branch_resolved=resolved,
+            exit_table_reads=reads,
+            exit_per_record_selects=per_record,
+        )
+        if satellite_names:
+            metrics["exit_satellite_programs"] = satellite_names
+            metrics["exit_satellite_unguarded_for_all_entries"] = unguarded_fae
+            # The satellite is the more precise citation: one program, one DataSource, so its reads
+            # need no hedging about which branch actually runs.
+            detail = (
+                " The exit code was read: this DataSource's logic lives in its own program "
+                f"{', '.join(satellite_names)}, reached by a runtime-named dispatch from "
+                f"{', '.join(includes) or 'the exit include'}, and reads {len(reads)} table(s)."
+            )
+        elif resolved:
+            detail = (
+                f" The exit code was read: {', '.join(code_ids)} dispatches on this DataSource and "
+                f"its branch reads {len(reads)} table(s)."
+            )
+        else:
+            detail = (
+                f" The exit code was read: {', '.join(code_ids)} dispatches on this DataSource, "
+                "but its branch could not be delimited, so no table read is attributed to it."
+            )
+
+        if unguarded_fae:
+            # Reported but deliberately not escalated. This count is an upper bound - an sy-subrc
+            # test after filling the driver table is a guard the parser does not follow - and
+            # raising severity on a signal that over-reports would push genuine findings down the
+            # page. The per-record SELECT below is exact, and that is what moves severity.
+            detail += (
+                f" Up to {unguarded_fae} FOR ALL ENTRIES read(s) there have no is-not-initial "
+                "guard, which would read the whole table if the driver were empty; verify each, as "
+                "an sy-subrc check counts as guarded and is not detected."
+            )
+
+        recommendation = (
+            "Review the source-system exit for this DataSource: confirm which tables it reads (a "
+            "read into another team's data is a coordination risk) and whether it does per-record "
+            "SELECTs (a performance risk that scales with extract volume). Re-verify after any "
+            "source-system upgrade."
+        )
+        if per_record:
+            severity = "high"
+            detail += (
+                f" {per_record} SELECT(s) sit inside a LOOP, so the read cost scales with extract "
+                "volume."
+            )
+            recommendation = (
+                "Rework the per-record SELECT(s) in the exit into a single set-based read before "
+                "the loop (FOR ALL ENTRIES or a sorted buffer table). Confirm the table(s) read "
+                f"belong to this functional area: {', '.join(reads) or 'none'}."
+            )
+        elif resolved:
+            recommendation = (
+                "Confirm the table(s) the exit code reads belong to this functional area — a read "
+                f"into another team's data is a coordination risk: {', '.join(reads) or 'none'}."
+            )
+        return detail, severity, recommendation
+
+    @staticmethod
+    def _exit_absent_detail(satellites: list[Any], metrics: dict[str, Any]) -> str:
+        """Say what was checked when the exit turns out not to carry this DataSource."""
+        metrics["exit_confirmed"] = False
+        probed = sorted(s.program_name for s in satellites)
+        if not probed:
+            return (
+                " The exit code was read but does not dispatch on this DataSource, so the "
+                "enhancement is implemented elsewhere (a BAdI, a different include, or a dynamic "
+                "dispatch this parser cannot follow)."
+            )
+        # Both routes were checked and both came up empty, which is a measurement rather than a
+        # shrug, and it narrows where the logic can be.
+        metrics["exit_satellite_probed"] = probed
+        return (
+            " The exit code was read and does not dispatch on this DataSource, and no "
+            f"per-DataSource exit program exists either ({', '.join(probed)} were checked and are "
+            "absent), so the enhancement is implemented somewhere neither route reaches — a BAdI, "
+            "or a class-based dispatch."
         )
 
     def _exit_only_findings(self, exits: Any, declared: set[str]) -> list[Finding]:
