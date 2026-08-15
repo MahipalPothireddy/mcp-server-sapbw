@@ -27,6 +27,7 @@ _TABLES = {
     "element_text": "RSZELTTXT",
     "element_range": "RSZRANGE",
     "element_select": "RSZSELECT",
+    "element_calc": "RSZCALC",
     "global_variable": "RSZGLOBV",
     "transformation": "RSTRAN",
     "dtp": "RSBKDTP",
@@ -49,6 +50,15 @@ _RANGE = {  # ELTUID -> [(IOBJNM, SIGN, OPT, LOW, HIGH, LOWFLAG, HIGHFLAG)]
     "E_CHAR": [("MATERIAL", "I", "EQ", "M100", "", "1", "0")],  # literal (flag 1)
 }
 _SELECT = {"E_RKF": ["AMOUNT"], "E_CHAR": ["MATERIAL"]}
+# RSZCALC per element, ordered by STEPNR:
+#   (AGGRGEN, AGGREXC, AGGRCHA, AGGRCHA2, AGGRCHA3, AGGRCHA4, AGGRCHA5, AGGREXCLUDE)
+# E_RKF counts distinct materials, so its value is NOT the sum of the underlying rows.
+_CALC: dict[str, list[tuple[Any, ...]]] = {
+    "E_RKF": [
+        ("SUM", "", "", "", "", "", "", ""),
+        ("", "CNT", "MATERIAL", "PLANT", "", "", "", ""),
+    ],
+}
 _GLOBV = {"USD_VAR": ("1", "3", "CURRENCY", "")}  # VPROCTP 3 = customer exit
 _TRANS_BY_TARGET = {
     "SALES_CUBE": [("SALES_DSO", "ODSO", "TR1")],
@@ -85,6 +95,9 @@ class ScriptedConnection:
         if "RSZSELECT" in sql:
             ids = _in_params(sql, params)
             return [(o,) for k, objs in _SELECT.items() if k in ids for o in objs]
+        if "RSZCALC" in sql:
+            ids = _in_params(sql, params)
+            return [(k, *row) for k, rows in _CALC.items() if k in ids for row in rows]
         if "RSZGLOBV" in sql:
             ids = _in_params(sql, params)
             return [(k, *v) for k, v in _GLOBV.items() if k in ids]
@@ -274,3 +287,92 @@ def test_classify_origin_is_a_pure_name_reading() -> None:
 def test_unsupported_without_query_dir() -> None:
     result = _repo(present={"element_dir"}).get_query("QUERY_SALES")
     assert isinstance(result, UnsupportedResult)
+
+
+# --- aggregation on query elements (RSZCALC) ---------------------------------------------------
+
+
+def _element(eltuid: str) -> Any:
+    query = _repo().get_query("QUERY_SALES")
+    assert not isinstance(query, UnsupportedResult)
+    return next(e for e in query.elements if e.eltuid == eltuid)
+
+
+def test_calc_step_count_is_populated() -> None:
+    """The field existed but nothing filled it, because RSZCALC was never read."""
+    assert _element("E_RKF").calc_step_count == 2
+    assert _element("E_CHAR").calc_step_count == 0
+
+
+def test_exception_aggregation_is_attached_to_the_element() -> None:
+    exc = _element("E_RKF").exception_aggregation
+    assert exc is not None
+    assert exc.behaviour.code == "CNT"
+    assert exc.behaviour.label == "Counter (all values)"
+    assert [r.name for r in exc.reference_characteristics] == ["MATERIAL", "PLANT"]
+    assert exc.reproducible_by_summation is False
+
+
+def test_standard_aggregation_comes_from_the_first_step() -> None:
+    standard = _element("E_RKF").standard_aggregation
+    assert standard is not None
+    assert standard.code == "SUM"
+    assert standard.label == "Summation"
+
+
+def test_element_without_calc_rows_has_no_aggregation() -> None:
+    assert _element("E_CHAR").exception_aggregation is None
+    assert _element("E_CHAR").standard_aggregation is None
+
+
+def test_query_caveat_warns_that_totals_will_not_match() -> None:
+    query = _repo().get_query("QUERY_SALES")
+    assert not isinstance(query, UnsupportedResult)
+    joined = " ".join(query.caveats)
+    assert "exception aggregation" in joined
+    assert "CNT" in joined
+    assert "not reproduced by adding the underlying rows up" in joined
+
+
+def test_no_aggregation_caveat_when_everything_sums() -> None:
+    """A query whose elements all sum normally must not carry a scary caveat."""
+    original = dict(_CALC)
+    _CALC.clear()
+    _CALC["E_RKF"] = [("SUM", "SUM", "MATERIAL", "", "", "", "", "")]
+    try:
+        query = _repo().get_query("QUERY_SALES")
+        assert not isinstance(query, UnsupportedResult)
+        assert not any("exception aggregation" in c for c in query.caveats)
+        exc = next(e for e in query.elements if e.eltuid == "E_RKF").exception_aggregation
+        assert exc is not None
+        assert exc.reproducible_by_summation is True
+    finally:
+        _CALC.clear()
+        _CALC.update(original)
+
+
+def test_disagreeing_steps_are_reported_not_silently_resolved() -> None:
+    original = dict(_CALC)
+    _CALC.clear()
+    _CALC["E_RKF"] = [
+        ("", "CNT", "MATERIAL", "", "", "", "", ""),
+        ("", "LAS", "CALDAY", "", "", "", "", ""),
+    ]
+    try:
+        exc = _element("E_RKF").exception_aggregation
+        assert exc is not None
+        assert exc.behaviour.code == "CNT"  # first step wins
+        assert "different exception aggregations" in (exc.note or "")
+    finally:
+        _CALC.clear()
+        _CALC.update(original)
+
+
+def test_missing_calc_table_degrades_quietly() -> None:
+    repo = QueriesRepository(
+        ScriptedConnection(), _capability(present=set(_TABLES) - {"element_calc"})
+    )
+    query = repo.get_query("QUERY_SALES")
+    assert not isinstance(query, UnsupportedResult)
+    assert all(e.exception_aggregation is None for e in query.elements)
+    assert all(e.calc_step_count == 0 for e in query.elements)

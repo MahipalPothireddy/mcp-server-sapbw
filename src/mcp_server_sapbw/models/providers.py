@@ -13,6 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .aggregation import KeyFigureAggregation
 from .description import Description
 from .provenance import Provenance
 
@@ -131,6 +132,9 @@ class Provider(BaseModel):
     fields: list[ProviderField] = Field(default_factory=list)
     part_providers: list[PartProviderRef] = Field(default_factory=list)
     composition_source: Literal["relational", "xml", "calc_view", "none"] = "none"
+    # Only for a key-figure InfoObject: how its number combines and in what unit. Absent for every
+    # other object type, and for a key figure whose RSDKYF row could not be read.
+    aggregation: KeyFigureAggregation | None = None
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 

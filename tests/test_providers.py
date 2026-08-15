@@ -11,7 +11,7 @@ from typing import Any
 
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
-from mcp_server_sapbw.models.providers import ObjectNotFound
+from mcp_server_sapbw.models.providers import ObjectNotFound, Provider
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 
 SCHEMA = "TESTSCHEMA"
@@ -30,6 +30,7 @@ _PROVIDER_TABLES = {
     "composite_text": "RSOHCPRT",
     "infoobject": "RSDIOBJ",
     "infoobject_text": "RSDIOBJT",
+    "keyfigure": "RSDKYF",
 }
 # HANA catalog views (schema SYS) needed for the calc-view route to CompositeProvider parts.
 _HANA_TABLES = {"hana_views": "VIEWS", "object_dependencies": "OBJECT_DEPENDENCIES"}
@@ -69,6 +70,12 @@ _CP_BASE_TABLES = [
 
 _IOBJ = {"MATERIAL_CHA": ("CHA", "ACT", "SD"), "AMOUNT_KYF": ("KYF", "ACT", "SD")}
 _IOBJ_TEXT = {"MATERIAL_CHA": [("E", "Material", "Material master characteristic")]}
+# RSDKYF: KYFTP, DATATP, AGGRGEN, AGGREXC, AGGRCHA, NCUMFL, FIXCUKY, FIXUNIT, UNINM, KYFSEMANTIC.
+# AMOUNT_KYF takes the LAST value along CALDAY, so its number is not the sum of the rows, and its
+# currency varies per record.
+_KYF = {
+    "AMOUNT_KYF": ("AMO", "CURR", "SUM", "LAS", "CALDAY", "", "", "", "DOC_CURRCY", ""),
+}
 
 
 def _rows_for_name(table: dict[str, Any], name: str) -> list[tuple[Any, ...]]:
@@ -133,6 +140,8 @@ class ScriptedConnection:
             return [(_CP_CALC_VIEW,)]
         if "OBJECT_DEPENDENCIES" in sql:
             return [(t,) for t in _CP_BASE_TABLES]
+        if "RSDKYF" in sql:
+            return _rows_for_name(_KYF, name)
         if "RSDIOBJT" in sql:
             return _rows_for_name(_IOBJ_TEXT, name)
         if "RSDIOBJ" in sql:
@@ -308,3 +317,59 @@ def test_unsupported_when_type_tables_absent() -> None:
     result = repo.describe("SALES_CUBE", object_type="infocube")
     assert isinstance(result, UnsupportedResult)
     assert result.status == "unsupported_on_release"
+
+
+# --- key-figure aggregation on bw_describe_object (RSDKYF) --------------------------------------
+
+
+def _described(name: str, present: set[str] | None = None) -> Provider:
+    provider = _repo(present).describe(name)
+    assert isinstance(provider, Provider)
+    return provider
+
+
+def test_characteristic_carries_no_aggregation() -> None:
+    """Aggregation is meaningless for a characteristic and must be absent, not defaulted."""
+    assert _described("MATERIAL_CHA").aggregation is None
+
+
+def test_key_figure_aggregation_is_read_and_decoded() -> None:
+    agg = _described("AMOUNT_KYF").aggregation
+    assert agg is not None
+    assert agg.key_figure == "AMOUNT_KYF"
+    assert agg.key_figure_type is not None and agg.key_figure_type.label == "Amount"
+    assert agg.default_aggregation is not None and agg.default_aggregation.code == "SUM"
+    assert agg.exception_aggregation is not None
+    assert agg.exception_aggregation.behaviour.code == "LAS"
+    assert agg.exception_aggregation.behaviour.label == "Last value"
+    assert [r.name for r in agg.exception_aggregation.reference_characteristics] == ["CALDAY"]
+
+
+def test_last_value_key_figure_is_reported_as_not_summable() -> None:
+    agg = _described("AMOUNT_KYF").aggregation
+    assert agg is not None
+    assert agg.summable is False
+    joined = " ".join(agg.summability_caveats)
+    assert "LAS" in joined
+    assert "CALDAY" in joined
+
+
+def test_summability_reasons_reach_the_provider_caveats() -> None:
+    """A caller reading only caveats must still learn the number cannot be added up."""
+    caveats = _described("AMOUNT_KYF").caveats
+    assert any("does not reproduce the reported number" in c for c in caveats)
+
+
+def test_varying_currency_is_surfaced() -> None:
+    agg = _described("AMOUNT_KYF").aggregation
+    assert agg is not None
+    assert agg.unit_infoobject == "DOC_CURRCY"
+    assert any("varies per record" in c for c in agg.summability_caveats)
+
+
+def test_unreadable_key_figure_aggregation_is_unknown_not_unrestricted() -> None:
+    """With RSDKYF absent, the answer is 'unknown', never an implied 'safe to sum'."""
+    present = (set(_PROVIDER_TABLES) | set(_HANA_TABLES)) - {"keyfigure"}
+    provider = _described("AMOUNT_KYF", present)
+    assert provider.aggregation is None
+    assert any("unknown rather than unrestricted" in c for c in provider.caveats)

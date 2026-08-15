@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .aggregation import AggregationRule, ExceptionAggregation
 from .provenance import Provenance
 
 # Element type from RSZELTDIR.DEFTP (decoded from DD07T).
@@ -112,6 +113,10 @@ class QueryElement(BaseModel):
     reusable: bool = False
     restrictions: list[Restriction] = Field(default_factory=list)
     calc_step_count: int = 0  # RSZCALC steps (CKF/formula definition size)
+    # How this element's number combines. Absent means RSZCALC records no aggregation for it, which
+    # is the normal case for a characteristic or a plain key-figure reference.
+    standard_aggregation: AggregationRule | None = None
+    exception_aggregation: ExceptionAggregation | None = None
     provenance: Provenance
 
 

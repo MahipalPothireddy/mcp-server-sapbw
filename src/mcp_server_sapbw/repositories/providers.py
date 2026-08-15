@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..models.aggregation import KeyFigureAggregation
 from ..models.description import Description
 from ..models.provenance import UnsupportedResult
 from ..models.providers import (
@@ -29,6 +30,7 @@ from ..models.providers import (
     ProviderType,
     classify_cube_type,
 )
+from ..services.aggregation import build_key_figure_aggregation
 from ..services.descriptions import DescriptionService
 from ..services.table_resolver import (
     ResolvedKind,
@@ -510,6 +512,16 @@ class ProvidersRepository(Repository):
             part_count=0,
             evidence_tables=["infoobject", "infoobject_text"],
         )
+        aggregation = self._key_figure_aggregation(name) if kind == "key_figure" else None
+        caveats: list[str] = []
+        if kind == "key_figure" and aggregation is None:
+            caveats.append(
+                "this is a key figure but its aggregation could not be read (RSDKYF is "
+                "unavailable or holds no active row), so whether its values can be summed is "
+                "unknown rather than unrestricted"
+            )
+        elif aggregation is not None and not aggregation.summable:
+            caveats.extend(aggregation.summability_caveats)
         return Provider(
             name=name,
             object_type="infoobject",
@@ -518,12 +530,61 @@ class ProvidersRepository(Repository):
             active=str(objstat).strip() == "ACT",
             application=_clean(appl),
             composition_source="none",
+            aggregation=aggregation,
             caveats=[
                 "attributes and navigation attributes are not resolved in this build "
-                "(RSDBCHATR / RSDATRNAV)"
+                "(RSDBCHATR / RSDATRNAV)",
+                *caveats,
             ],
             description=description,
             provenance=[self.provenance("infoobject", {"IOBJNM": name, "OBJVERS": "A"})],
+        )
+
+    def _key_figure_aggregation(self, name: str) -> KeyFigureAggregation | None:
+        """Read a key figure's aggregation and unit handling from ``RSDKYF``.
+
+        One read covers both questions, because they are the same question: a figure's number is
+        only meaningful together with how it combines and what it is denominated in.
+        """
+        if not self.capability.is_available("keyfigure"):
+            return None
+        rows = self.select(
+            self.dialect.build_select(
+                columns=[
+                    "KYFTP",
+                    "DATATP",
+                    "AGGRGEN",
+                    "AGGREXC",
+                    "AGGRCHA",
+                    "NCUMFL",
+                    "FIXCUKY",
+                    "FIXUNIT",
+                    "UNINM",
+                    "KYFSEMANTIC",
+                ],
+                from_logical="keyfigure",
+                where=["KYFNM = ?"],
+                params=[name],
+            )
+        )
+        if not rows:
+            return None
+        kyftp, datatp, aggrgen, aggrexc, aggrcha, ncumfl, fixcuky, fixunit, uninm, semantic = rows[
+            0
+        ]
+        return build_key_figure_aggregation(
+            key_figure=name,
+            kyftp=kyftp,
+            datatp=datatp,
+            aggrgen=aggrgen,
+            aggrexc=aggrexc,
+            aggrcha=aggrcha,
+            ncumfl=ncumfl,
+            fixcuky=fixcuky,
+            fixunit=fixunit,
+            uninm=uninm,
+            semantic=semantic,
+            provenance=self.provenance("keyfigure", {"KYFNM": name, "OBJVERS": "A"}),
         )
 
     # --- shared helpers ------------------------------------------------------------------

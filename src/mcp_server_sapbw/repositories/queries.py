@@ -10,11 +10,13 @@ tables are OBJVERS-versioned (auto ``OBJVERS='A'`` via the dialect).
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from ..core.dialect import quote_ident
+from ..models.aggregation import AggregationRule, ExceptionAggregation
 from ..models.provenance import UnsupportedResult
 from ..models.queries import (
     ElementRole,
@@ -34,6 +36,7 @@ from ..models.queries import (
     VariableKind,
     VariableProcessingType,
 )
+from ..services.aggregation import build_exception_aggregation, decode_query_aggregation
 from ..services.field_lineage import FieldLineageService
 from ..services.lineage import LineageService
 from .base import Repository
@@ -125,6 +128,20 @@ def _timestamp_to_date(value: Any) -> date | None:
 
 
 _MAX_LINEAGE_IOBJ = 100
+# RSZCALC rows pulled per query. An element can hold many calculation steps, so this is generous
+# relative to the 500-element tree cap while still bounding a pathological formula.
+_CALC_ROW_CAP = 5000
+
+
+@dataclass
+class _CalcAggregation:
+    """Aggregation accumulated across one element's RSZCALC calculation steps."""
+
+    step_count: int = 0
+    standard: AggregationRule | None = None
+    exception: ExceptionAggregation | None = None
+    # Steps of the same element declared different exception aggregations.
+    mixed_steps: bool = False
 
 
 class QueriesRepository(Repository):
@@ -240,9 +257,16 @@ class QueriesRepository(Repository):
         directory = self._element_directory(eltuids)
         texts = self._element_texts(list(eltuids))
         restrictions = self._restrictions(list(eltuids))
+        calc = self._calc_aggregation(list(eltuids))
 
         elements = [
-            self._build_element(uid, directory.get(uid), texts.get(uid), restrictions.get(uid, []))
+            self._build_element(
+                uid,
+                directory.get(uid),
+                texts.get(uid),
+                restrictions.get(uid, []),
+                calc.get(uid),
+            )
             for uid in sorted(eltuids)
         ]
         edges = [
@@ -273,7 +297,10 @@ class QueriesRepository(Repository):
             edges=edges,
             variables=variables,
             truncated=truncated,
-            caveats=["element tree capped"] if truncated else [],
+            caveats=[
+                *(["element tree capped"] if truncated else []),
+                *self._aggregation_caveats(elements),
+            ],
             provenance=self.provenance("query_dir", {"COMPUID": compuid, "OBJVERS": "A"}),
         )
 
@@ -283,6 +310,7 @@ class QueriesRepository(Repository):
         directory: tuple[Any, Any, Any] | None,
         text: tuple[str | None, str | None] | None,
         restrictions: list[Restriction],
+        calc: _CalcAggregation | None = None,
     ) -> QueryElement:
         deftp, mapname, reusable = directory if directory else (None, None, None)
         return QueryElement(
@@ -292,8 +320,92 @@ class QueriesRepository(Repository):
             description=(text or (None, None))[1] or (text or (None, None))[0],
             reusable=str(reusable).strip() == "X",
             restrictions=restrictions,
+            calc_step_count=calc.step_count if calc else 0,
+            standard_aggregation=calc.standard if calc else None,
+            exception_aggregation=calc.exception if calc else None,
             provenance=self.provenance("element_dir", {"ELTUID": uid, "OBJVERS": "A"}),
         )
+
+    # --- aggregation (RSZCALC) -----------------------------------------------------------
+
+    def _calc_aggregation(self, eltuids: list[str]) -> dict[str, _CalcAggregation]:
+        """Aggregation per element from ``RSZCALC``.
+
+        An element can hold several calculation steps, and exception aggregation sits on a step
+        rather than on the element. The first step that declares one is taken as the element's
+        aggregation, and a disagreement between steps is reported rather than silently resolved -
+        a formula whose steps aggregate differently cannot be summarised by one of them.
+        """
+        if not eltuids or not self.capability.is_available("element_calc"):
+            return {}
+        placeholders = ", ".join("?" for _ in eltuids)
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=[
+                        "ELTUID",
+                        "AGGRGEN",
+                        "AGGREXC",
+                        "AGGRCHA",
+                        "AGGRCHA2",
+                        "AGGRCHA3",
+                        "AGGRCHA4",
+                        "AGGRCHA5",
+                        "AGGREXCLUDE",
+                    ],
+                    from_logical="element_calc",
+                    where=[f"ELTUID IN ({placeholders})"],
+                    params=list(eltuids),
+                    order_by=["ELTUID", "STEPNR"],
+                ),
+                limit=_CALC_ROW_CAP,
+            )
+        )
+        found: dict[str, _CalcAggregation] = {}
+        for row in rows:
+            uid = _clean(row[0])
+            if uid is None:
+                continue
+            record = found.setdefault(uid, _CalcAggregation())
+            record.step_count += 1
+            if record.standard is None:
+                record.standard = decode_query_aggregation(row[1])
+            exception = build_exception_aggregation(
+                code=row[2], references=list(row[3:8]), exclude=row[8]
+            )
+            if exception is None:
+                continue
+            if record.exception is None:
+                record.exception = exception
+            elif record.exception.behaviour.code != exception.behaviour.code:
+                record.mixed_steps = True
+        for record in found.values():
+            if record.mixed_steps and record.exception is not None:
+                record.exception.note = (
+                    "calculation steps of this element declare different exception aggregations; "
+                    "the first is reported and the element cannot be characterised by it alone"
+                )
+        return found
+
+    @staticmethod
+    def _aggregation_caveats(elements: list[QueryElement]) -> list[str]:
+        """State plainly when the query holds figures that summation does not reproduce."""
+        non_summable = [
+            e
+            for e in elements
+            if e.exception_aggregation is not None
+            and not e.exception_aggregation.reproducible_by_summation
+        ]
+        if not non_summable:
+            return []
+        named = [e.name or e.eltuid for e in non_summable[:8]]
+        behaviours = sorted({e.exception_aggregation.behaviour.code for e in non_summable})  # type: ignore[union-attr]
+        return [
+            f"{len(non_summable)} element(s) carry exception aggregation "
+            f"({', '.join(behaviours)}), so their values are not reproduced by adding the "
+            "underlying rows up. Comparing such a figure against a summed total will differ "
+            f"legitimately: {', '.join(named)}"
+        ]
 
     # --- usage ---------------------------------------------------------------------------
 
