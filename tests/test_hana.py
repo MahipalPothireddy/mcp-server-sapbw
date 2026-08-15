@@ -162,7 +162,8 @@ def test_get_calc_view_lineage_resolves_bw_objects() -> None:
     assert dso.is_bw_generated is True
     assert dso.resolved_object == "SALES"
     assert dso.resolved_kind == "dso"
-    assert {"SALES", "MATERIAL"} <= set(lineage.resolved_bw_objects)
+    # "0MATERIAL", not "MATERIAL": a /BI0/ table name drops the SAP object's leading 0.
+    assert {"SALES", "0MATERIAL"} <= set(lineage.resolved_bw_objects)
 
 
 def test_get_hana_crossings_both_directions() -> None:

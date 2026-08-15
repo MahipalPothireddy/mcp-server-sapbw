@@ -243,8 +243,12 @@ class TableDependency(BaseModel):
     table: str  # physical table as written (e.g. /BIC/A<dso>00, /BI0/..., or a standard table)
     access: TableAccess = "read"
     is_bw_generated: bool = False  # /BIC/ or /BI0/ generated table
-    resolved_object: str | None = None  # heuristic BW object name (e.g. the DSO)
-    resolved_kind: str | None = None  # heuristic: 'dso' | 'infoobject' | ... (advisory)
+    resolved_object: str | None = None  # BW object name the table belongs to
+    resolved_kind: str | None = None  # 'dso' | 'adso' | 'infocube' | 'infoobject' | None
+    # 'confirmed' when the reading was checked against a catalogue of real object names,
+    # 'advisory' when it rests on the naming convention alone. Without this, a checked fact and a
+    # name-shaped guess are indistinguishable to the caller.
+    resolution_confidence: Literal["confirmed", "advisory"] | None = None
 
 
 class AntiPattern(BaseModel):

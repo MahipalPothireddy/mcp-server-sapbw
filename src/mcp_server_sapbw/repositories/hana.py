@@ -181,7 +181,7 @@ class HanaRepository(Repository):
                 continue
             seen.add(table)
             is_bw = _is_bw_generated(table)
-            obj, kind = _resolve_bw_table(table) if is_bw else (None, None)
+            obj, kind, _confidence = _resolve_bw_table(table) if is_bw else (None, None, None)
             if obj and obj not in resolved:
                 resolved.append(obj)
             base_tables.append(
@@ -315,7 +315,7 @@ class HanaRepository(Repository):
         resolved: str | None = None
         kind: str | None = None
         if _is_bw_generated(bw_object):
-            resolved, kind = _resolve_bw_table(bw_object)
+            resolved, kind, _confidence = _resolve_bw_table(bw_object)
             if resolved is not None:
                 resolution = "bic_table"
         elif (view := provider_views.get(bw_object)) is not None:

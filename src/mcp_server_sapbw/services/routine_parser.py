@@ -13,6 +13,7 @@ given the source lines and a provenance citation by the repository.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 
 from ..models.provenance import Provenance
 from ..models.transformations import (
@@ -23,15 +24,39 @@ from ..models.transformations import (
     TableDependency,
     UnresolvedRef,
 )
+from .table_resolver import resolve_table
 
 # Table after FROM/JOIN (captures /BIC/..., /BI0/..., or a plain table name).
 _FROM_RE = re.compile(r"\b(?:from|join)\s+([a-z0-9_/]+)", re.IGNORECASE)
 _SELECT_RE = re.compile(r"\bselect\b", re.IGNORECASE)
 _LOOP_OPEN_RE = re.compile(r"\b(loop\s+at|do|while)\b", re.IGNORECASE)
 _LOOP_CLOSE_RE = re.compile(r"\b(endloop|enddo|endwhile)\b", re.IGNORECASE)
-_FAE_RE = re.compile(r"\bfor\s+all\s+entries\s+in\s+@?\(?\s*([a-z0-9_<>]+)", re.IGNORECASE)
+_FAE_RE = re.compile(r"\bfor\s+all\s+entries\s+in\s+@?\(?\s*([a-z0-9_/<>]+)", re.IGNORECASE)
 _GUARD_RE = re.compile(
-    r"([a-z0-9_<>]+)\s+is\s+(not\s+)?initial|lines\(\s*([a-z0-9_<>]+)", re.IGNORECASE
+    # `(?:\[\])?` matters: `IF lt_keys[] IS NOT INITIAL` is the older and still common spelling, and
+    # without it the guard is missed and a guarded read is reported as unguarded.
+    r"([a-z0-9_<>]+)(?:\[\])?\s+is\s+(not\s+)?initial"
+    r"|lines\(\s*([a-z0-9_<>]+)"
+    r"|describe\s+table\s+([a-z0-9_<>]+)",
+    re.IGNORECASE,
+)
+# Driver tables the framework itself fills before calling the routine, so a FOR ALL ENTRIES over one
+# of them cannot degenerate into a full-table read and needs no guard.
+#
+# This is not a style allowance. Flagging them produced 20 of 74 findings on a real extractor-exit
+# set - over a quarter of the report - each one describing a risk that cannot occur, which crowds
+# out the ones that can. C_T_DATA and I_T_DATA are the RSAP0001 exit's own data parameters;
+# SOURCE_PACKAGE and RESULT_PACKAGE are the transformation equivalents.
+_FRAMEWORK_FILLED = frozenset(
+    {
+        "c_t_data",
+        "i_t_data",
+        "i_data",
+        "source_package",
+        "result_package",
+        "<source_fields>",
+        "<result_fields>",
+    }
 )
 _CALL_FUNC_RE = re.compile(r"\bcall\s+function\s+'([^']+)'", re.IGNORECASE)
 _CALL_FUNC_DYN_RE = re.compile(r"\bcall\s+function\s+([a-z0-9_<>]+)", re.IGNORECASE)
@@ -62,22 +87,27 @@ def _strip_comments(lines: list[str]) -> list[tuple[int, str]]:
     return cleaned
 
 
-def _resolve_bw_table(table: str) -> tuple[str | None, str | None]:
-    """Best-effort map a /BIC/ or /BI0/ generated table to a BW object (advisory)."""
-    upper = table.upper()
-    for prefix in ("/BIC/", "/BI0/"):
-        if upper.startswith(prefix):
-            body = upper[len(prefix) :]
-            if not body:
-                return None, None
-            table_class, rest = body[0], body[1:]
-            name = rest.rstrip("0123456789") or rest
-            if table_class == "A":  # active DSO table (/BIC/A<dso>00)
-                return name, "dso"
-            if table_class in ("P", "Q", "X", "Y", "S", "T", "M", "H", "K"):  # master-data/SID/text
-                return name or body, "infoobject"
-            return name or body, None
-    return None, None
+def _resolve_bw_table(
+    table: str, catalog: Mapping[str, Iterable[str]] | None = None
+) -> tuple[str | None, str | None, str | None]:
+    """Map a generated table to its BW object via the shared resolver.
+
+    Returns ``(object_name, kind, confidence)``. ``confidence`` is ``'confirmed'`` only when the
+    reading was checked against a catalogue of real object names; otherwise ``'advisory'``.
+
+    This used to be a second, cruder implementation living here, and it was wrong in two ways that
+    a real system exposed. It stripped *every* trailing digit, so a family of ADSO active tables
+    named ``<ns>A<NAME>08`` + role suffix ``2``, ``<NAME>07`` + ``2`` and so on all collapsed onto
+    the same truncated stem - a name that exists in no catalogue - and it typed every ``A`` table as
+    a classic DSO, so an ADSO was never identified as one. Both are fixed by delegating to the
+    single resolver that knows the ADSO ``1``/``2``/``3`` and DSO ``00``/``40`` suffixes apart,
+    handles customer namespaces, and reports whether it confirmed the reading.
+    """
+    resolved = resolve_table(table, catalog)
+    if resolved.object_name is None:
+        return None, None, None
+    kind = None if resolved.kind == "unknown" else resolved.kind
+    return resolved.object_name, kind, resolved.confidence
 
 
 class RoutineParser:
@@ -90,12 +120,19 @@ class RoutineParser:
         kind: RoutineKind,
         lines: list[str],
         provenance: Provenance,
+        catalog: Mapping[str, Iterable[str]] | None = None,
     ) -> RoutineAnalysis:
+        """Analyse one routine.
+
+        ``catalog`` maps an object kind to the known object names of that kind. Supplying it lets a
+        table reading be *confirmed* against real objects instead of resting on the naming
+        convention; without it every resolution is reported as ``advisory``.
+        """
         cleaned = _strip_comments(lines)
         code_lines = [text for _, text in cleaned]
         joined = " ".join(code_lines)
 
-        table_deps = self._table_dependencies(joined)
+        table_deps = self._table_dependencies(joined, catalog)
         anti, complexity = self._scan_lines(cleaned)
         unresolved = self._unresolved_calls(cleaned)
         complexity.line_count = len(lines)
@@ -117,7 +154,9 @@ class RoutineParser:
             provenance=provenance,
         )
 
-    def _table_dependencies(self, joined: str) -> list[TableDependency]:
+    def _table_dependencies(
+        self, joined: str, catalog: Mapping[str, Iterable[str]] | None = None
+    ) -> list[TableDependency]:
         seen: dict[str, TableDependency] = {}
         for statement in joined.split("."):
             if not _SELECT_RE.search(statement):
@@ -126,14 +165,24 @@ class RoutineParser:
                 table = match.group(1).strip()
                 if not table or table in seen or table.lower() in ("table",):
                     continue
-                is_bw = table.startswith(("/BIC/", "/BI0/", "/bic/", "/bi0/"))
-                resolved, kind = _resolve_bw_table(table) if is_bw else (None, None)
+                # Any namespaced table is offered to the resolver, not just /BIC/ and /BI0/: a
+                # provider in its own namespace generates tables there too, and only asking about
+                # the two SAP namespaces left those reads permanently unresolved.
+                resolved, kind, confidence = (
+                    _resolve_bw_table(table, catalog)
+                    if table.startswith("/")
+                    else (None, None, None)
+                )
+                in_bw_namespace = table.upper().startswith(("/BIC/", "/BI0/"))
                 seen[table] = TableDependency(
                     table=table,
                     access="read",
-                    is_bw_generated=is_bw,
+                    # A /BIC/ or /BI0/ table is BW-generated whether or not its name resolved;
+                    # a customer-namespace table only counts as generated once it did.
+                    is_bw_generated=in_bw_namespace or resolved is not None,
                     resolved_object=resolved,
                     resolved_kind=kind,
+                    resolution_confidence=confidence,  # type: ignore[arg-type]
                 )
         return list(seen.values())
 
@@ -172,23 +221,40 @@ class RoutineParser:
 
     @staticmethod
     def _missing_for_all_entries(cleaned: list[tuple[int, str]]) -> list[AntiPattern]:
+        """Flag ``FOR ALL ENTRIES`` whose driver table has no emptiness guard.
+
+        An **upper bound**, and the opposite direction of travel from the table dependencies. The
+        guard forms recognised are ``IS [NOT] INITIAL``, ``lines( )`` and ``DESCRIBE TABLE``; a
+        routine that instead tests ``sy-subrc`` after filling the driver table is guarded in fact
+        but counted here, so the number is a ceiling on the risk rather than a measurement of it.
+        The driver table is named in the detail so a reviewer can settle each case without
+        re-reading the whole routine.
+        """
         guarded: set[str] = set()
         for _, code in cleaned:
             for match in _GUARD_RE.finditer(code):
-                name = match.group(1) or match.group(3)
+                name = match.group(1) or match.group(3) or match.group(4)
                 if name:
                     guarded.add(name.lower())
         flagged: list[AntiPattern] = []
         for line_no, code in cleaned:
             fae = _FAE_RE.search(code)
-            if fae and fae.group(1).lower() not in guarded:
-                flagged.append(
-                    AntiPattern(
-                        kind="missing_for_all_entries",
-                        line_no=line_no,
-                        detail="FOR ALL ENTRIES without an is-not-initial guard (empty reads all)",
-                    )
+            if fae is None:
+                continue
+            driver = fae.group(1).lower().lstrip("@").rstrip("[]")
+            if driver in guarded or driver in _FRAMEWORK_FILLED:
+                continue
+            flagged.append(
+                AntiPattern(
+                    kind="missing_for_all_entries",
+                    line_no=line_no,
+                    detail=(
+                        f"FOR ALL ENTRIES over {driver} with no is-not-initial guard; if it is "
+                        "empty the read returns the whole table. Upper bound: an sy-subrc check "
+                        "after filling it is a guard this parser does not follow."
+                    ),
                 )
+            )
         return flagged
 
     @staticmethod
