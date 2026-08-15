@@ -245,7 +245,7 @@ is **not** covered; check `bw_get_hana_crossings` before acting.
 |---|---|---|
 | `bw_get_source_systems` | `system` | Which systems feed this BW system, and of what kind |
 | `bw_list_extractor_enhancements` | `system`, `limit=50` | DataSources whose extract structure carries customer-namespace fields |
-| `bw_get_extractor_exit_code` | `ecc_system?`, `include_source=false` | The exit **ABAP behind** those enhancements, read from the source system over ADT |
+| `bw_get_extractor_exit_code` | `ecc_system?`, `include_source=false`, `datasources?` | The exit **ABAP behind** those enhancements, read from the source system over ADT |
 
 Topology is built from the logical systems the DataSources actually extract from, compared against
 the source-system registry — so it surfaces logical systems that DataSources reference but the
@@ -258,6 +258,26 @@ Reading exit ABAP needs an optional `ecc_systems` profile (see `profiles.example
 session so it takes no locks. Risk is attributed per `CASE` branch, not per include: one include
 serves every enhanced DataSource, so crediting the whole include's table reads to one of them would
 manufacture false findings.
+
+**An empty-looking include does not mean a trivial enhancement.** Many sites keep no logic in
+`ZXRSAU0n` at all: it builds a program name from the DataSource and calls it
+(`PERFORM ... IN PROGRAM (name)`), which ABAP resolves at runtime, so nothing a static reader sees
+reflects what the enhancement does. That dispatch is detected and reported as `dynamic_dispatch`, the
+naming rule is read out of the source rather than assumed, and passing `datasources` resolves each
+`<prefix><DATASOURCE>` satellite program and analyses it — one program per DataSource, so its table
+reads and per-record `SELECT`s attribute exactly. On the reference system the include's `CASE` named
+10 DataSources while 26 satellite programs existed. Probes are one GET each and bounded by
+`max_satellite_fetches` (default 400); a namespaced DataSource resolves with its namespace stripped
+(`/PARTNER/SOME_DS` → `<PREFIX>SOME_DS`), and a probe that finds nothing is reported as a checked
+absence rather than omitted.
+
+**No naming convention is assumed.** The prefix is read out of your own exit ABAP — whatever it
+concatenates — so nothing needs configuring, and any customer-namespace form works (`Z…`, `Y…`,
+`/PARTNER/…`). If your site uses a different prefix per DataSource kind, for example one for
+transaction data and another for master data, each is attributed to the exit slot whose dispatch
+produced it, so the distinction is reported rather than flattened. `satellite_program_prefixes` on
+the profile is a supplement for sites whose name-building the parser cannot read; it defaults to
+empty, and an empty list costs no requests.
 
 ### HANA layer
 

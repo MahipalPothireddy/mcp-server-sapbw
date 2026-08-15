@@ -79,10 +79,39 @@ systems:
 #     use_tls: true             # leave true: Basic auth over plain HTTP exposes the password
 #     ssl_validate_certificate: true
 #     timeout_seconds: 30
+#     # Which BW systems this source system feeds, by profile name. Needed only when more than
+#     # one ecc_systems entry exists: without it the resolver cannot tell which source belongs
+#     # to which BW system, declines to choose, and the ECC-gated scenario reports "connector
+#     # not configured" even though a working connection is right here. Empty means "never use
+#     # this profile automatically", which is the right default for a sandbox.
+#     serves: [prd]
 #     # For an internal-only system with no TLS listener, plain HTTP needs a second,
 #     # deliberate opt-in - use_tls: false alone is rejected:
 #     #   use_tls: false
 #     #   allow_plain_http: true
+#     # An older ICM may advertise no ECDHE cipher suite, which OpenSSL 3.x refuses at its
+#     # default security level - the handshake then fails even though the certificate is fine.
+#     # This admits those suites; encryption and certificate checking both stay on, and the
+#     # single concession is forward secrecy:
+#     #   allow_legacy_tls_ciphers: true
+#     # Some landscapes publish the ADT ICF node under a prefix:
+#     #   adt_root: /sap/bc/adt
+#     #
+#     # SATELLITE EXIT PROGRAMS. If ZXRSAU0n holds no logic and instead builds a program name
+#     # from the DataSource (PERFORM ... IN PROGRAM (name)), the real enhancement logic is in
+#     # those programs and no static read of the include can reach it.
+#     #
+#     # No naming convention is assumed, because sites differ. The rule is normally recovered
+#     # from the exit source itself - whatever prefix your ABAP concatenates - so nothing needs
+#     # setting here. If your site uses a different prefix per DataSource kind (say one for
+#     # transaction data and another for master data), each is attributed to the exit slot it
+#     # came from automatically. Supply prefixes only if the name is built in a way the parser
+#     # cannot read; any customer-namespace form works (Z..., Y..., /PARTNER/...):
+#     #   satellite_program_prefixes: [ZAA_, ZBB_]
+#     # Each candidate program is one GET, and a large landscape offers over a thousand, so
+#     # probing is capped. Raise it deliberately for full coverage; when it binds, the
+#     # shortfall is reported as a caveat rather than as "no satellite exists":
+#     #   max_satellite_fetches: 400
 #
 # Requires the optional extra:  pip install 'mcp-server-sapbw[ecc]'
 # The ADT user needs source-display authorisation and an active ADT ICF node.

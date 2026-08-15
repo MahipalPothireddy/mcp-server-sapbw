@@ -102,6 +102,15 @@ class EccProfile(BaseModel):
 
     name: str
     host: str
+    # Which BW profiles this source system feeds, by profile name (e.g. ["prd"]).
+    #
+    # Without this, a landscape with more than one ECC profile leaves the connector-gated scenarios
+    # permanently unpopulated. The resolver correctly refused to guess between profiles, but the
+    # consequence was scenario 9.6 reporting "connector not configured" on a landscape where a
+    # working connector existed. Declaring the mapping makes the choice explicit and auditable
+    # rather than either guessed or abandoned. Empty means "do not use for any BW system", which is
+    # the right default for a sandbox that must never be mistaken for the real source.
+    serves: list[str] = Field(default_factory=list)
     port: int = Field(gt=0, lt=65536)
     client: str = Field(pattern=r"^[0-9]{3}$")
     user: str
@@ -120,6 +129,26 @@ class EccProfile(BaseModel):
     timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     # ADT service root. Configurable because some landscapes expose ICF nodes under a prefix.
     adt_root: str = "/sap/bc/adt"
+    # Extra prefixes for per-DataSource "satellite" exit programs, in any customer-namespace form:
+    # "Z...", "Y..." or "/PARTNER/...".
+    #
+    # A common site pattern is for ZXRSAU0n to hold no logic of its own but to build a program name
+    # from the DataSource and dispatch into it (PERFORM ... IN PROGRAM (name)). The analyser derives
+    # these prefixes from the exit source when it can, so this is a supplement rather than the only
+    # route: it covers a site whose name is built in a way the parser cannot read. Empty is correct
+    # for a landscape that does not use the pattern - satellite resolution then costs no requests.
+    #
+    # No convention is assumed or defaulted, because there is no common one. Sites differ, and some
+    # use a different prefix per DataSource kind - one for transaction data, another for master
+    # data. That is handled without configuration: a derived prefix is attributed to the exit slot
+    # whose dispatch produced it, so the distinction is reported rather than flattened.
+    satellite_program_prefixes: list[str] = Field(default_factory=list)
+    # Ceiling on satellite ADT round trips per inventory call. Each candidate is one GET against a
+    # production source system, and a large landscape can offer over a thousand, so an accidental
+    # sweep is a real operational cost rather than just a slow answer. Raise it deliberately when
+    # full coverage is wanted; when it binds, the shortfall is reported as a caveat, never as "no
+    # satellite exists".
+    max_satellite_fetches: int = Field(default=400, ge=0, le=20000)
 
     @model_validator(mode="after")
     def _require_plain_http_opt_in(self) -> EccProfile:
@@ -230,6 +259,7 @@ def _build_ecc_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]
         return EccProfile(
             name=name,
             host=host,  # type: ignore[arg-type]
+            serves=[str(s) for s in (raw.get("serves") or [])],
             port=_resolve_port(raw, env, profile=name),
             client=client,  # type: ignore[arg-type]
             user=user,  # type: ignore[arg-type]
@@ -240,6 +270,12 @@ def _build_ecc_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]
             allow_legacy_tls_ciphers=bool(raw.get("allow_legacy_tls_ciphers", False)),
             timeout_seconds=float(raw.get("timeout_seconds", 30.0)),
             adt_root=adt_root or "/sap/bc/adt",
+            satellite_program_prefixes=[
+                str(p).strip().upper()
+                for p in (raw.get("satellite_program_prefixes") or [])
+                if str(p).strip()
+            ],
+            max_satellite_fetches=int(raw.get("max_satellite_fetches", 400)),
         )
     except ValueError as exc:
         # Pydantic validation text is safe here: it names fields, never the password value.

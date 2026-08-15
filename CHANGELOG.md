@@ -340,6 +340,97 @@ system, the system won and the correction is noted.
   276 entries across eight pages while per-page time fell from 587s to 2-19s. Lineage depth also
   dropped from 6 to 4, which is the depth the deepest documented flow shape actually needs.
 
+- **A second ECC profile disabled the ECC scenario entirely.** `_ecc_connector()` had no way to
+  decide which source system a BW system extracts from, so with more than one ECC profile configured
+  and no explicit name it fell through to an *unconfigured* connector. Scenario 9.6 then emitted only
+  its "Connector required" stub — permanently, and specifically in the landscape where the tool is
+  most useful, since anyone who registers dev alongside production has two profiles. The stub reads
+  as "nothing to connect to", not "I declined to choose", which is why it survived unnoticed while a
+  working connector sat in the same file. `EccProfile.serves: list[str]` now lets a profile declare
+  the BW systems it is the source for, and resolution runs most-explicit-first: an explicit `name`,
+  then the single profile declaring `serves: [<system>]`, then the sole profile when there is only
+  one. Ambiguity beyond that still declines, because reading the wrong system is worse than reading
+  none. On the reference system 9.6 went from 0 findings to **146 across 947 DataSources**, naming
+  the tables each exit branch reads (`0MATERIAL_ATTR` → `mara`, `klah`, `kssk`) rather than
+  recommending someone go look.
+
+  Two alternatives were rejected. Matching the BW side's `RSBASIDOC`/`RFCDES` entries against profile
+  hosts at runtime looks more automatic but fails open in the common cases — an RFC destination may
+  hold a load-balancing group or a bare IP where the profile has a hostname — and a mismatch
+  reproduces exactly the defect being fixed, silently. Defaulting to the first profile was rejected
+  because output that analyses the wrong system still looks complete.
+
+- **The hand-written requirement answers were unreachable from the index.** `00-requirements/` is
+  not written by the generator — it holds the per-scenario narrative — so the generated index did not
+  link it, leaving the corpus' entry point reachable only by knowing the path. The index now lists it
+  first, ahead of the generated sections, and the link is inert when the directory is absent.
+
+### Added — extractor-exit satellite programs: the layer a static read cannot see
+
+Reading `ZXRSAU01` and concluding what an enhancement does is unsound on a large class of systems,
+and the failure is silent. A widespread site pattern keeps the include almost logic-free: it builds a
+program name from the DataSource and calls into it — `CONCATENATE '<PREFIX>' i_datasource INTO prog`
+then `PERFORM ... IN PROGRAM (prog)`. ABAP resolves that name at *runtime*, so a static reader finds
+no table, no `FOR ALL ENTRIES` and no per-record `SELECT`, and reports the most confident-sounding
+wrong answer available: that the enhancement is trivial. On the reference system the include's `CASE`
+named **10** DataSources while **26** satellite programs existed, holding 74 `FOR ALL ENTRIES` reads
+and 62 distinct table dependencies — none of it reachable from the include.
+
+The dispatch is now read rather than stopped at. `PERFORM ... IN PROGRAM (var)` is detected and
+reported as `dynamic_dispatch`, the `CONCATENATE` literals beside it give the naming rule, and each
+`<prefix><DATASOURCE>` is resolved as a program in its own right. Because a satellite serves exactly
+one DataSource, its findings attribute exactly — none of the hedging that makes `CASE`-branch slicing
+deliberately conservative — so scenario 9.6 gained per-DataSource table reads it previously could
+only recommend somebody go and look for.
+
+Decisions worth stating, because the plausible alternative is wrong in each case:
+
+- **The naming rule is derived from the source, not configured.** `satellite_program_prefixes` exists
+  on the ECC profile for a site whose name-building the parser cannot read, but it is a fallback. A
+  configured convention would keep working after the convention changed, and would report absence
+  where it should report a rule it no longer recognises. Verified live: both prefixes were recovered
+  from the real `ZXRSAU01`/`ZXRSAU02` with the profile setting empty.
+- **Candidates come from BW, not from the exit.** Under runtime dispatch a satellite can exist for a
+  DataSource the include never names — that is the whole point — so deriving candidates from the
+  include would miss exactly the cases worth finding. BW holds the authoritative enhanced-DataSource
+  list, so BW supplies them, and 9.6 passes them through.
+- **A namespaced DataSource loses its namespace.** `/PARTNER/SOME_DS` is served by
+  `<PREFIX>SOME_DS`; a slash is legal only as a leading namespace, so pasting it onto a prefix
+  cannot produce a name. The first implementation rejected these outright and thereby reported "no
+  satellite" for four programs that were there to be read — caught only by checking the generated
+  names against the programs actually on the system.
+- **A checked absence is recorded, not omitted.** A probe returning 404 is kept in the response with
+  reason `absent`, because "no satellite exists for this DataSource" is a measurement and dropping it
+  would leave it indistinguishable from one nobody looked for. Unreadable for any other reason stays
+  *unknown*.
+- **Probes are bounded, and the bound is visible.** Each candidate is one GET against a production
+  source system and a large landscape offers over a thousand, so `max_satellite_fetches` (default 400)
+  caps a run and a per-service memo means one probe per program name however many times it is asked
+  for. When the cap binds, the shortfall is a caveat naming where it stopped — never silence.
+
+### Fixed — `FOR ALL ENTRIES` findings were over-reported by more than half
+
+Promoting unguarded `FOR ALL ENTRIES` to a per-DataSource risk signal exposed a defect in the shared
+routine parser that had been harmless while the count was only decorative. Measured against 26 real
+extractor-exit programs: 74 `FOR ALL ENTRIES` reads, of which the old rule flagged **64** as
+unguarded. Two causes, both of which produce findings that describe a risk that cannot occur — and a
+report where three quarters of the entries are noise buries the ones that are not.
+
+- **The framework's own package was flagged.** `C_T_DATA` and `I_T_DATA` are the RSAP0001 exit's data
+  parameters, filled by the extractor before the call, exactly as `SOURCE_PACKAGE` and
+  `RESULT_PACKAGE` are in a transformation. A `FOR ALL ENTRIES` over one of them cannot degenerate
+  into a full-table read. This accounted for 20 of the 64.
+- **`IF lt_keys[] IS NOT INITIAL` was not recognised as a guard.** The bracket spelling is older but
+  still common, and missing it reports a guarded read as unguarded. `DESCRIBE TABLE` is now also
+  accepted, and the driver-table pattern admits `/` so a namespaced internal table is captured rather
+  than truncated at the slash.
+
+The remaining count is stated as an **upper bound** and deliberately does *not* escalate severity: a
+routine that tests `sy-subrc` after filling its driver table is guarded in fact but still counted, and
+raising severity on a signal that over-reports would push the exact findings — per-record `SELECT`s —
+down the page. Each finding now names the driver table so a reviewer can settle it without re-reading
+the routine.
+
 ### Added
 - **BW 3.x dataflow: transfer rules, update rules, InfoSource routing (`bw_list_3x_flows`,
   `bw_get_transfer_rules`, `bw_list_update_rules`).** These tables were absent from the table map, so
