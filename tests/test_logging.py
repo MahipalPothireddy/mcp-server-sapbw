@@ -93,15 +93,15 @@ def test_table_of_handles_unquoted_and_missing_from() -> None:
 def test_query_log_records_cost_but_never_parameters(caplog: pytest.LogCaptureFixture) -> None:
     """The regression this guards: logging the SQL with its bound values leaks object names."""
     connection = ReadOnlyConnection(FakeConnection(), scrubber=SecretScrubber([]))
-    secret_object_name = "SOME_CONCRETE_OBJECT"
+    sensitive_object_name = "SOME_CONCRETE_OBJECT"
     with caplog.at_level(logging.DEBUG, logger="mcp_server_sapbw.connection"):
         connection.execute_select(
-            'SELECT A FROM "SCHEMA"."RSTRAN" WHERE TRANID = ?', [secret_object_name]
+            'SELECT A FROM "SCHEMA"."RSTRAN" WHERE TRANID = ?', [sensitive_object_name]
         )
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "SCHEMA.RSTRAN" in text  # the table is useful and safe
     assert "elapsed_ms" in text and "rows=1" in text  # cost is what you need for support
-    assert secret_object_name not in text, "a bound parameter reached the log"
+    assert sensitive_object_name not in text, "a bound parameter reached the log"
     assert "WHERE" not in text, "the statement body reached the log"
 
 
