@@ -24,7 +24,8 @@ from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.models.providers import Provider, ProviderField
-from tests.test_server import FakeRuntime
+from mcp_server_sapbw.models.queries import Query, QueryElement
+from tests.test_server import _CHAIN_TABLES, FakeRuntime
 
 _EXPECTED_URIS = {
     "bw://{system}/profile",
@@ -143,6 +144,202 @@ def test_catalog_resource_lists_only_present_tables() -> None:
     payload = json.loads(asyncio.run(run())[0].text)
     assert "tables" in payload
     assert all(entry["resolved_name"] for entry in payload["tables"].values())
+
+
+# --- every template is actually readable, not just registered ------------------------------
+#
+# Registration and readability are different facts. Before these, five of the seven templates were
+# only ever asserted to exist - so a template could name a parameter the function does not take, or
+# a reader that raises, and nothing would have noticed.
+
+_READS = {
+    "bw://qa/profile": "system",
+    "bw://qa/catalog": "system",
+    "bw://qa/chain/DAILY_LOAD": "chain_id",
+    "bw://qa/provider/SALES_DSO": "name",
+    "bw://qa/transformation/TR1": "tran_id",
+    "bw://qa/query/QRY1": "compuid",
+    "bw://qa/calcview/CV1": "view_name",
+}
+
+
+def _read(uri: str) -> Any:
+    async def run() -> Any:
+        async with Client(server.mcp) as client:
+            return await client.read_resource(uri)
+
+    return json.loads(asyncio.run(run())[0].text)
+
+
+@pytest.mark.parametrize(("uri", "expected_key"), sorted(_READS.items()))
+def test_every_resource_template_is_readable(uri: str, expected_key: str) -> None:
+    server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
+    payload = _read(uri)
+    assert isinstance(payload, dict)
+    assert expected_key in payload, f"{uri} returned {sorted(payload)}"
+
+
+# --- BW names contain slashes, and a URI template expands one path segment ------------------
+
+
+def test_a_namespaced_name_needs_encoding_and_the_helper_provides_it() -> None:
+    """The defect this guards: `bw://qa/provider//IRM/IP_O02` resolves to nothing.
+
+    Measured on the reference system: 484 objects carry a slash, including 29 of 143 cube-table
+    objects and 57 of 280 active chains. An unencoded citation is unreadable for a fifth of them.
+    """
+    uri = server.resource_uri("qa", "provider", "/IRM/IP_O02")
+    assert uri == "bw://qa/provider/%2FIRM%2FIP_O02"
+    assert "//" not in uri.removeprefix("bw://")
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "/IRM/IP_O02",  # a namespaced provider
+        "0BW:BIA:SALES",  # a generated calc view
+        "!!ADHOC_QUERY",  # an ad-hoc BEx query
+        "NAME WITH SPACE",
+        "A%B",
+    ],
+)
+def test_an_encoded_identifier_round_trips_to_the_reader(name: str) -> None:
+    """What the reader receives must be the original name, not the encoded form.
+
+    Encoding is only useful if it is undone before the lookup: a repository asked for
+    ``%2FIRM%2FIP_O02`` would correctly report that no such provider exists.
+    """
+    asked: list[str] = []
+
+    class _Spy:
+        def describe(self, requested: str, object_type: Any = None) -> Any:
+            asked.append(requested)
+            return {"name": requested}
+
+    class _SpyRuntime(FakeRuntime):
+        def providers(self, system: str) -> Any:
+            return _Spy()
+
+    server.set_runtime(_SpyRuntime())
+    _read(server.resource_uri("qa", "provider", name))
+    assert asked == [name]
+
+
+def test_a_summarised_provider_cites_a_uri_that_actually_resolves() -> None:
+    """The end-to-end property: follow the citation and get the full record.
+
+    The caveat is the only place a caller is told where the omitted fields went, so a citation that
+    does not resolve is worse than no citation - it looks like an answer.
+    """
+    provider = _wide_provider(200).model_copy(update={"name": "/IRM/IP_O02"})
+    shaped = server._shape_provider(provider, system="qa", detail="auto")
+    cited = next(token for token in " ".join(shaped.caveats).split() if token.startswith("bw://"))
+    assert cited == "bw://qa/provider/%2FIRM%2FIP_O02"
+
+    asked: list[str] = []
+
+    class _Spy:
+        def describe(self, requested: str, object_type: Any = None) -> Any:
+            asked.append(requested)
+            return provider
+
+    class _SpyRuntime(FakeRuntime):
+        def providers(self, system: str) -> Any:
+            return _Spy()
+
+    server.set_runtime(_SpyRuntime())
+    payload = _read(cited)
+    assert asked == ["/IRM/IP_O02"]
+    assert len(payload["fields"]) == 200, "the citation must lead to the full record"
+
+
+def test_a_summarised_query_cites_a_uri_that_actually_resolves() -> None:
+    query = Query(
+        compuid="UID1",
+        compid="/IMO/V_MMIM01_Q0001",
+        elements=[
+            QueryElement(
+                eltuid=f"E{i}",
+                element_type="restricted_key_figure",
+                provenance=_provenance(),
+            )
+            for i in range(60)
+        ],
+        provenance=_provenance(),
+    )
+    shaped = server._shape_query(query, system="qa", detail="auto")
+    cited = next(t for t in " ".join(shaped.caveats).split() if t.startswith("bw://"))
+    assert cited == "bw://qa/query/%2FIMO%2FV_MMIM01_Q0001"
+
+    server.set_runtime(FakeRuntime())
+    # Resolves through the fixture rather than 404-ing on the slash, which is the point.
+    assert isinstance(_read(cited), dict)
+
+
+def test_the_system_alias_is_encoded_too() -> None:
+    """A profile alias is caller-chosen, so it cannot be assumed URI-safe either."""
+    assert server.resource_uri("prd/eu", "provider", "X") == "bw://prd%2Feu/provider/X"
+
+
+# --- a resource failure is as informative as the same failure through a tool -----------------
+
+
+class _Boom:
+    """Raises the way a dropped session or a locked-down user would."""
+
+    _MESSAGE = "connection to bwhost.internal.invalid:30015 failed"
+
+    def describe(self, name: str, object_type: Any = None) -> Any:
+        raise RuntimeError(self._MESSAGE)
+
+
+class _BoomRuntime(FakeRuntime):
+    def providers(self, system: str) -> Any:
+        return _Boom()
+
+
+def test_a_failed_resource_read_returns_a_structured_error() -> None:
+    """It previously reached the client as "Error reading resource" and nothing else.
+
+    The identical failure through `bw_describe_object` returns a code, a category, a remedy and a
+    retryable flag. A caller should not have to know which surface it asked through to learn why.
+    """
+    server.set_runtime(_BoomRuntime())
+    payload = _read("bw://qa/provider/X")
+    assert payload["status"] == "error"
+    assert payload["code"] == "internal_error"
+    assert payload["remedy"]
+    assert payload["retryable"] is False
+
+
+def test_a_failed_resource_read_never_carries_the_exception_message() -> None:
+    """A driver message can name the host, so the envelope forwards the class and not the text."""
+    server.set_runtime(_BoomRuntime())
+    serialised = json.dumps(_read("bw://qa/provider/X"))
+    assert "bwhost.internal.invalid" not in serialised
+    assert "30015" not in serialised
+    assert "RuntimeError" in serialised  # the class is useful and safe
+
+
+def test_a_resource_and_its_tool_agree_on_the_failure_code() -> None:
+    """One error model across both surfaces, so a client can branch on `code` either way."""
+    server.set_runtime(_BoomRuntime())
+
+    async def call_tool() -> Any:
+        async with Client(server.mcp) as client:
+            return await client.call_tool("bw_describe_object", {"system": "qa", "name": "X"})
+
+    tool_body = asyncio.run(call_tool()).structured_content
+    tool_body = tool_body.get("result", tool_body)
+    assert _read("bw://qa/provider/X")["code"] == tool_body["code"]
+
+
+def test_an_unsupported_release_still_reads_as_a_structured_result() -> None:
+    """Not an exception: the release lacking a table is an answer, and resources give it too."""
+    server.set_runtime(FakeRuntime())  # base fixture: chain_edges absent
+    payload = _read("bw://qa/chain/DAILY_LOAD")
+    assert payload["status"] == "unsupported_on_release"
+    assert "chain_edges" in payload["missing"]
 
 
 # --- provider shaping ----------------------------------------------------------------------

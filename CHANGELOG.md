@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — a resource URI citing a namespaced BW object resolved to nothing
+
+The seven `bw://` resources were registered and two of them were read by a test. The other five were
+only asserted to *exist* — and reading them turned out to be a different fact from registering them.
+
+**BW technical names contain slashes.** A namespaced object is `/IRM/IP_O02`, a URI template expands
+a single path segment, so an unencoded name splits the segment and the read fails with "Unknown
+resource". Measured on the reference system: **484 objects**, including 29 of 143 cube-table objects
+(20%) and 57 of 280 active chains (20%). Not an edge case.
+
+It mattered because of where those URIs appear. A summarised response cites the resource holding the
+full record, and that citation is the only place a caller is told where the omitted fields went — so
+for a fifth of the chains and cubes on a real system it was a pointer into nothing that looked like an
+answer. Every URI the server emits now goes through `resource_uri`, which percent-encodes; FastMCP
+decodes before the reader runs, so a repository is still asked for `/IRM/IP_O02` and not for the
+encoded form. A test follows a citation end to end and asserts the full record comes back, and each
+template's docstring says the identifier must be encoded.
+
+### Changed — resources now share the tools' failure envelope
+
+A failed resource read reached the client as `Error reading resource 'bw://...'` and nothing else: no
+code, no category, no remedy, no retryable flag. The identical failure through the equivalent tool
+returns a structured `BwError` a program can branch on. One surface answering usefully and the other
+opaquely is not a distinction a caller should have to know about, so both now go through
+`from_exception`, and resources are subject to the same per-call budget.
+
+Host names were never at risk — `mask_error_details=True` stops an exception message reaching the
+client — but that meant a project rule was resting on a framework default. It is now explicit, and a
+test asserts a driver message naming a host and port does not survive into the payload while the
+exception *class*, which is useful and safe, does.
+
+Also corrected: the README claimed resources were "specified but **not yet implemented**" and
+`PROGRESS.md` said "resources remain unimplemented". Both were stale by several sessions — a customer
+reading either would never have tried them.
+
 ### Added — a support matrix a customer can query before installing anything
 
 `bw_support_matrix` answers "I run BW 7.4 (or BW/4HANA) — which of your tools will work on my

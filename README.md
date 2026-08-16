@@ -601,9 +601,38 @@ and returns a guided workflow composing the read-only tools above.
 
 ### Resources
 
-URI-addressable read-only resources (`bw://{system}/profile`, `/catalog`, `/chain/{id}`, …) are
-specified (mission Section 4) but **not yet implemented** — the equivalent data is available today
-through the tools. Tracked as an open item in `PROGRESS.md`.
+Seven URI-addressable read-only resources, so a client can pull one object into context without a
+tool round-trip. All seven are read end to end by the test suite and were verified against a live
+BW 7.50 system.
+
+| URI template | Returns |
+|---|---|
+| `bw://{system}/profile` | Release, ABAP schema, object-model variants, table availability |
+| `bw://{system}/catalog` | Object counts per type — the system's shape at a glance |
+| `bw://{system}/chain/{chain_id}` | One chain: processes, event-linked edges, nested sub-chains |
+| `bw://{system}/provider/{name}` | One provider or InfoObject in full, **including every field** |
+| `bw://{system}/transformation/{tran_id}` | One transformation: mappings, rule types, routines |
+| `bw://{system}/query/{query_id}` | One BEx query: element tree, restrictions, CKFs, variables |
+| `bw://{system}/calcview/{view_name}` | One calc view: base tables and consuming providers |
+
+**Percent-encode the identifier.** A URI template expands one path segment and BW technical names
+contain slashes — a namespaced object is `/IRM/IP_O02`. Unencoded, the segment splits and the read
+resolves to nothing. On the reference system that is **484 objects**, including 20% of the
+cube-table objects and 57 of 280 active chains, so it is the common case rather than an edge one:
+
+```
+bw://qa/provider/%2FIRM%2FIP_O02      ✓ resolves
+bw://qa/provider//IRM/IP_O02          ✗ "Unknown resource"
+```
+
+Every URI the server itself emits is encoded, so a summarised response's citation is always
+followable. That is the point of the citation: it is the only place a caller is told where the
+omitted fields went.
+
+Resources share the tools' failure envelope — a failed read returns a structured error with a
+`code`, `category`, `remedy` and `retryable` flag rather than an opaque transport error, and an
+absent table returns `unsupported_on_release` naming what is missing. They also share the per-call
+budget, so a resource read cannot run unbounded either.
 
 ## Security model
 

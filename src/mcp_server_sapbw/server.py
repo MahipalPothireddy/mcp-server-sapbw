@@ -19,6 +19,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
+from urllib.parse import quote
 
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
@@ -1299,7 +1300,7 @@ def _shape_provider(provider: Provider, *, system: str, detail: DetailLevel) -> 
             "caveats": [
                 *provider.caveats,
                 f"field list summarised: {len(kept)} of {total} shown (the semantic key). "
-                f"Read bw://{system}/provider/{provider.name} for every field, "
+                f"Read {resource_uri(system, 'provider', provider.name)} for every field, "
                 "or call again with detail='full'.",
             ],
         }
@@ -2180,7 +2181,8 @@ def _shape_query(query: Query, *, system: str, detail: DetailLevel) -> Query:
             "caveats": [
                 *query.caveats,
                 f"element tree summarised: {len(kept)} of {total} elements shown, with the edges "
-                f"between them. Read bw://{system}/query/{query.compid or query.compuid} for the "
+                "between them. Read "
+                f"{resource_uri(system, 'query', query.compid or query.compuid)} for the "
                 "whole definition, or call bw_get_query, or call again with detail='full'.",
             ],
         }
@@ -2274,6 +2276,13 @@ def bw_generate_docs(
 #
 # Resources return JSON (FastMCP serialises non-str returns), and every one of them goes through
 # the same repositories, budgets and read-only guard as the tools.
+#
+# **Identifiers must be percent-encoded.** A URI template expands a single path segment, and BW
+# technical names contain slashes - a namespaced object is `/IRM/IP_O02`. Unencoded, the segment
+# splits and the URI resolves to nothing; measured on the reference system that is 484 objects,
+# including a fifth of the cube-table objects and a fifth of the active chains. Every URI this
+# server emits goes through `resource_uri`, which encodes; a caller building one by hand has to do
+# the same, so each template below says so.
 
 
 def _resource_payload(value: Any) -> Any:
@@ -2283,63 +2292,142 @@ def _resource_payload(value: Any) -> Any:
     return value
 
 
-@mcp.resource("bw://{system}/profile", mime_type="application/json")
+def _readonly_resource(uri: str) -> Callable[[Callable[..., Any]], Any]:
+    """Register a resource with the same budget and failure envelope the tools get.
+
+    Without this a resource read that failed reached the client as ``Error reading resource
+    'bw://...'`` and nothing more: no code, no category, no remedy, no retryable flag. The identical
+    failure through the equivalent tool returns a structured :class:`BwError` a program can branch
+    on. One surface answering usefully and the other opaquely is not a distinction a caller should
+    have to know about, so both now go through ``from_exception``.
+
+    Host names were never at risk here - ``mask_error_details=True`` on the FastMCP instance stops
+    an exception message reaching the client - but relying on that meant relying on a framework
+    default to satisfy a project rule. The envelope makes it explicit, and it applies the per-call
+    budget the same way, so a resource read cannot run unbounded either.
+    """
+
+    def decorate(func: Callable[..., Any]) -> Any:
+        @functools.wraps(func)
+        def guarded(**kwargs: Any) -> Any:
+            with query_budget(
+                max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]
+            ) as budget:
+                try:
+                    return _resource_payload(func(**kwargs))
+                except BudgetExceeded as exc:
+                    _LOG.warning("resource=%s stopped on budget: %s", uri, exc.reason)
+                    return BudgetResult(
+                        tool=uri,
+                        reason=exc.reason,
+                        queries_spent=exc.queries,
+                        elapsed_seconds=exc.elapsed_seconds,
+                        budget=cast("dict[str, Any]", budget.snapshot()),
+                    ).model_dump(mode="json")
+                except Exception as exc:
+                    failure = from_exception(exc, tool=uri)
+                    _LOG.warning(
+                        "resource=%s failed: code=%s (%s)",
+                        uri,
+                        failure.code,
+                        type(exc).__name__,
+                    )
+                    return failure.model_dump(mode="json")
+
+        return mcp.resource(uri, mime_type="application/json")(guarded)
+
+    return decorate
+
+
+def resource_uri(system: str, kind: str, identifier: str) -> str:
+    """Build a ``bw://`` URI whose identifier survives being a BW technical name.
+
+    **This exists because BW names contain slashes.** A namespaced object is called ``/IRM/IP_O02``,
+    and a URI template expands one path segment, so an unencoded name splits the segment and the URI
+    resolves to nothing. Measured on the reference system: 484 objects are affected, including 29 of
+    143 cube-table objects (20%) and 57 of 280 active chains (20%).
+
+    That mattered in practice, not in theory. A summarised response cites the resource holding the
+    full record, and for a fifth of the chains and cubes on a real system that citation was a URI
+    the client could not read - a pointer into nothing, in the one place a caller is told to go for
+    what was left out.
+
+    Encoding with nothing safe is what makes the identifier opaque to the template. FastMCP decodes
+    it before the resource function runs, so the reader still receives ``/IRM/IP_O02``.
+    """
+    return f"bw://{quote(system, safe='')}/{kind}/{quote(identifier, safe='')}"
+
+
+@_readonly_resource("bw://{system}/profile")
 def resource_profile(system: str) -> Any:
     """Release, ABAP schema, object-model variants and table availability for a system."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        return _resource_payload(runtime().capability(system))
+    return runtime().capability(system)
 
 
-@mcp.resource("bw://{system}/catalog", mime_type="application/json")
+@_readonly_resource("bw://{system}/catalog")
 def resource_catalog(system: str) -> Any:
     """Object counts per type — the system's shape at a glance."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        record = runtime().capability(system)
-        return {
-            "system": system,
-            "bw_release": record.bw_release,
-            "object_models": dict(record.object_models),
-            "tables": {
-                name: {"resolved_name": status.resolved_name, "rows": status.row_estimate}
-                for name, status in record.tables.items()
-                if status.present
-            },
-        }
+    record = runtime().capability(system)
+    return {
+        "system": system,
+        "bw_release": record.bw_release,
+        "object_models": dict(record.object_models),
+        "tables": {
+            name: {"resolved_name": status.resolved_name, "rows": status.row_estimate}
+            for name, status in record.tables.items()
+            if status.present
+        },
+    }
 
 
-@mcp.resource("bw://{system}/chain/{chain_id}", mime_type="application/json")
+@_readonly_resource("bw://{system}/chain/{chain_id}")
 def resource_chain(system: str, chain_id: str) -> Any:
-    """One process chain: processes, event-linked edges, nested sub-chains resolved."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        return _resource_payload(runtime().chains(system).get_chain(chain_id))
+    """One process chain: processes, event-linked edges, nested sub-chains resolved.
+
+    Percent-encode the chain id: 57 of the 280 active chains on the reference system are namespaced
+    (``/CPMB/ADMINTASK_MAKEDIM``), and an unencoded slash splits the URI segment.
+    """
+    return runtime().chains(system).get_chain(chain_id)
 
 
-@mcp.resource("bw://{system}/provider/{name}", mime_type="application/json")
+@_readonly_resource("bw://{system}/provider/{name}")
 def resource_provider(system: str, name: str) -> Any:
-    """One InfoProvider or InfoObject in full, including every field."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        return _resource_payload(runtime().providers(system).describe(name))
+    """One InfoProvider or InfoObject in full, including every field.
+
+    Percent-encode the name: a namespaced provider is ``/IRM/IP_O02``, and an unencoded slash splits
+    the URI segment so the read resolves to nothing.
+    """
+    return runtime().providers(system).describe(name)
 
 
-@mcp.resource("bw://{system}/transformation/{tran_id}", mime_type="application/json")
+@_readonly_resource("bw://{system}/transformation/{tran_id}")
 def resource_transformation(system: str, tran_id: str) -> Any:
-    """One transformation: header, field mappings, rule types, routine references."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        return _resource_payload(runtime().transformations(system).get_transformation(tran_id))
+    """One transformation: header, field mappings, rule types, routine references.
+
+    A TRANID is a generated identifier and carries no slash on the reference system, but
+    percent-encode it anyway rather than relying on that.
+    """
+    return runtime().transformations(system).get_transformation(tran_id)
 
 
-@mcp.resource("bw://{system}/query/{query_id}", mime_type="application/json")
+@_readonly_resource("bw://{system}/query/{query_id}")
 def resource_query(system: str, query_id: str) -> Any:
-    """One BEx query: element tree, restrictions, calculated key figures, variables."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        return _resource_payload(runtime().queries(system).get_query(query_id))
+    """One BEx query: element tree, restrictions, calculated key figures, variables.
+
+    Accepts the COMPID or the COMPUID. Percent-encode it: a COMPID can be namespaced
+    (``/IMO/V_MMIM01_Q0001``), and an ad-hoc query's name begins ``!!``.
+    """
+    return runtime().queries(system).get_query(query_id)
 
 
-@mcp.resource("bw://{system}/calcview/{view_name}", mime_type="application/json")
+@_readonly_resource("bw://{system}/calcview/{view_name}")
 def resource_calcview(system: str, view_name: str) -> Any:
-    """One calc view: base tables resolved to BW objects, and the providers consuming it."""
-    with query_budget(max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]):
-        return _resource_payload(runtime().hana(system).get_calc_view_lineage(view_name))
+    """One calc view: base tables resolved to BW objects, and the providers consuming it.
+
+    Percent-encode the view name: a generated BW view is ``0BW:BIA:<PROVIDER>`` and a modelled one
+    carries its package path, so both bring characters a URI segment has to escape.
+    """
+    return runtime().hana(system).get_calc_view_lineage(view_name)
 
 
 # --- prompts (analyst workflows composing the read-only tools) ---------------------------
