@@ -40,9 +40,11 @@ from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnection, ReadOnlyConnectionPool
 from .core.dialect import record_tool_reads
+from .core.identity import Environment, StorageIdentity
 from .core.logging import configure as configure_logging
 from .core.logging import get_logger
 from .core.paths import cache_dir as default_cache_dir
+from .core.paths import cache_file
 from .core.profiles import ProfileManager
 from .core.snapshots import SnapshotStore, snapshot_file
 from .core.support import support_matrix
@@ -166,7 +168,12 @@ _LOG = get_logger("server")
 
 
 class SystemStatus(BaseModel):
-    """One configured profile and its discovery status (no host/credentials)."""
+    """One configured profile and its discovery status (no host/credentials).
+
+    Carries the identity as well as the alias. On an install serving several landscapes the alias is
+    not distinguishing - everybody's production system is called ``prd`` - so an answer that named
+    only the alias left a reader unable to tell which customer it was about.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -174,6 +181,15 @@ class SystemStatus(BaseModel):
     status: Literal["configured", "discovered"]
     release: str | None = None
     read_only_user: bool = True
+    #: Which customer or landscape this profile belongs to. ``None`` is normal for a single-customer
+    #: install and is what makes ``isolated_by_tenant`` false.
+    tenant: str | None = None
+    #: Declared by the operator, never inferred from an alias or a host name.
+    environment: Environment = "unknown"
+    #: Unambiguous across tenants, for use in a report: ``acme/prd (prod)``.
+    label: str = ""
+    #: True when this profile's stored data is separated from another customer's by a tenant.
+    isolated_by_tenant: bool = False
 
 
 class RefreshResult(BaseModel):
@@ -199,6 +215,13 @@ class CacheStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     system: str
+    #: The identity that decides where this profile's data lands. Reported so isolation is
+    #: verifiable rather than asserted: on a machine serving several customers, ``storage_key`` is
+    #: what proves two of them are not sharing a file.
+    tenant: str | None = None
+    environment: Environment = "unknown"
+    storage_key: str = ""
+    isolated_by_tenant: bool = False
     enabled: bool
     location: str | None = None  # the directory, never a host or credential
     exists: bool = False
@@ -340,6 +363,7 @@ class Runtime(Protocol):
     """The surface the tools depend on (implemented by ServerRuntime; faked in tests)."""
 
     def list_systems(self) -> list[SystemStatus]: ...
+    def identity(self, system: str) -> StorageIdentity: ...
     def capability(self, system: str) -> CapabilityRecord: ...
     def refresh_capabilities(self, system: str) -> CapabilityRecord: ...
     def refresh_cache(self, system: str, scope: str) -> RefreshResult: ...
@@ -407,6 +431,10 @@ class ServerRuntime:
         """
         return self._pool.acquire(self._profiles.get(system))
 
+    def identity(self, system: str) -> StorageIdentity:
+        """Who a profile belongs to: the tenant, the alias, and the declared environment."""
+        return self._profiles.get(system).identity
+
     def capability(self, system: str, *, refresh: bool = False) -> CapabilityRecord:
         record = self._capabilities.get(system)
         if refresh or record is None or record.is_expired():
@@ -429,7 +457,8 @@ class ServerRuntime:
         ABAP routine source and query definitions, so an organisation that will not accept customer
         metadata at rest can switch it off per system and pay the re-read cost instead.
         """
-        if not self._profiles.get(system).cache_enabled:
+        profile = self._profiles.get(system)
+        if not profile.cache_enabled:
             return None
         record = self.capability(system)
         # The server version is part of the fingerprint, not just the discovery timestamp. An
@@ -448,7 +477,10 @@ class ServerRuntime:
             del self._caches[system]
         try:
             cache = SqliteCache(
-                self._cache_dir / f"{system}.sqlite",
+                # Through `cache_file`, not assembled here. Assembling it here is what let a profile
+                # alias containing `..` write customer metadata outside the cache root: the
+                # sanitising helper existed and nothing called it.
+                cache_file(system, tenant=profile.tenant, directory=self._cache_dir),
                 system=system,
                 fingerprint=fingerprint,
             )
@@ -464,43 +496,67 @@ class ServerRuntime:
 
     def cache_status(self, system: str) -> CacheStatus:
         """Report what is cached on disk for a profile, without reading any cached value."""
-        enabled = self._profiles.get(system).cache_enabled
-        path = self._cache_dir / f"{system}.sqlite"
-        if not enabled:
-            return CacheStatus(
-                system=system,
-                enabled=False,
-                note="cache_enabled is false for this profile: no metadata is written to disk",
+        profile = self._profiles.get(system)
+        identity = profile.identity
+
+        def stamped(status: CacheStatus) -> CacheStatus:
+            """Attach the identity to whichever branch answered.
+
+            Applied on every branch, including the ones that keep nothing: an operator verifying
+            two customers are not sharing a file needs the identity even when the answer is
+            "nothing is stored here".
+            """
+            return status.model_copy(
+                update={
+                    "tenant": identity.tenant,
+                    "environment": identity.environment,
+                    "storage_key": identity.key,
+                    "isolated_by_tenant": identity.isolated_by_tenant,
+                }
+            )
+
+        if not profile.cache_enabled:
+            return stamped(
+                CacheStatus(
+                    system=system,
+                    enabled=False,
+                    note="cache_enabled is false for this profile: no metadata is written to disk",
+                )
             )
         cache = self._cache(system)
         if cache is None:
-            return CacheStatus(
-                system=system,
-                enabled=True,
-                location=str(self._cache_dir),
-                note="the cache could not be opened; the server is running uncached",
+            return stamped(
+                CacheStatus(
+                    system=system,
+                    enabled=True,
+                    location=str(self._cache_dir),
+                    note="the cache could not be opened; the server is running uncached",
+                )
             )
         counts = cache.entry_counts()
+        path = cache_file(system, tenant=identity.tenant, directory=self._cache_dir)
         # Only report the snapshot file if one already exists. Opening the store to answer a status
         # question would create an empty database and make the report the cause of the thing it
         # reports.
-        snapshot_path = snapshot_file(system, self._cache_dir)
+        snapshot_path = snapshot_file(system, self._cache_dir, tenant=identity.tenant)
         snapshots = self._snapshot_stores.get(system)
         if snapshots is None and snapshot_path.exists():
             snapshots = self.snapshot_store(system)
-        return CacheStatus(
-            system=system,
-            enabled=True,
-            location=str(self._cache_dir),
-            exists=path.exists(),
-            size_bytes=path.stat().st_size if path.exists() else 0,
-            entries=sum(counts.values()),
-            entries_by_type=counts,
-            structural_ttl_seconds=cache.structural_ttl,
-            runtime_ttl_seconds=cache.runtime_ttl,
-            snapshots=snapshots.count(system=system) if snapshots is not None else 0,
-            snapshot_size_bytes=snapshots.size_bytes() if snapshots is not None else 0,
-            snapshot_location=str(self._cache_dir) if snapshot_path.exists() else None,
+        return stamped(
+            CacheStatus(
+                system=system,
+                enabled=True,
+                location=str(self._cache_dir),
+                exists=path.exists(),
+                size_bytes=path.stat().st_size if path.exists() else 0,
+                entries=sum(counts.values()),
+                entries_by_type=counts,
+                structural_ttl_seconds=cache.structural_ttl,
+                runtime_ttl_seconds=cache.runtime_ttl,
+                snapshots=snapshots.count(system=system) if snapshots is not None else 0,
+                snapshot_size_bytes=snapshots.size_bytes() if snapshots is not None else 0,
+                snapshot_location=str(self._cache_dir) if snapshot_path.exists() else None,
+            )
         )
 
     def chains(self, system: str) -> ChainsRepository:
@@ -626,13 +682,14 @@ class ServerRuntime:
         same `cache_enabled` switch as the extract cache. With it off, snapshots still work for
         an immediate comparison; they just are not kept.
         """
-        if not self._profiles.get(system).cache_enabled:
+        profile = self._profiles.get(system)
+        if not profile.cache_enabled:
             return None
         existing = self._snapshot_stores.get(system)
         if existing is not None:
             return existing
         try:
-            store = SnapshotStore(snapshot_file(system, self._cache_dir))
+            store = SnapshotStore(snapshot_file(system, self._cache_dir, tenant=profile.tenant))
         except (sqlite3.Error, OSError):
             return None
         self._snapshot_stores[system] = store
@@ -788,12 +845,17 @@ class ServerRuntime:
         for name in self._profiles.names():
             profile = self._profiles.get(name)
             record = self._capabilities.get(name)
+            identity = profile.identity
             result.append(
                 SystemStatus(
                     name=name,
                     status="discovered" if record is not None else "configured",
                     release=record.bw_release if record is not None else None,
                     read_only_user=profile.read_only_user,
+                    tenant=identity.tenant,
+                    environment=identity.environment,
+                    label=identity.label,
+                    isolated_by_tenant=identity.isolated_by_tenant,
                 )
             )
         return result
@@ -2223,6 +2285,23 @@ def _shape_query_lineage(
 # --- documentation generation tool -------------------------------------------------------
 
 
+def _default_docs_dir(system: str) -> str:
+    """Where a generated knowledge base lands when the caller names no directory.
+
+    Scoped by tenant, because a documentation tree is the most obviously customer-specific thing
+    this server writes: two landscapes both called ``prd`` would otherwise render into one and
+    interleave, and generation only ever *adds* files, so the result would be a tree describing two
+    systems at once with nothing saying so.
+
+    Readability wins over collision-freedom here, unlike the cache and snapshot stores: a person
+    opens this tree and reads it, and ``_safe_output_dir`` already refuses to write into a
+    git-tracked location. Each segment is still sanitised so an alias cannot traverse.
+    """
+    identity = runtime().identity(system)
+    parts = [_slug_for_file(part) for part in (identity.tenant, identity.system) if part]
+    return "/".join(["output", "docs", *parts])
+
+
 @_readonly_tool
 def bw_generate_docs(
     system: str,
@@ -2256,7 +2335,7 @@ def bw_generate_docs(
     """
     limit = max(1, min(limit, _MAX_DOCGEN_PAGES))
     cap = limit if catalog_cap is None else max(1, min(catalog_cap, _MAX_DOCGEN_PAGES))
-    target = output_dir or f"output/docs/{system}"
+    target = output_dir or _default_docs_dir(system)
     return (
         runtime()
         .docgen(system)

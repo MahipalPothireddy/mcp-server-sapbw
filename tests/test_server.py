@@ -17,6 +17,7 @@ from pydantic import SecretStr
 
 from mcp_server_sapbw import server
 from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
+from mcp_server_sapbw.core.identity import StorageIdentity
 from mcp_server_sapbw.core.profiles import EccProfile
 from mcp_server_sapbw.core.snapshots import IN_MEMORY, SnapshotStore
 from mcp_server_sapbw.models.analysis import Analysis, AnalysisConfidence
@@ -228,7 +229,23 @@ class FakeRuntime:
         self._snapshot_store: SnapshotStore | None = None
 
     def list_systems(self) -> list[SystemStatus]:
-        return [SystemStatus(name="qa", status="discovered", release="7.50", read_only_user=True)]
+        identity = self.identity("qa")
+        return [
+            SystemStatus(
+                name="qa",
+                status="discovered",
+                release="7.50",
+                read_only_user=True,
+                tenant=identity.tenant,
+                environment=identity.environment,
+                label=identity.label,
+                isolated_by_tenant=identity.isolated_by_tenant,
+            )
+        ]
+
+    def identity(self, system: str) -> StorageIdentity:
+        """A tenant is set in the fixture so the isolation path is the one exercised."""
+        return StorageIdentity(system=system, tenant="acme", environment="qa")
 
     def capability(self, system: str) -> CapabilityRecord:
         return self._cap

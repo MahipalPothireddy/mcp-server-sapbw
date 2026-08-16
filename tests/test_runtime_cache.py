@@ -17,6 +17,7 @@ from typing import Any
 
 from pydantic import SecretStr
 
+from mcp_server_sapbw.core.paths import cache_file
 from mcp_server_sapbw.core.profiles import Profile
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.snapshot import Snapshot
@@ -65,8 +66,12 @@ class _Resolver:
 
 
 class _Profiles:
-    def __init__(self, *, cache_enabled: bool = True) -> None:
+    def __init__(
+        self, *, cache_enabled: bool = True, tenant: str | None = None, name: str = "qa"
+    ) -> None:
         self._cache_enabled = cache_enabled
+        self._tenant = tenant
+        self._name = name
 
     def get(self, name: str) -> Profile:
         return Profile(
@@ -78,10 +83,11 @@ class _Profiles:
             abap_schema=SCHEMA,
             read_only_user=False,
             cache_enabled=self._cache_enabled,
+            tenant=self._tenant,
         )
 
     def names(self) -> list[str]:
-        return ["qa"]
+        return [self._name]
 
     def ecc_names(self) -> list[str]:
         return []
@@ -90,10 +96,12 @@ class _Profiles:
         return None
 
 
-def _runtime(tmp_path: Path, *, cache_enabled: bool = True) -> tuple[ServerRuntime, _Resolver]:
+def _runtime(
+    tmp_path: Path, *, cache_enabled: bool = True, tenant: str | None = None
+) -> tuple[ServerRuntime, _Resolver]:
     resolver = _Resolver()
     runtime = ServerRuntime(
-        _Profiles(cache_enabled=cache_enabled),  # type: ignore[arg-type]
+        _Profiles(cache_enabled=cache_enabled, tenant=tenant),  # type: ignore[arg-type]
         _Pool(),  # type: ignore[arg-type]
         resolver,  # type: ignore[arg-type]
         cache_dir=tmp_path / "cache",
@@ -146,7 +154,37 @@ def test_same_cache_instance_is_reused_across_repositories(tmp_path: Path) -> No
 def test_cache_file_is_created_under_the_cache_dir(tmp_path: Path) -> None:
     runtime, _ = _runtime(tmp_path)
     runtime.transformations("qa")
-    assert (tmp_path / "cache" / "qa.sqlite").exists()
+    written = list((tmp_path / "cache").glob("qa-*.sqlite"))
+    assert len(written) == 1, f"expected one cache file, found {written}"
+
+
+def test_the_runtime_uses_the_same_path_helper_as_everything_else(tmp_path: Path) -> None:
+    """The bug this guards: the runtime built `cache_dir / f"{system}.sqlite"` itself.
+
+    That bypassed the sanitising in `cache_file`, so an alias containing `..` wrote customer
+    metadata outside the cache root - and the helper that would have prevented it was never called.
+    """
+    runtime, _ = _runtime(tmp_path)
+    runtime.transformations("qa")
+    expected = cache_file("qa", directory=tmp_path / "cache")
+    assert expected.exists()
+
+
+def test_an_alias_that_would_traverse_stays_inside_the_cache_directory(tmp_path: Path) -> None:
+    root = tmp_path / "cache"
+    resolver = _Resolver()
+    runtime = ServerRuntime(
+        _Profiles(name="../../escaped"),  # type: ignore[arg-type]
+        _Pool(),  # type: ignore[arg-type]
+        resolver,  # type: ignore[arg-type]
+        cache_dir=root,
+    )
+    assert runtime.transformations("../../escaped")._cache is not None
+    written = list(root.rglob("*.sqlite"))
+    assert written, "no cache file was created"
+    for path in written:
+        assert root.resolve() in path.resolve().parents
+    assert not list(tmp_path.glob("*.sqlite")), "a file escaped the cache directory"
 
 
 def test_capability_refresh_retires_the_cache(tmp_path: Path) -> None:
@@ -196,7 +234,49 @@ def test_snapshot_store_lives_beside_the_cache(tmp_path: Path) -> None:
     store = runtime.snapshot_store("qa")
     assert store is not None
     assert store.path.parent == tmp_path / "cache"
-    assert store.path.name == "qa.snapshots.sqlite"
+    assert store.path.name.startswith("qa-")
+    assert store.path.name.endswith(".snapshots.sqlite")
+
+
+def test_two_tenants_with_the_same_alias_do_not_share_stored_data(tmp_path: Path) -> None:
+    """The isolation property that was absent: everybody's production system is called `prd`.
+
+    Without a tenant these two resolved to one cache file and one snapshot store, so a partner
+    install served one customer's extracted metadata under another's name - and nothing failed.
+    """
+    acme, _ = _runtime(tmp_path, tenant="acme")
+    globex, _ = _runtime(tmp_path, tenant="globex")
+
+    acme.transformations("prd")
+    globex.transformations("prd")
+    acme_store, globex_store = acme.snapshot_store("prd"), globex.snapshot_store("prd")
+    assert acme_store is not None and globex_store is not None
+    assert acme_store.path != globex_store.path
+
+    caches = sorted(
+        p.name for p in (tmp_path / "cache").glob("*.sqlite") if "snapshots" not in p.name
+    )
+    assert len(caches) == 2, f"the two tenants shared a cache file: {caches}"
+    assert any(name.startswith("acme-prd-") for name in caches)
+    assert any(name.startswith("globex-prd-") for name in caches)
+
+
+def test_cache_status_reports_the_identity_so_isolation_is_verifiable(tmp_path: Path) -> None:
+    """Asserting isolation is not the same as being able to check it."""
+    runtime, _ = _runtime(tmp_path, tenant="acme")
+    status = runtime.cache_status("prd")
+    assert status.tenant == "acme"
+    assert status.isolated_by_tenant is True
+    assert status.storage_key.startswith("acme-prd-")
+
+
+def test_the_identity_is_reported_even_when_nothing_is_stored(tmp_path: Path) -> None:
+    """A profile keeping nothing at rest still has to say whose profile it is."""
+    runtime, _ = _runtime(tmp_path, cache_enabled=False, tenant="acme")
+    status = runtime.cache_status("prd")
+    assert status.enabled is False
+    assert status.tenant == "acme"
+    assert status.storage_key.startswith("acme-prd-")
 
 
 def test_one_snapshot_store_per_profile(tmp_path: Path) -> None:

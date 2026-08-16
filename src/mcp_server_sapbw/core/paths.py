@@ -25,6 +25,8 @@ import os
 import sys
 from pathlib import Path
 
+from .identity import storage_key
+
 APP_NAME = "mcp-server-sapbw"
 CACHE_DIR_ENV = "SAPBW_CACHE_DIR"
 
@@ -50,12 +52,19 @@ def cache_dir(env: dict[str, str] | None = None) -> Path:
     return _platform_cache_root(source)
 
 
-def cache_file(system: str, env: dict[str, str] | None = None) -> Path:
-    """The cache file for one profile. The name is the profile alias, never a host."""
-    return cache_dir(env) / f"{_safe_name(system)}.sqlite"
+def cache_file(
+    system: str,
+    env: dict[str, str] | None = None,
+    *,
+    tenant: str | None = None,
+    directory: Path | None = None,
+) -> Path:
+    """The cache file for one profile. Named from the profile identity, never from a host.
 
-
-def _safe_name(system: str) -> str:
-    """A filesystem-safe profile name, so an alias can never escape the cache directory."""
-    cleaned = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in system.strip())
-    return cleaned or "default"
+    ``directory`` overrides the resolved cache root, which is what lets the runtime call this
+    rather than assembling the path itself. It used to do the latter, and so bypassed the sanitising
+    function performs - a profile alias containing ``..`` escaped the cache root entirely. The
+    guarantee only holds if there is one way to get a path, so this is it.
+    """
+    root = directory if directory is not None else cache_dir(env)
+    return root / f"{storage_key(system, tenant)}.sqlite"

@@ -53,8 +53,16 @@ def test_posix_falls_back_to_dot_cache() -> None:
     assert cache_dir({}) == Path.home() / ".cache" / APP_NAME
 
 
-def test_cache_file_is_named_for_the_profile_alias() -> None:
-    assert cache_file("qa", {"SAPBW_CACHE_DIR": "/c"}) == Path("/c/qa.sqlite")
+def test_cache_file_leads_with_the_profile_alias() -> None:
+    """The alias leads so the file is identifiable; a digest follows so it is unique.
+
+    See `core.identity.storage_key` - the digest is what makes two similar aliases distinct, which
+    plain sanitising did not.
+    """
+    path = cache_file("qa", {"SAPBW_CACHE_DIR": "/c"})
+    assert path.parent == Path("/c")
+    assert path.name.startswith("qa-")
+    assert path.suffix == ".sqlite"
 
 
 def test_profile_alias_cannot_escape_the_cache_directory() -> None:
@@ -65,4 +73,18 @@ def test_profile_alias_cannot_escape_the_cache_directory() -> None:
 
 
 def test_empty_profile_alias_still_yields_a_file() -> None:
-    assert cache_file("   ", {"SAPBW_CACHE_DIR": "/c"}).name == "default.sqlite"
+    assert cache_file("   ", {"SAPBW_CACHE_DIR": "/c"}).name.startswith("profile-")
+
+
+def test_a_tenant_separates_two_customers_using_the_same_alias() -> None:
+    """The isolation property: everybody calls their production system `prd`."""
+    one = cache_file("prd", {"SAPBW_CACHE_DIR": "/c"}, tenant="acme")
+    two = cache_file("prd", {"SAPBW_CACHE_DIR": "/c"}, tenant="globex")
+    assert one != two
+    assert one.name.startswith("acme-prd-")
+    assert two.name.startswith("globex-prd-")
+
+
+def test_the_directory_argument_is_what_the_runtime_uses() -> None:
+    """The runtime assembled its own path and so skipped the sanitising this function does."""
+    assert cache_file("qa", directory=Path("/elsewhere")).parent == Path("/elsewhere")

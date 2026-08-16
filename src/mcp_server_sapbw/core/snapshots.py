@@ -21,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..models.snapshot import Snapshot, SnapshotSummary
+from .identity import storage_key
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -176,7 +177,12 @@ class SnapshotStore:
         self._conn.close()
 
 
-def snapshot_file(system: str, cache_directory: Path) -> Path:
-    """The snapshot file for one profile. The name is the profile alias, never a host."""
-    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in system.strip())
-    return cache_directory / f"{safe or 'default'}.snapshots.sqlite"
+def snapshot_file(system: str, cache_directory: Path, *, tenant: str | None = None) -> Path:
+    """The snapshot file for one profile. Named from the profile identity, never from a host.
+
+    Shares :func:`~mcp_server_sapbw.core.identity.storage_key` with the extract cache rather than
+    repeating the sanitising rule. It repeated it before, and the copy had the same defect: five
+    distinct aliases (``prd/eu``, ``prd_eu``, ``prd.eu``, ``prd eu``, ``prd:eu``) all produced one
+    file name, so two profiles shared one snapshot store without anything failing.
+    """
+    return cache_directory / f"{storage_key(system, tenant)}.snapshots.sqlite"

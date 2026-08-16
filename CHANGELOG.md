@@ -6,6 +6,51 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — two customers on one install could share a cache file, and an alias could escape it
+
+Both were measured, not theorised.
+
+**Distinct profiles collided.** The rule for naming a stored file mapped every awkward character to
+an underscore, so `prd/eu`, `prd_eu`, `prd.eu`, `prd eu` and `prd:eu` all produced `prd_eu.sqlite`.
+Two profiles — in a partner install, two different **customers** — shared one extract cache and one
+snapshot store. Nothing failed; the wrong data was simply there. The rule was also written out twice,
+once for the cache and once for snapshots, so both copies carried the defect.
+
+**An alias escaped the cache directory.** The runtime built its cache path itself as
+`cache_dir / f"{system}.sqlite"`, bypassing the sanitising helper that existed for exactly this
+purpose — so a profile named `../../escaped` wrote customer metadata to `%LOCALAPPDATA%` , outside
+the cache root and outside anything an audit would look at. The helper was correct and never called,
+which is the worst arrangement: the guarantee reads as present while nothing enforces it.
+
+`core/identity.py` now holds the single rule. A stored file is named `<tenant>-<system>-<digest>`:
+readable, because an operator auditing the machine has to be able to tell whose data a file holds;
+and injective, because the digest covers the exact identity rather than trusting a lossy sanitiser to
+be one-to-one. It is always a single path component, so an operator-supplied alias cannot traverse.
+The runtime now goes through `cache_file()` — there is one way to get a path, which is the only way
+the guarantee holds.
+
+### Added — tenant and environment identity, so isolation is verifiable rather than asserted
+
+`tenant` separates two customers who both, reasonably, call their production system `prd`. Without it
+their aliases carry no distinguishing information and both resolve to one identity. It is optional
+and unset is right for a single-customer install.
+
+`environment` (`dev`/`test`/`qa`/`preprod`/`prod`/`sandbox`) is **declared, never inferred**. The
+server will not guess it from an alias or a host name: `prd_copy` would read as production and
+`production_2` would not, and being wrong means someone reads production figures believing they are
+looking at QA. It stays out of the storage path deliberately — the alias already identifies the
+connection, and putting a label in a filename would orphan every stored file the moment somebody
+corrected the label.
+
+Both are reported. `bw_cache_status` carries `tenant`, `environment`, `storage_key` and
+`isolated_by_tenant` on **every** branch, including the ones that store nothing, because an operator
+verifying that two customers are not sharing a file needs the identity even when the answer is
+"nothing is stored here". `bw_list_systems` carries a `label` (`acme/prd (prod)`) that is unambiguous
+across tenants, so two answers can be told apart without cross-referencing a config file. A generated
+documentation tree is scoped by tenant for the same reason: generation only ever adds files, so two
+landscapes called `prd` would otherwise interleave into one tree describing both with nothing saying
+so.
+
 ### Fixed — a resource URI citing a namespaced BW object resolved to nothing
 
 The seven `bw://` resources were registered and two of them were read by a test. The other five were

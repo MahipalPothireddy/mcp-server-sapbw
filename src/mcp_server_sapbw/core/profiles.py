@@ -25,6 +25,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from .identity import Environment, StorageIdentity
+
 _VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 # Sentinel meaning "resolve the ABAP schema at connect time" (never hardcode SAPABAP1).
@@ -55,6 +57,18 @@ class Profile(BaseModel):
     port: int = Field(gt=0, lt=65536)
     user: str
     password: SecretStr = Field(repr=False)
+    # Which customer or landscape this system belongs to. Optional, and unset is right for an
+    # install serving one organisation.
+    #
+    # It exists because everybody calls their production system "prd". On a machine serving several
+    # customers the aliases carry no distinguishing information, so without a tenant two customers'
+    # extract caches and snapshot stores resolve to the same files - and nothing fails, the wrong
+    # data is simply there. Setting it separates them at rest and labels them in every report.
+    tenant: str | None = None
+    # Which environment this points at, declared rather than guessed. The server never infers it
+    # from an alias or a host name: `prd_copy` would read as production and `production_2` would
+    # not, and being wrong here means someone reads production figures believing they are QA.
+    environment: Environment = "unknown"
     abap_schema: str = ABAP_SCHEMA_AUTO
     encrypt: bool = True
     # TLS certificate handling (only relevant when encrypt is true). Validation defaults to ON;
@@ -84,6 +98,11 @@ class Profile(BaseModel):
     def resolve_schema_at_connect(self) -> bool:
         """True when the ABAP schema must be discovered at connect time."""
         return self.abap_schema == ABAP_SCHEMA_AUTO
+
+    @property
+    def identity(self) -> StorageIdentity:
+        """Who this profile is, for isolating its stored data and for labelling its answers."""
+        return StorageIdentity(system=self.name, tenant=self.tenant, environment=self.environment)
 
 
 class EccProfile(BaseModel):

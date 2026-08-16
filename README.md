@@ -641,11 +641,43 @@ budget, so a resource read cannot run unbounded either.
   `read_only_user: true` are refused (fail closed) if the user holds any write grant.
 - **No data retention off-box.** Metadata is cached locally per profile (git-ignored SQLite);
   runtime statistics are never cached beyond an hour. Nothing is transmitted to third parties.
+- **One install can serve several customers without their data meeting.** See below.
 - **Secrets by environment variable only.** No credentials in code, config, logs, or error
   messages. Connection strings are scrubbed from all error text.
 - **Provenance on every fact.** Every returned record cites the metadata table and key it came from.
 - **Generated content is labelled.** Synthesized descriptions are marked as generated and are never
   written back to BW.
+
+### Isolating several customers on one install
+
+A partner or consultancy points one install at several landscapes. Nothing distinguishes those
+landscapes by alias, because **everybody calls their production system `prd`** — so set `tenant` on
+every profile:
+
+```yaml
+systems:
+  prd:
+    tenant: acme
+    environment: prod
+```
+
+The tenant and the alias together decide where a profile's data lands. Each stored file is named
+`<tenant>-<system>-<digest>`: the prefix so an operator auditing the machine can tell whose data a
+file holds, the digest so two identities can never share a file no matter how similar their aliases
+look. That applies to the extract cache, the snapshot store and (by tenant directory) a generated
+documentation tree.
+
+`environment` is declared, never inferred. The server will not guess it from an alias or a host
+name, because `prd_copy` would read as production and `production_2` would not — and being wrong
+means someone reads production figures believing they are looking at QA.
+
+Isolation is **verifiable rather than asserted**. `bw_cache_status` reports `storage_key`,
+`tenant`, `environment` and `isolated_by_tenant` on every branch, including when a profile keeps
+nothing at rest; `bw_list_systems` reports a `label` (`acme/prd (prod)`) that is unambiguous across
+tenants. If two answers disagree, those fields say which landscape each came from.
+
+For an install that must keep nothing at all, `cache_enabled: false` per profile writes no cache and
+no snapshot store; `bw_compare_systems`, which captures both sides live, still works.
 
 ## No customer metadata ships with this package
 

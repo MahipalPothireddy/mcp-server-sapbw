@@ -6,6 +6,13 @@
 #
 # Every tool/resource/prompt takes a `system:` argument naming one of these profiles.
 # The server is stateless across calls; connections are pooled per profile.
+#
+# SERVING MORE THAN ONE CUSTOMER FROM ONE INSTALL? Set `tenant` on every profile.
+# Everybody calls their production system "prd", so without a tenant two customers' aliases carry
+# no distinguishing information and their extract caches and snapshot stores resolve to the same
+# files - nothing fails, the wrong data is simply there. With it they are separated at rest and
+# labelled in every answer. Verify with bw_cache_status (`storage_key`, `isolated_by_tenant`) or
+# bw_list_systems (`label`).
 
 systems:
   dev:
@@ -16,6 +23,12 @@ systems:
     abap_schema: auto           # resolve at connect; do NOT hardcode SAPABAP1
     encrypt: true
     read_only_user: true        # assert no write grants; fail closed if any are found
+    # Which environment this points at. Declared, never inferred: the server will not guess from
+    # an alias, because `prd_copy` would read as production and `production_2` would not, and
+    # being wrong means someone reads production figures believing they are looking at QA.
+    # One of: dev test qa preprod prod sandbox unknown (default: unknown).
+    environment: dev
+    # tenant: acme              # only needed when one install serves several customers
 
   qa:
     host: ${BW_QA_HOST}
@@ -25,6 +38,7 @@ systems:
     abap_schema: auto
     encrypt: true
     read_only_user: true
+    environment: qa
 
   prd:
     host: ${BW_PRD_HOST}
@@ -33,6 +47,7 @@ systems:
     password: ${BW_PRD_PASSWORD}
     abap_schema: auto
     encrypt: true
+    environment: prod           # so an answer can say "this is production" without guessing
     # TLS certificate handling (optional; only when encrypt: true). Validation defaults to true.
     # For internal/self-signed HANA certs, either point at the CA:
     #   ssl_trust_store: /path/to/internal-ca.pem
