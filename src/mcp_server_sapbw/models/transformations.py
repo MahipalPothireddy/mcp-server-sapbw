@@ -12,8 +12,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 # Rule type decoded from RSTRANRULE.RULETYPE (values are self-describing on the wire).
@@ -249,6 +250,26 @@ class TableDependency(BaseModel):
     # 'advisory' when it rests on the naming convention alone. Without this, a checked fact and a
     # name-shaped guess are indistinguishable to the caller.
     resolution_confidence: Literal["confirmed", "advisory"] | None = None
+    evidence: Evidence | None = None
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> TableDependency:
+        if self.evidence is None and self.resolution_confidence is not None:
+            self.evidence = evidence_for(
+                "table_resolution",
+                self.resolution_confidence,
+                detail=(
+                    f"Table {self.table} was decomposed to {self.resolved_object}"
+                    + (
+                        " and that object was found in the catalogue."
+                        if self.resolution_confidence == "confirmed"
+                        else ", but no catalogue entry confirmed the object exists."
+                    )
+                )
+                if self.resolved_object
+                else None,
+            )
+        return self
 
 
 class AntiPattern(BaseModel):
@@ -299,5 +320,23 @@ class RoutineAnalysis(BaseModel):
     unresolved_refs: list[UnresolvedRef] = Field(default_factory=list)
     complexity: ComplexitySignals = Field(default_factory=ComplexitySignals)
     completeness: Literal["lower_bound"] = "lower_bound"
+    evidence: Evidence | None = None
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance  # RSAABAP:<code_id>
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> RoutineAnalysis:
+        if self.evidence is None:
+            unfollowed = len(self.unresolved_refs)
+            self.evidence = evidence_for(
+                "routine_analysis",
+                self.completeness,
+                detail=(
+                    "Static parse of this routine's ABAP. "
+                    f"{unfollowed} call(s) were named but not followed, so the dependency set can "
+                    "only be larger than reported."
+                )
+                if unfollowed
+                else None,
+            )
+        return self

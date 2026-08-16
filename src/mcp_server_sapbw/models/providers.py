@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .aggregation import KeyFigureAggregation
 from .description import Description
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 # Unified provider/object type. Cube variants are split by RSDCUBE.CUBETYPE (B/M/V).
@@ -160,7 +161,26 @@ class PartProviderRef(BaseModel):
     position: int | None = None
     via_table: str | None = None  # generated table the part was resolved from (calc-view route)
     confidence: Literal["confirmed", "advisory"] = "confirmed"
+    evidence: Evidence | None = None
     provenance: Provenance
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> PartProviderRef:
+        if self.evidence is None:
+            detail = None
+            if self.via_table:
+                detail = (
+                    f"Resolved from generated table {self.via_table}, reached through the "
+                    "CompositeProvider's calc-view dependencies."
+                    + (
+                        " Confirmed against the provider catalogue."
+                        if self.confidence == "confirmed"
+                        else " Not confirmed against the provider catalogue, so the table -> "
+                        "object reading rests on the naming convention alone."
+                    )
+                )
+            self.evidence = evidence_for("part_provider", self.confidence, detail=detail)
+        return self
 
 
 class Provider(BaseModel):

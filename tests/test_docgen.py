@@ -29,6 +29,7 @@ from mcp_server_sapbw.services.docgen import (
     _LoadClosure,
     _render_attributes,
     _render_description,
+    _render_evidence_mix,
     _render_value_altering_elements,
     _safe_output_dir,
     _slug,
@@ -181,6 +182,37 @@ def test_attribute_table_distinguishes_navigable_from_kind() -> None:
     assert "| `MATL_GROUP` | Material group | navigation | yes |" in rendered
     # Navigable on the base, not exposed here: kind says navigation, navigable says no.
     assert "| `MATL_TYPE` | - | navigation | no | - | yes | yes |" in rendered
+
+
+def test_evidence_mix_reports_the_counts_a_diagram_cannot() -> None:
+    """A dashed edge reads one path; the counts say whether the whole shape can be trusted."""
+    prov = Provenance(source_table="RSTRAN")
+    graph = LineageGraph(
+        root_id="dso:A",
+        direction="both",
+        depth=2,
+        edges=[
+            LineageEdge(src="a", dst="b", kind="transformation", provenance=prov),
+            LineageEdge(
+                src="b",
+                dst="c",
+                kind="routine_lookup",
+                derivation="routine",
+                confidence="advisory",
+                provenance=prov,
+            ),
+        ],
+    )
+    rendered = "\n".join(_render_evidence_mix(graph))
+    assert "## Evidence" in rendered
+    assert "| observed | 1 |" in rendered
+    assert "| inferred | 1 |" in rendered
+    assert "`declared_metadata`" in rendered and "`routine_select_parse`" in rendered
+
+
+def test_evidence_mix_omitted_for_an_empty_graph() -> None:
+    graph = LineageGraph(root_id="dso:A", direction="both", depth=1)
+    assert _render_evidence_mix(graph) == []
 
 
 def test_value_altering_elements_are_listed_and_formatting_is_not() -> None:

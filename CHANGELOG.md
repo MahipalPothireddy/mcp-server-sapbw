@@ -6,6 +6,48 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — one evidence vocabulary, replacing seven
+
+The server was honest about uncertainty from the start, but in seven separate vocabularies: a part
+provider was `confirmed`/`advisory`, a lineage edge `exact`/`advisory`, a decoded code
+`dictionary`/`cross_domain`/`advisory`, a source-system kind `dictionary`/`advisory` under a
+differently named field, a table dependency `confirmed`/`advisory`, a HANA crossing
+`bic_table`/`bw_provider_view`/`unresolved`, a field-lineage path `field`/`provider`/`none`, a
+routine analysis `lower_bound`, and a chain cadence `high`/`low`.
+
+Each was locally reasonable and collectively they were not comparable. A caller could not sort a
+mixed set of findings by how much to trust them, and "advisory" meant a naming convention in one
+place and a heuristic ABAP parse in another — two very different risks.
+
+`Evidence` adds the comparable axis without discarding the per-mechanism detail:
+
+- **`basis`** is `observed` (a row states it), `derived` (assembled from rows by a documented rule),
+  `inferred` (rests on a convention or a parsed routine) or `unknown`. Ranked, so a mixed set sorts.
+- **`method`** keeps the specific mechanism verbatim — `bw_provider_view`, `bic_table_naming`,
+  `dictionary_domain`, `routine_select_parse`, `observed_run_history` — so unification costs no
+  precision.
+- **`detail`** answers "why did you conclude this" for *this* fact, not its class. A routine-derived
+  lineage edge now says which transformation's ABAP contained the SELECT; a declared edge names the
+  transformation that declares the source and target.
+- **`completeness`** is orthogonal. A routine's table reads are each `inferred` *and* the list is a
+  `lower_bound`; collapsing those into one field loses a statement.
+- **`mapped_from`** records the legacy vocabulary and code, so the translation is auditable.
+
+The legacy fields stay. They are published tool schemas and removing them would break a caller to
+gain nothing. `evidence` is derived from them by a pydantic validator on each carrying model, so the
+two cannot disagree and no call site had to change. One mapping table is the single place to review
+how a code becomes a basis, and an unmapped code degrades to `basis="unknown"` rather than being
+silently promoted to a fact.
+
+A test walks each legacy field's own `Literal` and asserts every value has a mapping, so adding a
+confidence value without deciding what it means as evidence fails the build.
+
+`LineageGraph` also carries an `evidence_summary` and states the mix in its caveats — "7 of 75 edges
+(9%) are inferred rather than declared" — because the diagram's dashed line reads one path but says
+nothing about whether the whole shape can be trusted. Measured live: a real graph came out 68
+observed / 7 inferred, and the HANA crossing table split exactly 60 `bw_provider_view` (derived) / 60
+`bic_table_naming` (inferred).
+
 ### Added — the capability contract, and `bw_capability_report`
 
 The resolver declares a logical name for every metadata table the server knows about. Declaring one

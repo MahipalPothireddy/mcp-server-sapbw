@@ -11,8 +11,9 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 # Observed-cadence frequency buckets (derived from RSPCLOGCHAIN run history, never from names).
@@ -168,8 +169,24 @@ class ChainCadence(BaseModel):
     liveness_window_days: int | None = None  # window appropriate to this band
     active: bool | None = None  # ran within its own band's window
     confidence: Literal["high", "low"] = "high"  # 'low' for single-run / too-few-runs chains
+    evidence: Evidence | None = None
     note: str | None = None
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> ChainCadence:
+        if self.evidence is None:
+            detail = (
+                f"Classified as {self.frequency} from {self.run_count} run(s) across "
+                f"{self.run_days} distinct day(s) in the retained log window"
+                + (
+                    f", median gap {self.median_gap_days} day(s)."
+                    if self.median_gap_days is not None
+                    else "."
+                )
+            )
+            self.evidence = evidence_for("cadence", self.confidence, detail=detail)
+        return self
 
 
 class LoadedProvider(BaseModel):

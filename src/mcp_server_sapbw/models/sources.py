@@ -19,8 +19,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 # How a source system supplies data. Values marked advisory below are widely-used conventions that
@@ -47,10 +48,23 @@ class SourceSystem(BaseModel):
     kind: SourceSystemKind = "unknown"
     kind_code: str | None = None  # raw SRCTYPE, so an undecoded value stays visible
     kind_confidence: Literal["dictionary", "advisory"] = "advisory"
+    evidence: Evidence | None = None
     registered: bool = True  # False when DataSources use it but the registry has no entry
     active: bool | None = None
     datasource_count: int = 0
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> SourceSystem:
+        if self.evidence is None:
+            detail = None
+            if self.kind_confidence == "advisory" and self.kind_code:
+                detail = (
+                    f"Source-system type code {self.kind_code!r} is not documented by this "
+                    f"system's ABAP dictionary; {self.kind!r} is the conventional reading."
+                )
+            self.evidence = evidence_for("source_system_kind", self.kind_confidence, detail=detail)
+        return self
 
 
 class SourceTopology(BaseModel):

@@ -16,8 +16,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence import Evidence, EvidenceSummary, evidence_for, summarise
 from .provenance import Provenance
 from .transformations import UnresolvedRef
 
@@ -82,7 +83,15 @@ class LineageNode(BaseModel):
 
 
 class LineageEdge(BaseModel):
-    """A directed data-flow edge ``src -> dst`` (``confidence='advisory'`` for routine edges)."""
+    """A directed data-flow edge ``src -> dst`` (``confidence='advisory'`` for routine edges).
+
+    ``evidence`` says why this edge was concluded to exist, in the vocabulary every subsystem
+    shares. It is derived from ``confidence`` automatically, so the two can never disagree, and it
+    names the mechanism per edge: a declared edge is a row in ``RSTRAN``/``RSBKDTP``, a routine edge
+    is a SELECT parsed out of a named transformation's ABAP. That difference decides whether the
+    edge can be acted on or has to be checked first, and it was previously only inferable from a
+    one-word field.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -96,11 +105,41 @@ class LineageEdge(BaseModel):
     chain_id: str | None = None
     chain_frequency: str | None = None
     note: str | None = None
+    evidence: Evidence | None = None
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> LineageEdge:
+        """Fill ``evidence`` from ``confidence`` unless a caller supplied a richer one."""
+        if self.evidence is None:
+            self.evidence = evidence_for(
+                "lineage_edge", self.confidence, detail=self._edge_detail()
+            )
+        return self
+
+    def _edge_detail(self) -> str | None:
+        """The reason *this* edge exists, where it is more specific than its class's reason."""
+        if self.derivation == "routine" and self.transformation_id:
+            return (
+                f"A SELECT in transformation {self.transformation_id}'s routine reads {self.src}. "
+                "BW's own where-used lists do not contain this edge; dynamic SQL and "
+                "function-module calls are not followed, so it is a lower bound."
+            )
+        if self.derivation == "declared" and self.transformation_id:
+            return (
+                f"Transformation {self.transformation_id} declares {self.src} as its source and "
+                f"{self.dst} as its target."
+            )
+        return None
 
 
 class LineageGraph(BaseModel):
-    """A resolved lineage graph around a root object."""
+    """A resolved lineage graph around a root object.
+
+    ``evidence_summary`` counts the edges by basis. A graph of 200 edges is a different object
+    depending on whether 2 or 150 of them rest on a routine parse, and a count says so without the
+    caller walking every edge.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -112,7 +151,14 @@ class LineageGraph(BaseModel):
     node_count: int = 0
     edge_count: int = 0
     truncated: bool = False  # a depth or node cap stopped expansion
+    evidence_summary: EvidenceSummary | None = None
     caveats: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _summarise_evidence(self) -> LineageGraph:
+        if self.evidence_summary is None and self.edges:
+            self.evidence_summary = summarise([e.evidence for e in self.edges if e.evidence])
+        return self
 
 
 class ImpactAnalysis(BaseModel):

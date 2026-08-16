@@ -27,10 +27,11 @@ corroborated reading is never mistaken for a directly documented one.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 # Where a decoded label came from.
@@ -65,6 +66,16 @@ class AggregationRule(BaseModel):
     confidence: DecodeConfidence
     # True only for plain summation. Every other behaviour means re-adding the figure is wrong.
     is_summation: bool = False
+    # The same statement as ``confidence``, in the vocabulary every subsystem shares. Filled before
+    # validation rather than after, because this model is frozen.
+    evidence: Evidence | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_evidence(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "evidence" not in value and value.get("confidence"):
+            return {**value, "evidence": evidence_for("code_decode", str(value["confidence"]))}
+        return value
 
 
 class ReferenceCharacteristic(BaseModel):

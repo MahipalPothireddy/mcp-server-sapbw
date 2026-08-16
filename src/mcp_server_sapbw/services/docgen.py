@@ -182,6 +182,34 @@ def _render_attributes(provider: Provider) -> list[str]:
     return lines
 
 
+def _render_evidence_mix(graph: LineageGraph) -> list[str]:
+    """How much of a flow is declared metadata and how much was inferred.
+
+    The diagram already dashes an inferred edge, which is right for reading one path but useless for
+    judging the whole shape. The counts say whether this page is a picture of the system or a
+    hypothesis about it.
+    """
+    summary = graph.evidence_summary
+    if summary is None or not summary.total:
+        return []
+    lines = [
+        "## Evidence",
+        "",
+        "| Basis | Edges | Meaning |",
+        "|---|---|---|",
+        f"| observed | {summary.observed} | A metadata row declares the edge |",
+        f"| derived | {summary.derived} | Assembled from rows by a documented rule |",
+        f"| inferred | {summary.inferred} | Rests on a convention or a parsed routine - confirm "
+        "before acting |",
+        f"| unknown | {summary.unknown} | Could not be established |",
+        "",
+        f"Mechanisms present: {', '.join(f'`{m}`' for m in summary.methods)}. Each edge in the "
+        "graph JSON below carries its own `evidence.detail` saying why it was concluded.",
+        "",
+    ]
+    return lines
+
+
 def _render_value_altering_elements(query: Query) -> list[str]:
     """The elements that do something to their own value before it is displayed.
 
@@ -820,6 +848,7 @@ class DocGenerator(Repository):
         if trace is not None:
             reached = ", ".join(trace.datasources_reached) or "(none reached)"
             lines += [f"- DataSources reached upstream: {reached}", ""]
+        lines += _render_evidence_mix(graph)
         for caveat in graph.caveats:
             self._gaps.add(f"lineage {name}", caveat)
         lines += ["## Graph JSON", "", "```json", graph.model_dump_json(indent=2), "```"]

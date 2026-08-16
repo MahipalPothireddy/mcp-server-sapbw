@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from ..models.evidence import summarise
 from ..models.lineage import (
     ImpactAnalysis,
     LineageDirection,
@@ -73,6 +74,25 @@ _ROUTINE_CAVEAT = (
     "routine-derived edges are advisory (heuristic lower bound): dynamic SQL, function-module and "
     "class-method calls are not followed"
 )
+
+
+def _evidence_caveats(edges: list[LineageEdge]) -> list[str]:
+    """State how much of the graph rests on inference, in the graph's own terms.
+
+    A graph of 200 edges is a different object depending on whether 2 or 150 of them come from a
+    routine parse. Both cases already carried the standing routine caveat, which says the class of
+    risk but not its extent - and extent is what decides whether the shape can be trusted.
+    """
+    summary = summarise([e.evidence for e in edges if e.evidence])
+    if not summary.total or not summary.advisory_count:
+        return []
+    share = round(100 * summary.advisory_count / summary.total)
+    return [
+        f"{summary.advisory_count} of {summary.total} edges ({share}%) are inferred rather than "
+        "declared, so that share of this shape should be confirmed before it is acted on. Each "
+        "edge's `evidence` says which mechanism produced it and why. Mechanisms present: "
+        + ", ".join(summary.methods)
+    ]
 
 
 class _Hop:
@@ -711,6 +731,7 @@ class LineageService(Repository):
         caveats = [_ROUTINE_CAVEAT]
         if truncated:
             caveats.append(f"expansion stopped at depth {depth} or the {_MAX_NODES}-node cap")
+        caveats.extend(_evidence_caveats(edges))
         return LineageGraph(
             root_id=root,
             direction=direction,

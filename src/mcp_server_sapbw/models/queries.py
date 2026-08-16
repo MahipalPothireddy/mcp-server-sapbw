@@ -14,9 +14,10 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .aggregation import AggregationRule, ExceptionAggregation
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 # Element type from RSZELTDIR.DEFTP (decoded from DD07T).
@@ -122,6 +123,7 @@ class ValueSource(BaseModel):
     code: str
     label: str | None = None
     confidence: Literal["dictionary", "advisory"] = "dictionary"
+    evidence: Evidence | None = None
     runtime_resolved: bool = False
     value_holds: Literal[
         "literal",  # the value column holds the thing itself
@@ -131,6 +133,12 @@ class ValueSource(BaseModel):
         "constant",
         "unknown",
     ] = "unknown"
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> ValueSource:
+        if self.evidence is None:
+            self.evidence = evidence_for("code_decode", self.confidence)
+        return self
 
 
 class CurrencyTranslation(BaseModel):
@@ -324,6 +332,7 @@ class FieldLineageHop(BaseModel):
         "transformation"
     )
     advisory: bool = False
+    evidence: Evidence | None = None
     # Rule-level detail, populated for transformation hops.
     target_field: str | None = None
     rule_type: str | None = None
@@ -331,6 +340,26 @@ class FieldLineageHop(BaseModel):
     transformation_id: str | None = None
     routine_code_id: str | None = None
     note: str | None = None
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> FieldLineageHop:
+        """Reuse the lineage-edge vocabulary: a hop is an edge seen from a field's point of view."""
+        if self.evidence is None:
+            detail = None
+            if self.advisory and self.routine_code_id:
+                detail = (
+                    f"This hop's inputs come from parsing routine {self.routine_code_id}, so what "
+                    "the ABAP actually reads is a lower bound rather than a declared mapping."
+                )
+            elif not self.advisory and self.rule_type and self.target_field:
+                detail = (
+                    f"Rule type {self.rule_type!r} on field {self.target_field} declares this "
+                    "derivation in the transformation's own metadata."
+                )
+            self.evidence = evidence_for(
+                "lineage_edge", "advisory" if self.advisory else "exact", detail=detail
+            )
+        return self
 
 
 class FieldLineagePath(BaseModel):
@@ -359,7 +388,27 @@ class FieldLineagePath(BaseModel):
     has_routine_hop: bool = False
     resolution: Literal["field", "provider", "none"] = "provider"
     unresolved_reason: str | None = None
+    evidence: Evidence | None = None
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> FieldLineagePath:
+        if self.evidence is None:
+            self.evidence = evidence_for(
+                "field_lineage", self.resolution, detail=self.unresolved_reason
+            )
+            # A routine hop anywhere makes the whole path a lower bound, whatever the resolution:
+            # the walk itself was exact, but what the routine reads is a heuristic.
+            if self.has_routine_hop and self.evidence.completeness == "complete":
+                self.evidence = self.evidence.model_copy(
+                    update={
+                        "completeness": "lower_bound",
+                        "detail": (self.evidence.detail or "")
+                        + " At least one hop passes through a routine, so the inputs on that hop "
+                        "are a parsed lower bound rather than a declared mapping.",
+                    }
+                )
+        return self
 
 
 class QueryLineage(BaseModel):

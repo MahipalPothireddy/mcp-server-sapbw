@@ -17,8 +17,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
 CalcViewType = Literal["calc", "join", "olap", "hierarchy", "other"]
@@ -103,7 +104,21 @@ class HanaCrossing(BaseModel):
     bw_object_kind: str | None = None
     resolution: Literal["bic_table", "bw_provider_view", "unresolved"] = "unresolved"
     object_type: str | None = None  # the HANA object type on the BW side (TABLE/VIEW/SYNONYM)
+    evidence: Evidence | None = None
     provenance: Provenance
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> HanaCrossing:
+        if self.evidence is None:
+            detail = None
+            if self.bw_object_resolved:
+                detail = f"{self.bw_object} was read as BW object {self.bw_object_resolved}" + (
+                    f", type-confirmed as {self.bw_object_kind}."
+                    if self.resolution == "bw_provider_view" and self.bw_object_kind
+                    else " by the generated-table naming convention, which nothing records."
+                )
+            self.evidence = evidence_for("hana_crossing", self.resolution, detail=detail)
+        return self
 
 
 class HanaCrossingReport(BaseModel):

@@ -48,6 +48,26 @@ own where-used lists), and can render a full markdown knowledge base on demand.
   layer violations including write-back loops, and more) plus decommission-candidate detection.
 - **Knowledge base** — a full markdown documentation set rendered on demand.
 
+## How firmly a fact is established
+
+Every fact that is not simply a row value carries an `evidence` object, in one vocabulary shared by
+every subsystem, so a mixed set of findings can be sorted and filtered by how much to trust it:
+
+| `basis` | Meaning |
+|---|---|
+| `observed` | A metadata row states it |
+| `derived` | Computed from rows by a documented rule — a join, a dictionary decode, an aggregation of run history |
+| `inferred` | Rests on a naming convention or a heuristic parse of ABAP; can be wrong even when every input was read correctly |
+| `unknown` | Could not be established, and is reported as such rather than omitted |
+
+`method` keeps the specific mechanism (`bw_provider_view`, `bic_table_naming`, `dictionary_domain`,
+`routine_select_parse`, `observed_run_history`, …) so nothing is flattened, `detail` says why *this*
+fact was concluded, and `completeness` (`complete` / `lower_bound`) is a separate statement: whether
+a set is exhaustive is a different question from whether each member is right.
+
+A lineage graph also reports the mix — "7 of 75 edges (9%) are inferred" — because a graph is a
+different object depending on whether 2 or 150 of its edges came from a routine parse.
+
 ## Supported releases
 
 | Release | Status |
