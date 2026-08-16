@@ -12,7 +12,7 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **55 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **56 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -234,8 +234,38 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_system_profile` | `system` | Release, ABAP schema, object-model variants, log window, table presence/counts |
 | `bw_refresh_capabilities` | `system` | Re-run capability discovery, replacing the cached record |
 | `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
+| `bw_support_matrix` | `tool?`, `release?`, `system?` | Which tool works on which BW release — **no connection required** |
 | `bw_cache_status` | `system` | What extracted metadata and how many snapshots are on local disk, and where |
 | `bw_refresh_cache` | `system`, `scope="all"` | Invalidate cached extracts by scope |
+
+#### Will this work on my system?
+
+Three answers, in increasing specificity, and the first needs nothing from you:
+
+| Question | Ask | Needs a connection |
+|---|---|---|
+| Which tools work on BW 7.4 / 7.5 / BW/4HANA? | `bw_support_matrix` | no |
+| Which questions resolve on *my* system? | `bw_capability_report` | yes |
+| What does this server do with metadata object X? | [`docs/capability-contract.md`](docs/capability-contract.md) | no |
+
+`bw_support_matrix` is keyed by **tool**, because that is the unit the question is asked in. Its
+`requires` field bridges to the capability contract and is **measured**, by attributing each metadata
+read to the tool that caused it while the offline suite runs — so it cannot drift the way a
+hand-written mapping across 56 tools would. It is a lower bound: everything listed really is read,
+and a code path no test reaches contributes nothing.
+
+There is deliberately no `supported` verdict. Every value says where the claim comes from:
+`verified` (read through a feature on that release, output inspected), `expected` (implemented, but
+not everything verified there), `unverified` (**nobody has run it against that release — not a
+prediction**), `needs_connector`, `unknown`.
+
+Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 39 tools `verified`, 15 `expected`, 2
+connector-gated. Every other release reports `unverified` for every tool. That is an absence of
+evidence stated rather than filled in — which metadata objects a release carries is exactly what the
+capability resolver discovers at connect time, and predicting it from a version number would be
+guesswork dressed as a support statement. The matrix names the capabilities that decide the answer on
+an unverified release, so a proof of concept has a scope. Published as
+[`docs/support-matrix.md`](docs/support-matrix.md) and checked by CI.
 
 ### Compound analysis
 

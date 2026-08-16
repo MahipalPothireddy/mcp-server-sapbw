@@ -38,11 +38,13 @@ from .core.budget import (
 from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
 from .core.connection import ReadOnlyConnection, ReadOnlyConnectionPool
+from .core.dialect import record_tool_reads
 from .core.logging import configure as configure_logging
 from .core.logging import get_logger
 from .core.paths import cache_dir as default_cache_dir
 from .core.profiles import ProfileManager
 from .core.snapshots import SnapshotStore, snapshot_file
+from .core.support import support_matrix
 from .models.analysis import Analysis
 from .models.capability import CapabilityRecord, CapabilityReport
 from .models.chains import (
@@ -78,6 +80,7 @@ from .models.security import (
 )
 from .models.snapshot import Snapshot, SnapshotDiff, SnapshotSummary
 from .models.sources import EnhancementInventory, SourceTopology
+from .models.support import SupportMatrix
 from .models.threex import ThreeXFlowReport, TransferRule, UpdateRule
 from .models.transformations import (
     RoutineAnalysis,
@@ -828,9 +831,15 @@ def _readonly_tool(func: Callable[..., Any]) -> Any:
 
     @functools.wraps(func)
     def budgeted(*args: Any, **kwargs: Any) -> Any:
-        with query_budget(
-            max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]
-        ) as budget:
+        with (
+            query_budget(
+                max_queries=_budget_limits()[0], max_seconds=_budget_limits()[1]
+            ) as budget,
+            # Inert in production (one bool check); switched on only by the test session, so the
+            # support matrix can measure which capabilities each tool needs rather than a
+            # hand-written mapping drifting the first time a tool gains a reader.
+            record_tool_reads(name),
+        ):
             try:
                 return func(*args, **kwargs)
             except BudgetExceeded as exc:
@@ -922,6 +931,109 @@ def bw_capability_report(system: str) -> CapabilityReport:
     one of them is a gap in this server.
     """
     return build_report(runtime().capability(system))
+
+
+@_readonly_tool
+def bw_support_matrix(
+    tool: str | None = None, release: str | None = None, system: str | None = None
+) -> SupportMatrix | BwError:
+    """Which tool works on which BW release. **Answerable without connecting to anything.**
+
+    Every other support answer here needs a profile first. This one is built from data shipped in
+    the package, so it answers the question a customer has before installing anything: *I run BW
+    7.4 (or BW/4HANA) - which of your tools will work on my landscape?*
+
+    Keyed by **tool**, because that is the unit the question is asked in; nobody asks whether
+    RSPCPROCESSLOG is present. ``requires`` bridges to the capability contract and is **measured**
+    by attributing each read to the tool that caused it, so it cannot drift the way a hand-written
+    mapping would. It is a lower bound: everything listed really is read, and a code path no test
+    reaches contributes nothing.
+
+    Read the verdicts literally. There is deliberately no ``supported``:
+
+    * ``verified`` - every capability it needs was read through a feature on that release.
+    * ``expected`` - implemented and read, but not everything was verified on that release.
+    * ``unverified`` - nobody has run it against that release. **Not a prediction.** Only BW 7.50
+      has been verified here, so every other release reports this for every tool. Which metadata
+      objects a release carries is what the capability resolver discovers at connect time, and
+      asserting it from a version number would be guesswork dressed as a support statement.
+    * ``needs_connector`` - the BW half works; the answer is completed by a system outside BW.
+    * ``unknown`` - this build could not measure what the tool needs, which is not the same as the
+      tool needing nothing.
+
+    Filter with ``tool`` or ``release``. Naming a ``system`` sharpens the result with that system's
+    discovery record - turning ``unverified`` into a statement about your own release - but it is
+    an option, not a precondition.
+    """
+    matrix = support_matrix()
+    if matrix is None:
+        return error(
+            "internal_error",
+            "the support-matrix data file is missing from this installation; regenerate it with "
+            "python scripts/support_matrix.py",
+        )
+    if release is not None and not any(r.release == release for r in matrix.releases):
+        return error(
+            "invalid_argument",
+            f"unknown release {release!r}; this build has an opinion about "
+            f"{', '.join(r.release for r in matrix.releases)}",
+        )
+    if tool is not None and matrix.tool(tool) is None:
+        return error("object_not_found", f"no registered tool named {tool!r}", id=tool)
+    return _narrow_matrix(matrix, tool=tool, release=release, system=system)
+
+
+def _narrow_matrix(
+    matrix: SupportMatrix, *, tool: str | None, release: str | None, system: str | None
+) -> SupportMatrix:
+    """Apply the filters, and fold in a live discovery record when a system was named.
+
+    The live part is what turns ``unverified`` into something actionable: the shipped matrix cannot
+    know what a customer's release carries, but their own capability record does. Crossing the two
+    reports presence per required capability without claiming the tool was ever *run* there - which
+    is why the verdict stays ``unverified`` and the finding lands in a caveat instead.
+    """
+    tools = [t for t in matrix.tools if tool is None or t.tool == tool]
+    releases = [r for r in matrix.releases if release is None or r.release == release]
+    kept = {r.release for r in releases}
+    tools = [
+        t.model_copy(update={"releases": {k: v for k, v in t.releases.items() if k in kept}})
+        for t in tools
+    ]
+    totals = {k: v for k, v in matrix.totals.items() if k in kept}
+    caveats = list(matrix.caveats)
+
+    if system is not None:
+        try:
+            record = runtime().capability(system)
+        except Exception as exc:
+            caveats.append(
+                f"a discovery record for {system!r} could not be read ({type(exc).__name__}), so "
+                "this is the offline matrix only."
+            )
+        else:
+            blocked = {
+                t.tool: sorted(c for c in t.requires if not record.is_available(c))
+                for t in tools
+                if t.requires
+            }
+            missing = {name: caps for name, caps in blocked.items() if caps}
+            caveats.append(
+                f"crossed with {system} (release {record.bw_release}): "
+                f"{len(tools) - len(missing)} of {len(tools)} tools have every capability they "
+                "need present on that system. Presence is not the same as having been run "
+                "there, so the release verdict above is unchanged."
+            )
+            if missing:
+                caveats.append(
+                    "on this system these tools are missing at least one capability they read: "
+                    + "; ".join(
+                        f"{name} ({', '.join(caps)})" for name, caps in sorted(missing.items())
+                    )
+                )
+    return matrix.model_copy(
+        update={"tools": tools, "releases": releases, "totals": totals, "caveats": caveats}
+    )
 
 
 @_readonly_tool

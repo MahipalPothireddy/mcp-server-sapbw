@@ -70,6 +70,13 @@ jobs:
       - name: Contract check
         run: python scripts/capability_contract.py --check
 
+      # Fails when docs/support-matrix.md or the shipped support_matrix.json no longer matches the
+      # registered tools and what each was measured to read. Runs the suite with per-tool read
+      # attribution on, which is why it cannot be a pytest test: a test that regenerated the matrix
+      # would run the suite containing itself.
+      - name: Support matrix check
+        run: python scripts/support_matrix.py --check
+
   security:
     name: secret scan + customer-metadata leak check
     runs-on: ubuntu-latest

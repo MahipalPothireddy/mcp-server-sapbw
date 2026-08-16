@@ -95,6 +95,55 @@ def record_reads() -> Iterator[set[str]]:
             previous |= observed  # an outer block also saw whatever the inner one read
 
 
+# --- per-tool attribution (off unless explicitly switched on) ----------------------------------
+#
+# The contract answers "is this capability read anywhere". The support matrix has to answer a
+# different question - "which capabilities does *this tool* need" - because that is the unit a
+# customer thinks in: nobody asks whether RSPCPROCESSLOG is present, they ask whether
+# bw_get_chain_runtimes works on their release.
+#
+# Hand-maintaining that mapping across 55 tools would drift the first time a tool gained a reader,
+# and drift silently, since nothing would contradict it. So it is measured through the same
+# chokepoint: each tool call opens a nested recording scope, and what it read is attributed to it.
+# Off by default and gated on a single bool, so a production call pays one attribute lookup.
+
+_attribution: dict[str, set[str]] = {}
+_attribution_on = False
+
+
+def enable_tool_attribution() -> None:
+    """Switch per-tool read attribution on. Called by the test session, never in production."""
+    global _attribution_on  # noqa: PLW0603 - one process-wide build-time switch
+    _attribution_on = True
+
+
+def tool_attribution() -> dict[str, set[str]]:
+    """What each tool was observed to read, so far. Keys are tool names."""
+    return {tool: set(reads) for tool, reads in _attribution.items()}
+
+
+def reset_tool_attribution() -> None:
+    _attribution.clear()
+
+
+@contextmanager
+def record_tool_reads(tool: str) -> Iterator[None]:
+    """Attribute the reads inside the block to one tool.
+
+    A no-op unless :func:`enable_tool_attribution` has been called. The scope nests, so an outer
+    session-wide recorder still sees everything the block read - the attribution is additional
+    bookkeeping, not a redirection.
+    """
+    if not _attribution_on:
+        yield
+        return
+    with record_reads() as observed:
+        try:
+            yield
+        finally:
+            _attribution.setdefault(tool, set()).update(observed)
+
+
 def needs_active_version(physical_table: str) -> bool:
     """True when a physical table name belongs to an OBJVERS-versioned family.
 
