@@ -22,6 +22,7 @@ from ..models.aggregation import KeyFigureAggregation
 from ..models.description import Description
 from ..models.provenance import UnsupportedResult
 from ..models.providers import (
+    AttributeRef,
     InfoObjectKind,
     ObjectNotFound,
     PartProviderRef,
@@ -53,6 +54,9 @@ _CALC_SCHEMA = "_SYS_BIC"
 _TRANSITIVE_DEPENDENCY = 2
 _MAX_PART_TABLES = 400  # transitive closure of one view; bounded, and reported when hit
 _MAX_CATALOG = 20000  # provider-name catalogue used to confirm table -> object readings
+# How many object names a caveat lists before eliding. A caveat points at the list; it is not a
+# second copy of it (a characteristic can inherit 175 attributes).
+_CAVEAT_NAMES = 10
 
 # Table-resolver kind -> provider type vocabulary.
 _KIND_TO_PROVIDER_TYPE: dict[ResolvedKind, ProviderType | None] = {
@@ -297,7 +301,7 @@ class ProvidersRepository(Repository):
                     ),
                 )
             )
-        return fields
+        return self._annotate_nav_attribute_fields(fields)
 
     def _build_adso(self, name: str) -> Provider | None:
         header = self.select(
@@ -422,7 +426,7 @@ class ProvidersRepository(Repository):
                     ),
                 )
             )
-        return fields
+        return self._annotate_nav_attribute_fields(fields)
 
     def _multiprovider_parts(self, name: str) -> list[PartProviderRef]:
         rows = self.select(
@@ -522,6 +526,18 @@ class ProvidersRepository(Repository):
             )
         elif aggregation is not None and not aggregation.summable:
             caveats.extend(aggregation.summability_caveats)
+
+        attributes: list[AttributeRef] = []
+        if kind == "characteristic":
+            attributes, attribute_caveats = self._attributes(name)
+            caveats.extend(attribute_caveats)
+            restricted = sorted(a.name for a in attributes if a.auth_relevant)
+            if restricted:
+                caveats.append(
+                    "these navigation attributes are authorisation-relevant in their own right, "
+                    "so a query drilling down by one returns different rows per user even when "
+                    "the characteristic itself is unrestricted: " + ", ".join(restricted)
+                )
         return Provider(
             name=name,
             object_type="infoobject",
@@ -531,14 +547,199 @@ class ProvidersRepository(Repository):
             application=_clean(appl),
             composition_source="none",
             aggregation=aggregation,
-            caveats=[
-                "attributes and navigation attributes are not resolved in this build "
-                "(RSDBCHATR / RSDATRNAV)",
-                *caveats,
-            ],
+            attributes=attributes,
+            caveats=caveats,
             description=description,
             provenance=[self.provenance("infoobject", {"IOBJNM": name, "OBJVERS": "A"})],
         )
+
+    def _attributes(self, name: str) -> tuple[list[AttributeRef], list[str]]:
+        """A characteristic's display and navigation attributes, with the inheritance resolved.
+
+        The two tables are keyed differently and it matters. ``RSDBCHATR`` is keyed on the *basic*
+        characteristic, so a reference characteristic has no rows of its own and inherits its base's
+        attribute list. ``RSDATRNAV`` is keyed on the characteristic itself, so that same inherited
+        attribute carries a navigation name belonging to the reference. Keying both on one name is
+        the obvious implementation and is wrong in both directions: on the reference system 26% of
+        characteristics are references, and 724 of 4,129 navigation attributes exist only under a
+        reference name.
+
+        Returns the attributes plus any caveats, so an unreadable table is stated rather than
+        rendered as "this characteristic has no attributes".
+        """
+        caveats: list[str] = []
+        if not self.capability.is_available("attribute"):
+            return [], [
+                f"attributes are not resolved: {self.physical('attribute')} is absent on this "
+                "release, so whether this characteristic has attributes is unknown"
+            ]
+
+        base = self._basic_characteristic(name)
+        if base is None:
+            base = name
+            caveats.append(
+                f"the basic characteristic behind {name} could not be read from "
+                f"{self.physical('characteristic')}, so attributes were looked up under its own "
+                "name; a reference characteristic's inherited attributes would be missed"
+            )
+
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["ATTRINM", "POSIT", "ATTRITP", "ATRTIMFL", "NODISPINQUERYFL"],
+                from_logical="attribute",
+                where=["CHABASNM = ?"],
+                params=[base],
+                order_by=["POSIT", "ATTRINM"],
+            )
+        )
+        if not rows:
+            return [], caveats
+
+        nav = self._nav_attributes(name)
+        if nav is None:
+            caveats.append(
+                f"navigation attributes are not resolved: {self.physical('nav_attribute')} is "
+                "absent on this release, so an attribute reported as display-only here may in fact "
+                "be navigable"
+            )
+        nav_rows = nav or {}
+
+        names = [str(r[0]).strip() for r in rows]
+        descriptions = self._texts.object_texts(_TEXT_SPECS["infoobject"], names)
+
+        attributes: list[AttributeRef] = []
+        for attrinm, posit, attritp, timfl, nodisp in rows:
+            attribute = str(attrinm).strip()
+            if not attribute:
+                continue
+            nav_row = nav_rows.get(attribute)
+            provenance = [self.provenance("attribute", {"CHABASNM": base, "ATTRINM": attribute})]
+            if nav_row is not None:
+                provenance.append(
+                    self.provenance("nav_attribute", {"CHANM": name, "ATTRINM": attribute})
+                )
+            attributes.append(
+                AttributeRef(
+                    name=attribute,
+                    description=descriptions.get(attribute),
+                    kind="navigation" if str(attritp).strip().upper() == "NAV" else "display",
+                    position=_as_int(posit),
+                    # Domain RSDCNVFL, whose values are '0'/'1' - not the 'X' every neighbouring
+                    # flag uses. Measured: 688 attributes are time-dependent on the reference
+                    # system, all of which an 'X' test would report as not.
+                    time_dependent=str(timfl).strip() == "1",
+                    hidden_in_query=str(nodisp).strip().upper() == "X",
+                    navigation_name=None if nav_row is None else nav_row[0],
+                    navigable=nav_row is not None and nav_row[0] is not None,
+                    auth_relevant=nav_row is not None and nav_row[1],
+                    text_from_characteristic=nav_row is not None and nav_row[2],
+                    transitive=nav_row is not None and nav_row[3],
+                    inherited_from=base if base != name else None,
+                    provenance=provenance,
+                )
+            )
+        not_exposed = sorted(
+            a.name for a in attributes if a.kind == "navigation" and not a.navigable
+        )
+        if not_exposed:
+            caveats.append(
+                f"{len(not_exposed)} attributes are navigable on the basic characteristic {base} "
+                f"but carry no navigation name under {name}, so a query on {name} cannot drill "
+                "down by them: "
+                + ", ".join(not_exposed[:_CAVEAT_NAMES])
+                + (" ..." if len(not_exposed) > _CAVEAT_NAMES else "")
+            )
+        return attributes, caveats
+
+    def _annotate_nav_attribute_fields(self, fields: list[ProviderField]) -> list[ProviderField]:
+        """Resolve provider fields that are navigation attributes back to what they come from.
+
+        A navigation attribute appears in a provider's field list under its own technical name -
+        ``<characteristic>__<attribute>`` in almost every case - and nothing else in the field row
+        says the value is not stored there but read from the characteristic's master data. On the
+        reference system 2,756 InfoCube field rows are navigation attributes, so a field list
+        without this is 2,756 names a reader has to decode by convention.
+
+        One query for the whole field list. The name is matched against stored ``ATRNAVNM`` rather
+        than split on ``__``, because the convention holds for 4,127 of 4,129 rows and splitting
+        would invent a characteristic for the other two.
+        """
+        if not fields or not self.capability.is_available("nav_attribute"):
+            return fields
+        names = sorted({f.name for f in fields})
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["ATRNAVNM", "CHANM", "ATTRINM"],
+                from_logical="nav_attribute",
+                where=[f"ATRNAVNM IN ({', '.join('?' for _ in names)})"],
+                params=names,
+            )
+        )
+        resolved = {
+            str(navnm).strip(): (_clean(chanm), _clean(attrinm)) for navnm, chanm, attrinm in rows
+        }
+        if not resolved:
+            return fields
+        annotated: list[ProviderField] = []
+        for field in fields:
+            match = resolved.get(field.name)
+            if match is None:
+                annotated.append(field)
+                continue
+            annotated.append(
+                field.model_copy(
+                    update={
+                        "role": "navigation_attribute",
+                        "attribute_of": match[0],
+                        "attribute_name": match[1],
+                    }
+                )
+            )
+        return annotated
+
+    def _basic_characteristic(self, name: str) -> str | None:
+        """``RSDCHA.CHABASNM`` for a characteristic: the object its attribute list belongs to."""
+        if not self.capability.is_available("characteristic"):
+            return None
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["CHABASNM"],
+                from_logical="characteristic",
+                where=["CHANM = ?"],
+                params=[name],
+            )
+        )
+        if not rows:
+            return None
+        return _clean(rows[0][0]) or name
+
+    def _nav_attributes(self, name: str) -> dict[str, tuple[str | None, bool, bool, bool]] | None:
+        """``{ATTRINM: (nav_name, auth_relevant, text_from_characteristic, transitive)}``.
+
+        ``None`` when the table is absent, which is a different statement from an empty mapping.
+        """
+        if not self.capability.is_available("nav_attribute"):
+            return None
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["ATTRINM", "ATRNAVNM", "AUTHRELFL", "TXTFROMCHAFL", "TRANSITIVEFL"],
+                from_logical="nav_attribute",
+                where=["CHANM = ?"],
+                params=[name],
+            )
+        )
+        resolved: dict[str, tuple[str | None, bool, bool, bool]] = {}
+        for attrinm, navnm, authfl, txtfl, transfl in rows:
+            attribute = str(attrinm).strip()
+            if not attribute:
+                continue
+            resolved[attribute] = (
+                _clean(navnm),
+                str(authfl).strip().upper() == "X",
+                str(txtfl).strip().upper() == "X",
+                str(transfl).strip().upper() == "X",
+            )
+        return resolved
 
     def _key_figure_aggregation(self, name: str) -> KeyFigureAggregation | None:
         """Read a key figure's aggregation and unit handling from ``RSDKYF``.

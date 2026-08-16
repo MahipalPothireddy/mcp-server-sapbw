@@ -31,6 +31,9 @@ _PROVIDER_TABLES = {
     "infoobject": "RSDIOBJ",
     "infoobject_text": "RSDIOBJT",
     "keyfigure": "RSDKYF",
+    "characteristic": "RSDCHA",
+    "attribute": "RSDBCHATR",
+    "nav_attribute": "RSDATRNAV",
 }
 # HANA catalog views (schema SYS) needed for the calc-view route to CompositeProvider parts.
 _HANA_TABLES = {"hana_views": "VIEWS", "object_dependencies": "OBJECT_DEPENDENCIES"}
@@ -51,7 +54,12 @@ _CUBE = {
     "SALES_CUBE": ("B", "ACT", "SALES", "DEVUSER", "SD"),
     "SALES_MP": ("M", "ACT", "SALES", "DEVUSER", "SD"),
 }
-_CUBE_FIELDS = {"SALES_CUBE": [("MATERIAL", 1), ("AMOUNT", 2)], "SALES_MP": [("MATERIAL", 1)]}
+_CUBE_FIELDS = {
+    # The third field is a navigation attribute, which is how BW stores it: an opaque
+    # <characteristic>__<attribute> name with nothing in the row saying so.
+    "SALES_CUBE": [("MATERIAL", 1), ("AMOUNT", 2), ("MATERIAL_CHA__MATL_GROUP", 3)],
+    "SALES_MP": [("MATERIAL", 1)],
+}
 _CUBE_TEXT = {"SALES_CUBE": [("E", "Sales cube", "Sales InfoCube transaction data")]}
 _MP_PARTS = {"SALES_MP": [("SALES_CUBE", 1), ("SALES_DSO", 2)]}
 
@@ -68,8 +76,51 @@ _CP_BASE_TABLES = [
     "/BI0/" + "PMATERIAL_CHA",  # master-data attributes -> NOT a part provider
 ]
 
-_IOBJ = {"MATERIAL_CHA": ("CHA", "ACT", "SD"), "AMOUNT_KYF": ("KYF", "ACT", "SD")}
-_IOBJ_TEXT = {"MATERIAL_CHA": [("E", "Material", "Material master characteristic")]}
+_IOBJ = {
+    "MATERIAL_CHA": ("CHA", "ACT", "SD"),
+    "AMOUNT_KYF": ("KYF", "ACT", "SD"),
+    "SOLD_TO_CHA": ("CHA", "ACT", "SD"),
+}
+_IOBJ_TEXT = {
+    "MATERIAL_CHA": [("E", "Material", "Material master characteristic")],
+    "SOLD_TO_CHA": [("E", "Sold-to party", "Reference characteristic of MATERIAL_CHA")],
+}
+
+# --- attributes ---------------------------------------------------------------------------
+#
+# The shape that matters: SOLD_TO_CHA is a *reference* characteristic, so its attribute list lives
+# under its basic characteristic (RSDCHA.CHABASNM -> MATERIAL_CHA) while its navigation names live
+# under its own name. Two tables, two keys; a fixture that used one name for both would pass a
+# broken implementation.
+_RSDCHA = {  # CHANM -> CHABASNM
+    "MATERIAL_CHA": ("MATERIAL_CHA",),
+    "SOLD_TO_CHA": ("MATERIAL_CHA",),
+}
+# CHABASNM -> [(ATTRINM, POSIT, ATTRITP, ATRTIMFL, NODISPINQUERYFL)]
+# ATRTIMFL is domain RSDCNVFL: '1' means time-dependent, not 'X'.
+_RSDBCHATR = {
+    "MATERIAL_CHA": [
+        ("MATL_GROUP", 1, "NAV", "0", ""),
+        ("MATL_TYPE", 2, "NAV", "1", ""),
+        ("BASE_UOM", 3, "DIS", "0", ""),
+        ("OLD_MATNR", 4, "DIS", "0", "X"),
+    ]
+}
+# CHANM -> [(ATTRINM, ATRNAVNM, AUTHRELFL, TXTFROMCHAFL, TRANSITIVEFL)]
+# SOLD_TO_CHA exposes only one of the two navigable attributes it inherits.
+_RSDATRNAV = {
+    "MATERIAL_CHA": [
+        ("MATL_GROUP", "MATERIAL_CHA__MATL_GROUP", "", "X", ""),
+        ("MATL_TYPE", "MATERIAL_CHA__MATL_TYPE", "X", "", ""),
+    ],
+    "SOLD_TO_CHA": [("MATL_GROUP", "SOLD_TO_CHA__MATL_GROUP", "", "", "")],
+}
+_ATTR_DESCRIPTIONS = {
+    "MATL_GROUP": "Material group",
+    "MATL_TYPE": "Material type",
+    "BASE_UOM": "Base unit of measure",
+    "OLD_MATNR": "Legacy material number",
+}
 # RSDKYF: KYFTP, DATATP, AGGRGEN, AGGREXC, AGGRCHA, NCUMFL, FIXCUKY, FIXUNIT, UNINM, KYFSEMANTIC.
 # AMOUNT_KYF takes the LAST value along CALDAY, so its number is not the sum of the rows, and its
 # currency varies per record.
@@ -142,11 +193,30 @@ class ScriptedConnection:
             return [(t,) for t in _CP_BASE_TABLES]
         if "RSDKYF" in sql:
             return _rows_for_name(_KYF, name)
+        if "RSDBCHATR" in sql:
+            return _rows_for_name(_RSDBCHATR, name)
+        if "RSDATRNAV" in sql:
+            return self._nav_attributes(sql, name)
+        if "RSDCHA" in sql:
+            return _rows_for_name(_RSDCHA, name)
         if "RSDIOBJT" in sql:
+            if "IN (" in sql:  # bulk short-text read: (IOBJNM, LANGU, TXTSH)
+                return [(n, "E", t) for n, t in _ATTR_DESCRIPTIONS.items()]
             return _rows_for_name(_IOBJ_TEXT, name)
         if "RSDIOBJ" in sql:
             return _rows_for_name(_IOBJ, name)
         return []
+
+    @staticmethod
+    def _nav_attributes(sql: str, name: str) -> list[tuple[Any, ...]]:
+        """RSDATRNAV is read two ways: by characteristic, and by navigation name for a field."""
+        if "ATRNAVNM IN (" in sql:  # (ATRNAVNM, CHANM, ATTRINM)
+            return [
+                (navnm, chanm, attrinm)
+                for chanm, rows in _RSDATRNAV.items()
+                for attrinm, navnm, *_flags in rows
+            ]
+        return _rows_for_name(_RSDATRNAV, name)
 
     @staticmethod
     def _hana_text(
@@ -242,7 +312,11 @@ def test_describe_infocube() -> None:
     assert provider.object_type == "infocube"
     assert provider.subtype == "B"
     assert provider.active is True
-    assert {f.name for f in provider.fields} == {"MATERIAL", "AMOUNT"}
+    assert {f.name for f in provider.fields} == {
+        "MATERIAL",
+        "AMOUNT",
+        "MATERIAL_CHA__MATL_GROUP",
+    }
 
 
 def test_describe_multiprovider_parts_and_generated_description() -> None:
@@ -281,12 +355,128 @@ def test_describe_compositeprovider_resolves_parts_via_calc_view() -> None:
 # --- InfoObject ---------------------------------------------------------------------------
 
 
-def test_describe_infoobject_kind_and_caveat() -> None:
+def test_describe_infoobject_kind() -> None:
     provider = _repo().describe("MATERIAL_CHA")
     assert not isinstance(provider, (ObjectNotFound, UnsupportedResult))
     assert provider.object_type == "infoobject"
     assert provider.infoobject_kind == "characteristic"
-    assert any("attributes" in c.lower() for c in provider.caveats)
+
+
+# --- attributes ---------------------------------------------------------------------------
+
+
+def test_basic_characteristic_attributes_are_resolved() -> None:
+    provider = _described("MATERIAL_CHA")
+    by_name = {a.name: a for a in provider.attributes}
+    assert set(by_name) == {"MATL_GROUP", "MATL_TYPE", "BASE_UOM", "OLD_MATNR"}
+    assert [a.position for a in provider.attributes] == [1, 2, 3, 4]
+    # Locally defined, so nothing is marked inherited.
+    assert all(a.inherited_from is None for a in provider.attributes)
+    assert by_name["MATL_GROUP"].kind == "navigation"
+    assert by_name["BASE_UOM"].kind == "display"
+    assert by_name["MATL_GROUP"].description == "Material group"
+
+
+def test_time_dependent_attribute_uses_the_numeric_flag_not_x() -> None:
+    """ATRTIMFL is domain RSDCNVFL ('0'/'1'). Testing for 'X' reports every attribute as static."""
+    by_name = {a.name: a for a in _described("MATERIAL_CHA").attributes}
+    assert by_name["MATL_TYPE"].time_dependent is True
+    assert by_name["MATL_GROUP"].time_dependent is False
+
+
+def test_navigation_name_is_read_not_composed() -> None:
+    by_name = {a.name: a for a in _described("MATERIAL_CHA").attributes}
+    assert by_name["MATL_GROUP"].navigation_name == "MATERIAL_CHA__MATL_GROUP"
+    assert by_name["MATL_GROUP"].navigable is True
+    # A display attribute has no navigation row at all.
+    assert by_name["BASE_UOM"].navigation_name is None
+    assert by_name["BASE_UOM"].navigable is False
+
+
+def test_hidden_in_query_flag_is_carried() -> None:
+    by_name = {a.name: a for a in _described("MATERIAL_CHA").attributes}
+    assert by_name["OLD_MATNR"].hidden_in_query is True
+    assert by_name["BASE_UOM"].hidden_in_query is False
+
+
+def test_reference_characteristic_inherits_its_bases_attributes() -> None:
+    """RSDBCHATR is keyed on the basic characteristic; keying it on the reference finds nothing."""
+    provider = _described("SOLD_TO_CHA")
+    assert {a.name for a in provider.attributes} == {
+        "MATL_GROUP",
+        "MATL_TYPE",
+        "BASE_UOM",
+        "OLD_MATNR",
+    }
+    assert all(a.inherited_from == "MATERIAL_CHA" for a in provider.attributes)
+
+
+def test_reference_characteristic_carries_its_own_navigation_names() -> None:
+    """RSDATRNAV is keyed on the characteristic itself, so the nav name is the reference's own."""
+    by_name = {a.name: a for a in _described("SOLD_TO_CHA").attributes}
+    assert by_name["MATL_GROUP"].navigation_name == "SOLD_TO_CHA__MATL_GROUP"
+    assert by_name["MATL_GROUP"].navigable is True
+
+
+def test_inherited_navigable_attribute_not_exposed_here_is_reported() -> None:
+    """Navigable on the base but with no navigation name here means no drilldown - and is stated."""
+    provider = _described("SOLD_TO_CHA")
+    by_name = {a.name: a for a in provider.attributes}
+    assert by_name["MATL_TYPE"].kind == "navigation"
+    assert by_name["MATL_TYPE"].navigable is False
+    assert by_name["MATL_TYPE"].navigation_name is None
+    assert any("cannot drill down" in c and "MATL_TYPE" in c for c in provider.caveats)
+
+
+def test_authorisation_relevant_navigation_attribute_is_flagged() -> None:
+    provider = _described("MATERIAL_CHA")
+    by_name = {a.name: a for a in provider.attributes}
+    assert by_name["MATL_TYPE"].auth_relevant is True
+    assert by_name["MATL_GROUP"].auth_relevant is False
+    assert by_name["MATL_GROUP"].text_from_characteristic is True
+    assert any("authorisation-relevant" in c and "MATL_TYPE" in c for c in provider.caveats)
+
+
+def test_attributes_carry_provenance_for_both_tables() -> None:
+    by_name = {a.name: a for a in _described("MATERIAL_CHA").attributes}
+    assert [p.source_table for p in by_name["MATL_GROUP"].provenance] == ["RSDBCHATR", "RSDATRNAV"]
+    # A display attribute has no navigation row, so it cites one table only.
+    assert [p.source_table for p in by_name["BASE_UOM"].provenance] == ["RSDBCHATR"]
+
+
+def test_absent_attribute_table_is_stated_not_reported_as_no_attributes() -> None:
+    present = set(_PROVIDER_TABLES) | set(_HANA_TABLES)
+    provider = _described("MATERIAL_CHA", present - {"attribute"})
+    assert provider.attributes == []
+    assert any("attributes are not resolved" in c for c in provider.caveats)
+
+
+def test_absent_nav_attribute_table_does_not_claim_display_only() -> None:
+    present = set(_PROVIDER_TABLES) | set(_HANA_TABLES)
+    provider = _described("MATERIAL_CHA", present - {"nav_attribute"})
+    assert {a.name for a in provider.attributes} == {
+        "MATL_GROUP",
+        "MATL_TYPE",
+        "BASE_UOM",
+        "OLD_MATNR",
+    }
+    assert all(a.navigation_name is None for a in provider.attributes)
+    assert any("navigation attributes are not resolved" in c for c in provider.caveats)
+
+
+def test_key_figure_has_no_attributes() -> None:
+    assert _described("AMOUNT_KYF").attributes == []
+
+
+def test_provider_field_that_is_a_navigation_attribute_is_resolved() -> None:
+    """A field list otherwise shows an opaque X__Y name with no statement of where it comes from."""
+    fields = {f.name: f for f in _described("SALES_CUBE").fields}
+    nav = fields["MATERIAL_CHA__MATL_GROUP"]
+    assert nav.role == "navigation_attribute"
+    assert (nav.attribute_of, nav.attribute_name) == ("MATERIAL_CHA", "MATL_GROUP")
+    # An ordinary field is left alone.
+    assert fields["AMOUNT"].role == "field"
+    assert fields["AMOUNT"].attribute_of is None
 
 
 # --- resolution / gating ------------------------------------------------------------------

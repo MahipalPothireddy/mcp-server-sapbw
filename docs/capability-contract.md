@@ -7,7 +7,7 @@ Declaring a capability is cheap; reading it is not, so the two are recorded
 separately and a drift check fails the build when a capability is declared with
 neither a reader nor a stated reason.
 
-**73 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
+**75 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
 
 | State | Meaning |
 |---|---|
@@ -21,13 +21,14 @@ neither a reader nor a stated reason.
 Presence of a table on *your* system is a separate question, answered per connection by
 `bw_system_profile`. This file records what the server would do with it if present.
 
-## SUPPORTED (59)
+## SUPPORTED (61)
 
 | Capability | Object | Notes |
 |---|---|---|
 | `adso_header` | `RSOADSO` | read by the server |
 | `adso_keyfields` | `RSOADSOKEYFIELDS` | read by the server |
 | `adso_text` | `RSOADSOT` | read by the server |
+| `attribute` | `RSDBCHATR` | read by the server |
 | `auth_hierarchy` | `RSECHIE` | read by the server |
 | `auth_text` | `RSECTXT` | read by the server |
 | `auth_user` | `RSECUSERAUTH` | read by the server |
@@ -64,6 +65,7 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `keyfigure` | `RSDKYF` | read by the server |
 | `log_chain` | `RSPCLOGCHAIN` | read by the server |
 | `multiprovider_part` | `RSDCUBEMULTI` | read by the server |
+| `nav_attribute` | `RSDATRNAV` | read by the server |
 | `object_dependencies` | `OBJECT_DEPENDENCIES` | read by the server |
 | `process_log` | `RSPCPROCESSLOG` | read by the server |
 | `query_dir` | `RSZCOMPDIR` | read by the server |
@@ -109,7 +111,7 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `composite_provider` | `RSOHCPR%` | Pattern RSOHCPR% establishes whether CompositeProviders exist. The tables it finds are declared as composite_header/composite_text, which are read. |
 | `query_stats` | `RSDDSTAT%` | Pattern RSDDSTAT% establishes which BW statistics variant a release carries; the names differ across 7.4/7.5/BW4. Query usage is read from RSZCOMPDIR.LASTUSED instead, which is present on every release, so no statistics table is read directly. |
 
-## PLANNED (21)
+## PLANNED (19)
 
 | Capability | Object | Notes |
 |---|---|---|
@@ -117,7 +119,6 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `abap_role_auth` | `AGR_1251` | See abap_user_profile. |
 | `abap_user_profile` | `UST04` | UST04/UST10S/AGR_USERS/AGR_1251 tie a BW user to their ABAP roles and profiles. The security tools report analysis-authorisation shape and assignment; the ABAP role side would show how a user comes to hold one. |
 | `abap_user_role` | `AGR_USERS` | See abap_user_profile. |
-| `attribute` | `RSDBCHATR` | RSDBCHATR holds InfoObject attributes. bw_describe_object currently states in a caveat that attributes are unresolved; this is the table that closes it. |
 | `comm_structure` | `RSKS` | RSKS/RSKSFIELDNEW hold the 3.x communication structure between transfer rules and update rules. bw_list_update_rules reports the update rules; the structure between them is not yet resolved. |
 | `comm_structure_field` | `RSKSFIELDNEW` | See comm_structure. |
 | `dtp_request` | `RSBKREQUEST` | RSBKREQUEST holds per-DTP request history. Provider currency currently comes from RSSTATMANPART; this would add per-DTP durations and record counts. |
@@ -130,7 +131,6 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `job_schedule` | `TBTCS` | See job_header. |
 | `job_steps` | `TBTCP` | See job_header. |
 | `log_messages` | `RSPCLOGS` | RSPCLOGS holds per-step chain messages. Runtime statistics come from RSPCPROCESSLOG; the messages are what a failure diagnosis needs. |
-| `nav_attribute` | `RSDATRNAV` | RSDATRNAV holds navigation attributes, which appear in queries as if they were characteristics of the provider. Needed for complete query field lineage. |
 | `report_dir` | `RSRREPDIR` | RSRREPDIR holds query generation status, which distinguishes a query that exists from one that is executable. |
 | `routine_source_3x` | `RSAROUT` | RSAROUT/RSAROUTT hold 3.x routine source. bw_get_routine_code covers 7.x routines from RSAABAP only, so a 3.x flow's conversion routines are currently named but not read. |
 | `routine_text_3x` | `RSAROUTT` | See routine_source_3x. |

@@ -20,11 +20,13 @@ from mcp_server_sapbw.models.description import Description
 from mcp_server_sapbw.models.hana import HanaCrossing, HanaCrossingReport
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
 from mcp_server_sapbw.models.provenance import Provenance
+from mcp_server_sapbw.models.providers import AttributeRef, Provider
 from mcp_server_sapbw.services.docgen import (
     GENERATED_MARKER,
     DocGenerator,
     DocGenError,
     _LoadClosure,
+    _render_attributes,
     _render_description,
     _safe_output_dir,
     _slug,
@@ -140,6 +142,50 @@ def test_render_description_marks_generated() -> None:
     stored = Description(description_long="A real stored text.", origin="stored", quality_flag="ok")
     assert GENERATED_MARKER in _render_description(generated)
     assert GENERATED_MARKER not in _render_description(stored)
+
+
+def test_attribute_table_distinguishes_navigable_from_kind() -> None:
+    """The two disagree for an inherited attribute, and the page must not blur them."""
+    prov = Provenance(source_table="RSDBCHATR")
+    provider = Provider(
+        name="SOLD_TO_CHA",
+        object_type="infoobject",
+        infoobject_kind="characteristic",
+        provenance=prov,
+        attributes=[
+            AttributeRef(
+                name="MATL_GROUP",
+                kind="navigation",
+                position=1,
+                navigation_name="SOLD_TO_CHA__MATL_GROUP",
+                navigable=True,
+                inherited_from="MATERIAL_CHA",
+                description="Material group",
+            ),
+            AttributeRef(
+                name="MATL_TYPE",
+                kind="navigation",
+                position=2,
+                navigable=False,
+                time_dependent=True,
+                auth_relevant=True,
+                inherited_from="MATERIAL_CHA",
+            ),
+        ],
+    )
+    rendered = "\n".join(_render_attributes(provider))
+    assert "## Attributes" in rendered
+    assert "MATERIAL_CHA" in rendered  # the inheritance is stated on the page
+    assert "| `MATL_GROUP` | Material group | navigation | yes |" in rendered
+    # Navigable on the base, not exposed here: kind says navigation, navigable says no.
+    assert "| `MATL_TYPE` | - | navigation | no | - | yes | yes |" in rendered
+
+
+def test_attribute_table_omitted_for_objects_without_attributes() -> None:
+    provider = Provider(
+        name="SALES_DSO", object_type="dso", provenance=Provenance(source_table="RSDODSO")
+    )
+    assert _render_attributes(provider) == []
 
 
 def test_safe_output_dir_rejects_tracked_repo(tmp_path: Path) -> None:

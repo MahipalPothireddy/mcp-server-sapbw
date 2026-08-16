@@ -86,7 +86,63 @@ class ProviderField(BaseModel):
     is_key: bool = False  # part of the semantic key (DSO/ADSO KEYFLAG)
     role: FieldRole = "unknown"
     description: str | None = None  # field-level text where the source provides one
+    # When the field is a navigation attribute, the characteristic it hangs off and the attribute
+    # itself, resolved from RSDATRNAV. Without this a provider field list shows names like
+    # ``0CUSTOMER__0COUNTRY`` with nothing saying where the value comes from - and on the reference
+    # system 2,756 InfoCube field rows are exactly that.
+    attribute_of: str | None = None
+    attribute_name: str | None = None
     provenance: Provenance
+
+
+class AttributeRef(BaseModel):
+    """One attribute of a characteristic InfoObject.
+
+    Two tables, keyed differently, and the difference is load-bearing. ``RSDBCHATR`` is keyed on the
+    *basic* characteristic, so a reference characteristic inherits its base's attribute list;
+    ``RSDATRNAV`` is keyed on the characteristic itself, so the same inherited attribute carries a
+    navigation name of its own. Reading both from one name loses one side silently - measured on the
+    reference system, 26% of characteristics are reference characteristics and 724 of 4,129
+    navigation attributes are reachable only through the reference name.
+
+    ``kind`` and ``navigable`` answer two different questions and can disagree. ``kind`` is the
+    attribute type as defined on the basic characteristic, which is the only place BW stores it;
+    ``navigable`` says whether *this* characteristic exposes the attribute for drilldown, which is
+    true only when it has a navigation name of its own. A reference characteristic can therefore
+    inherit an attribute the base defines as navigable and still not expose it - measured on the
+    reference system, one such characteristic inherits 62 navigable attributes and exposes 55.
+    Reading ``kind`` alone would claim a drilldown that does not exist.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str  # ATTRINM - the attribute's own InfoObject
+    description: str | None = None
+    kind: Literal["display", "navigation"]
+    position: int | None = None
+    # RSDBCHATR.ATRTIMFL. Domain RSDCNVFL: '1' is true, '0'/blank false - not the usual 'X'.
+    time_dependent: bool = False
+    # RSDBCHATR.NODISPINQUERYFL - present in the provider but hidden from query display.
+    hidden_in_query: bool = False
+    # The navigation attribute's technical name as stored (RSDATRNAV.ATRNAVNM), which is what a
+    # provider field list and a query reference. Read rather than composed: it matches
+    # <CHANM>__<ATTRINM> for 4,127 of 4,129 rows on the reference system, so composing it would be
+    # wrong twice.
+    navigation_name: str | None = None
+    # Whether a query on *this* characteristic can drill down by the attribute. Stored rather than
+    # left to be derived, because the derivation ("navigation_name is not None") is not obvious and
+    # getting it wrong claims a drilldown the system does not offer.
+    navigable: bool = False
+    # RSDATRNAV.AUTHRELFL. A navigation attribute carries its own authorisation relevance, which can
+    # differ from that of the characteristic behind it - so a report can be row-restricted on an
+    # attribute nothing in the characteristic list would suggest.
+    auth_relevant: bool = False
+    text_from_characteristic: bool = False  # RSDATRNAV.TXTFROMCHAFL
+    transitive: bool = False  # RSDATRNAV.TRANSITIVEFL - attribute of an attribute
+    # Set when the attribute list came from a different (basic) characteristic than the one asked
+    # about, so an inherited attribute never looks locally defined.
+    inherited_from: str | None = None
+    provenance: list[Provenance] = Field(default_factory=list)
 
 
 class PartProviderRef(BaseModel):
@@ -130,6 +186,10 @@ class Provider(BaseModel):
     application: str | None = None
     key_field_names: list[str] = Field(default_factory=list)  # semantic key (DSO/ADSO)
     fields: list[ProviderField] = Field(default_factory=list)
+    # Only for a characteristic InfoObject: its display and navigation attributes. Empty for every
+    # other object type, and for a characteristic whose attribute tables could not be read - in
+    # which case a caveat says so rather than implying it has none.
+    attributes: list[AttributeRef] = Field(default_factory=list)
     part_providers: list[PartProviderRef] = Field(default_factory=list)
     composition_source: Literal["relational", "xml", "calc_view", "none"] = "none"
     # Only for a key-figure InfoObject: how its number combines and in what unit. Absent for every

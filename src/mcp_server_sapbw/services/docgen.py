@@ -29,7 +29,7 @@ from ..models.description import Description
 from ..models.hana import HanaCrossingReport
 from ..models.lineage import LineageGraph
 from ..models.provenance import UnsupportedResult
-from ..models.providers import ObjectNotFound
+from ..models.providers import ObjectNotFound, Provider
 from ..repositories.base import Repository
 from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
@@ -135,6 +135,48 @@ def _render_description(description: Description | None) -> str:
     marker = f"{GENERATED_MARKER}  \n" if description.origin != "stored" else ""
     origin = f"_origin: {description.origin}, quality: {description.quality_flag}_"
     return f"{marker}{text}  \n{origin}"
+
+
+# How many attributes a provider page renders before eliding. A characteristic can carry 175.
+_MAX_ATTRIBUTES = 60
+
+
+def _render_attributes(provider: Provider) -> list[str]:
+    """The attribute table for a characteristic InfoObject; nothing for any other object type.
+
+    ``Navigable`` is the column to read, not ``Kind``: an inherited attribute can be navigable on
+    the basic characteristic and still have no navigation name here, in which case no query on this
+    characteristic can drill down by it.
+    """
+    if not provider.attributes:
+        return []
+    rows = provider.attributes[:_MAX_ATTRIBUTES]
+    inherited = sorted({a.inherited_from for a in provider.attributes if a.inherited_from})
+    lines = ["## Attributes", ""]
+    if inherited:
+        lines += [
+            f"Inherited from basic characteristic **{', '.join(inherited)}** - this is a reference "
+            "characteristic, so its attribute list is defined there while its navigation names are "
+            "its own.",
+            "",
+        ]
+    lines += [
+        "| # | Attribute | Description | Kind | Navigable | Navigation name | Time-dep. | Auth. |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for attribute in rows:
+        lines.append(
+            f"| {attribute.position or ''} | `{attribute.name}` "
+            f"| {attribute.description or '-'} | {attribute.kind} "
+            f"| {'yes' if attribute.navigable else 'no'} "
+            f"| {f'`{attribute.navigation_name}`' if attribute.navigation_name else '-'} "
+            f"| {'yes' if attribute.time_dependent else 'no'} "
+            f"| {'yes' if attribute.auth_relevant else 'no'} |"
+        )
+    if len(provider.attributes) > _MAX_ATTRIBUTES:
+        lines.append(f"\n_Showing {_MAX_ATTRIBUTES} of {len(provider.attributes)} attributes._")
+    lines.append("")
+    return lines
 
 
 class _Gaps:
@@ -875,6 +917,7 @@ class DocGenerator(Repository):
                 _render_description(provider.description),
                 "",
             ]
+            lines += _render_attributes(provider)
             for caveat in provider.caveats:
                 self._gaps.add(f"provider {name}", caveat)
         loaded = closure.targets.get(name)

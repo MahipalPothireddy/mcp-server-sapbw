@@ -14,6 +14,7 @@ generation live in the descriptions service.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -101,6 +102,47 @@ class TextsRepository(Repository):
                 spec.text_logical, {spec.id_column: object_id, "LANGU": language or ""}
             ),
         )
+
+    def object_texts(
+        self,
+        spec: TextTableSpec,
+        object_ids: Sequence[str],
+        *,
+        preferred_language: str = DEFAULT_LANGUAGE,
+    ) -> dict[str, str]:
+        """Short texts for many objects in one query: ``{object_id: short_text}``.
+
+        A per-object :meth:`object_text` call would be correct but not affordable - an InfoObject
+        can carry fifty attributes, and fifty round trips would exhaust a tool's query budget on
+        descriptions alone. Objects with no row are simply absent from the result.
+        """
+        ids = [i for i in dict.fromkeys(str(i).strip() for i in object_ids) if i]
+        if not ids or not self.capability.is_available(spec.text_logical):
+            return {}
+
+        short_column = "TXTSH" if spec.shape == "classic" else "DESCRIPTION"
+        where = [f"{spec.id_column} IN ({', '.join('?' for _ in ids)})"]
+        if spec.shape == "hana":
+            where.append("TRIM(COLNAME) = ''")
+        rows = self.select(
+            self.dialect.build_select(
+                columns=[spec.id_column, "LANGU", short_column],
+                from_logical=spec.text_logical,
+                where=where,
+                params=list(ids),
+            )
+        )
+        best: dict[str, tuple[int, str]] = {}
+        for object_id, langu, short in rows:
+            key = str(object_id).strip()
+            text = _clean(short)
+            if not key or text is None:
+                continue
+            rank = _lang_rank(str(langu).strip(), preferred_language)
+            current = best.get(key)
+            if current is None or rank < current[0]:
+                best[key] = (rank, text)
+        return {key: value[1] for key, value in best.items()}
 
     def field_texts(
         self, spec: TextTableSpec, object_id: str, *, preferred_language: str = DEFAULT_LANGUAGE

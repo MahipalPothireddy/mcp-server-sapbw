@@ -125,16 +125,6 @@ DECLARED_STATE: dict[str, tuple[str, str]] = {
         "resolves during discovery.",
     ),
     # --- genuinely planned, with the feature named ------------------------------------------
-    "attribute": (
-        "PLANNED",
-        "RSDBCHATR holds InfoObject attributes. bw_describe_object currently states in a caveat "
-        "that attributes are unresolved; this is the table that closes it.",
-    ),
-    "nav_attribute": (
-        "PLANNED",
-        "RSDATRNAV holds navigation attributes, which appear in queries as if they were "
-        "characteristics of the provider. Needed for complete query field lineage.",
-    ),
     "element_prop": (
         "PLANNED",
         "RSZELTPROP carries element display properties and axis placement. Needed to report where "

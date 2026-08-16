@@ -6,6 +6,64 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — the capability contract, and `bw_capability_report`
+
+The resolver declares a logical name for every metadata table the server knows about. Declaring one
+is cheap; reading it is not. Left unchecked the two drift, and the schema ends up claiming an
+understanding the implementation does not have — which a customer discovers by asking a question the
+server answers thinly.
+
+Each declared capability now carries one of `SUPPORTED`, `PARTIAL`, `DISCOVERY_ONLY`, `PLANNED`,
+`NOT_SUPPORTED` or `DEPRECATED`, published in `docs/capability-contract.md`. Implementation is
+established by measurement rather than assertion: a static scan for `from_logical="x"` unioned with
+the logical names the SQL dialect was actually asked for while the test suite ran. The static scan
+alone undercounted by ten, because eight call sites pass the name as a variable fed from a
+module-level spec table and a grep reports those as dead. Anything in neither signal must carry an
+explicit state and a reason, so a table is either read or its non-implementation is a stated
+decision.
+
+`bw_capability_report` crosses the contract with a system's discovery record, because two facts have
+to meet before a question has an answer: the server must implement a reader, and the connected
+release must carry the object. The verdict per capability is `usable`, `absent_on_system`,
+`not_implemented` or `not_applicable` — the two failure modes look identical from the outside and
+only one of them is a gap in this server. Tool count 45 → 46.
+
+The contract ships as a package data file (`data/capability_contract.json`) read through
+`importlib.resources`, identified by package version plus a digest of its content rather than a
+generation timestamp: a timestamp records when someone ran a script, not which contract this is, and
+it would make the `--check` comparison non-deterministic. CI runs the check; a test asserts the
+committed artifact still matches what the code declares.
+
+### Added — InfoObject attributes and navigation attributes
+
+`bw_describe_object` on a characteristic carried a caveat saying attributes were unresolved. They now
+resolve from `RSDBCHATR` and `RSDATRNAV`, with each decoding decision measured against the reference
+system rather than assumed:
+
+- **The two tables are keyed differently and it is load-bearing.** `RSDBCHATR` is keyed on the
+  *basic* characteristic, so a reference characteristic has no rows of its own and inherits its
+  base's attribute list; `RSDATRNAV` is keyed on the characteristic itself, so that same inherited
+  attribute carries a navigation name belonging to the reference. Measured: 26% of characteristics
+  are references, and 724 of 4,129 navigation attributes exist only under a reference name. Keying
+  both on one name — the obvious implementation — is wrong in both directions.
+- **`ATRTIMFL` is domain `RSDCNVFL`, whose values are `'0'`/`'1'`, not the `'X'` every neighbouring
+  flag uses.** Testing for `'X'` reports all 688 time-dependent attributes as static.
+- **`ATRNAVNM` is read, not composed.** It equals `<CHANM>__<ATTRINM>` for 4,127 of 4,129 rows, so
+  composing it invents a name twice.
+- **`kind` and `navigable` are separate fields because they disagree.** An inherited attribute can be
+  navigable on the base and still have no navigation name here, in which case no query on this
+  characteristic can drill down by it. One characteristic inherits 62 navigable attributes and
+  exposes 55; a caveat names the difference.
+- **A navigation attribute carries its own authorisation relevance** (`RSDATRNAV.AUTHRELFL`), which
+  can differ from the characteristic behind it — so a report can be row-restricted on an attribute
+  nothing in the characteristic list would suggest. Flagged with a caveat.
+
+Provider field lists now resolve fields that *are* navigation attributes back to their characteristic
+and attribute. On the reference system 2,756 InfoCube field rows are navigation attributes stored
+under an opaque `X__Y` name with nothing in the row saying where the value comes from.
+
+Contract movement: `attribute` and `nav_attribute` PLANNED → SUPPORTED (61 supported of 97 declared).
+
 ### Added — BW security: analysis authorisations
 
 Row-level security was the largest uncovered area of standard BW: the server could describe every
