@@ -17,7 +17,7 @@ technical name (BW names are unique enough for lineage); the object type is a se
 from __future__ import annotations
 
 from collections import deque
-from typing import Any
+from typing import Any, cast
 
 from ..models.evidence import summarise
 from ..models.lineage import (
@@ -30,32 +30,23 @@ from ..models.lineage import (
     TraceToSource,
     UpdateMode,
 )
+from ..models.objects import BwObjectRef, normalise_object_type
 from ..models.provenance import Provenance, UnsupportedResult
+from ..models.providers import Provider
 from ..repositories.base import Repository
 from ..repositories.providers import ProvidersRepository
 from ..repositories.transformations import TransformationsRepository
 from .table_resolver import candidate_tables, provider_from_calc_view
 
-# RSTLOGO type code -> lineage node type.
-_RSTLOGO_TO_NODE: dict[str, LineageNodeType] = {
-    "RSDS": "datasource",
-    "TRCS": "infosource",
-    "ODSO": "dso",
-    "ADSO": "adso",
-    "CUBE": "cube",
-    "MPRO": "multiprovider",
-    "HCPR": "compositeprovider",
-    "IOBJ": "infoobject",
-}
-# Provider-type vocabulary -> lineage node type (for calc-view-resolved part providers).
-_PROVIDER_TYPE_TO_NODE: dict[str, LineageNodeType] = {
-    "dso": "dso",
-    "adso": "adso",
-    "infocube": "cube",
-    "multiprovider": "multiprovider",
-    "compositeprovider": "compositeprovider",
-    "infoobject": "infoobject",
-}
+
+# RSTLOGO type code -> lineage node type. Decoded through the canonical table in models.objects
+# rather than a local copy: three copies of this map existed and had already drifted (this one said
+# "cube" where the provider vocabulary said "infocube").
+def _node_type(code: object) -> LineageNodeType:
+    """Canonical node type for a raw TLOGO code or a provider-type string."""
+    return cast("LineageNodeType", normalise_object_type(code))
+
+
 _UPDMODE_MAP: dict[str, UpdateMode] = {"F": "full", "D": "delta", "I": "init"}
 
 # HANA schema holding generated BW calc views. Part-provider edges need TRANSITIVE dependencies
@@ -317,9 +308,8 @@ class LineageService(Repository):
                 )
             )
             if rows:
-                code = str(rows[0][0]).strip()
-                resolved = _RSTLOGO_TO_NODE.get(code)
-                if resolved is not None:
+                resolved = _node_type(str(rows[0][0]).strip())
+                if resolved != "unknown":
                     return resolved
         # A CompositeProvider is often an endpoint of nothing (it has no transformations at all).
         if self.capability.is_available("composite_header"):
@@ -340,6 +330,13 @@ class LineageService(Repository):
             header = self._query_repo()._header(name)
             if header is not None:
                 return "query"
+        # Last: ask the provider catalogue. An InfoCube that no transformation touches - an isolated
+        # or fully retired one - was reaching the caller as 'unknown' even though RSDCUBE says
+        # exactly what it is. Found by comparing the canonical id from bw_describe_object against
+        # the one from bw_get_lineage for the same object: they disagreed.
+        described = self._providers.describe(name)
+        if isinstance(described, Provider):
+            return _node_type(described.object_type)
         return "unknown"
 
     def _query_repo(self) -> Any:
@@ -396,7 +393,7 @@ class LineageService(Repository):
             hops.append(
                 _Hop(
                     part.name,
-                    _PROVIDER_TYPE_TO_NODE.get(part.part_type or "", "unknown"),
+                    _node_type(part.part_type),
                     LineageEdge(
                         src=part.name,
                         dst=name,
@@ -478,7 +475,7 @@ class LineageService(Repository):
 
         hops: list[_Hop] = []
         for other_name, info in merged.items():
-            other_type = _RSTLOGO_TO_NODE.get(info["type_code"], "unknown")
+            other_type = _node_type(info["type_code"])
             src, dst = (name, other_name) if downstream else (other_name, name)
             hops.append(
                 _Hop(
@@ -692,7 +689,7 @@ class LineageService(Repository):
             target = str(target_name).strip()
             if not target:
                 continue
-            node_type = _RSTLOGO_TO_NODE.get(str(target_type).strip(), "unknown")
+            node_type = _node_type(target_type)
             result.append((target, node_type, str(tran_id).strip()))
         return result
 
@@ -715,7 +712,12 @@ class LineageService(Repository):
                 provenance=provenance,
             )
         elif existing.object_type == "unknown" and node_type != "unknown":
+            # A node can be created before its type is known (a neighbour hop names it first) and
+            # upgraded when a later hop or the provider catalogue resolves it. The canonical ref was
+            # derived at construction, so it has to be rebuilt here or it keeps the stale type - and
+            # then two tools disagree about the same object, which is the whole thing being fixed.
             existing.object_type = node_type
+            existing.ref = BwObjectRef(object_type=normalise_object_type(node_type), name=name)
             existing.upstream_resolved = node_type != "datasource"
 
     def _graph(

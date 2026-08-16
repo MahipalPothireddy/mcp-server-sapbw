@@ -19,17 +19,26 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .evidence import Evidence, EvidenceSummary, evidence_for, summarise
+from .objects import BwObjectRef, normalise_object_type
 from .provenance import Provenance
 from .transformations import UnresolvedRef
 
 # Node object types (RSTLOGO-derived for BW objects, plus boundary/extension types).
+# Node object types. A subset of the canonical BwObjectType vocabulary, not a parallel list.
+#
+# BREAKING (pre-1.0): a basic InfoCube is now ``infocube``, matching bw_describe_object and every
+# other surface. It was ``cube`` here alone, so correlating a lineage node with a described object
+# required knowing the two words meant one thing. ``virtualprovider`` is added for the same reason -
+# it previously arrived as a plain cube, silently discarding the distinction. Legacy ``cube`` still
+# normalises through models.objects.TYPE_ALIASES.
 LineageNodeType = Literal[
     "datasource",
     "infosource",
     "dso",
     "adso",
-    "cube",
+    "infocube",
     "multiprovider",
+    "virtualprovider",
     "compositeprovider",
     "infoobject",
     "transformation",
@@ -76,10 +85,22 @@ class LineageNode(BaseModel):
     id: str
     object_type: LineageNodeType
     name: str
+    #: The canonical reference, whose own ``id`` is type-qualified (``infocube:SALES_CUBE``). ``id``
+    #: above stays the graph's internal key - the edges reference it and changing it would break
+    #: every stored graph - so ``ref.id`` is the value to join on across tools.
+    ref: BwObjectRef | None = None
     upstream_resolved: bool = True  # False on a DataSource with no resolved source-system parents
     source_system: SourceSystemRef | None = None
     unresolved_ref: UnresolvedRef | None = None
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_ref(self) -> LineageNode:
+        if self.ref is None:
+            self.ref = BwObjectRef(
+                object_type=normalise_object_type(self.object_type), name=self.name
+            )
+        return self
 
 
 class LineageEdge(BaseModel):

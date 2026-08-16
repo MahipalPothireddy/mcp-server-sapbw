@@ -25,7 +25,14 @@ _TABLES = {
     "transformation_step_rout": "RSTRANSTEPROUT",
     "routine_source": "RSAABAP",
     "dtp": "RSBKDTP",
+    # The provider catalogue, so an object no transformation touches can still be typed.
+    "cube_header": "RSDCUBE",
+    "cube_field": "RSDCUBEIOBJ",
 }
+
+# An InfoCube that is the endpoint of nothing: no transformation, no DTP. RSDCUBE knows exactly what
+# it is, and before the provider-catalogue fallback the lineage graph typed it 'unknown'.
+_ISOLATED_CUBE = "RETIRED_CUBE"
 
 _BIC_LOOKUP = "/BIC/" + "ALOOKUP_DSO00"  # concatenated so the scan does not match this .py file
 
@@ -72,6 +79,15 @@ class ScriptedConnection:
             return []  # no field routines in this landscape
         if "RSAABAP" in sql:
             return self._rsaabap(sql, params)
+        if "RSDCUBEIOBJ" in sql:
+            return []
+        if "RSDCUBE" in sql:
+            if "= ?" not in sql:  # catalogue listing
+                return [(_ISOLATED_CUBE,)]
+            # CUBETYPE, OBJSTAT, INFOAREA, OWNER, BWAPPL
+            return (
+                [("B", "ACT", "SALES", "DEVUSER", "SD")] if str(params[0]) == _ISOLATED_CUBE else []
+            )
         if "RSTRAN" in sql:
             return self._rstran(sql, params)
         return []
@@ -183,3 +199,32 @@ def test_impact_analysis_finds_routine_embedded_consumer() -> None:
 def test_unsupported_without_transformation() -> None:
     result = _service(present={"dtp"}).get_lineage("X", direction="both", depth=2)
     assert isinstance(result, UnsupportedResult)
+
+
+# --- canonical object typing ------------------------------------------------------------------
+
+
+def test_isolated_provider_is_typed_from_the_catalogue_not_left_unknown() -> None:
+    """An object no transformation touches was typed 'unknown' while RSDCUBE knew what it was.
+
+    Found by comparing the canonical id from bw_describe_object against the one from
+    bw_get_lineage for the same InfoCube: they disagreed, which is exactly what the canonical
+    object model exists to make visible.
+    """
+    graph = _service().get_lineage(_ISOLATED_CUBE, direction="both", depth=2)
+    assert not isinstance(graph, UnsupportedResult)
+    node = next(n for n in graph.nodes if n.name == _ISOLATED_CUBE)
+    assert node.object_type == "infocube"
+    assert node.ref is not None
+    assert node.ref.id == f"infocube:{_ISOLATED_CUBE}"
+
+
+def test_lineage_nodes_carry_a_canonical_ref() -> None:
+    graph = _service().get_lineage("SALES_CUBE", direction="both", depth=2)
+    assert not isinstance(graph, UnsupportedResult)
+    for node in graph.nodes:
+        assert node.ref is not None, f"{node.name} has no canonical ref"
+        assert node.ref.id.startswith(f"{node.object_type}:")
+    # The basic InfoCube is 'infocube' here, matching every other surface (it was 'cube').
+    cube = next(n for n in graph.nodes if n.name == "SALES_CUBE")
+    assert cube.object_type == "infocube"

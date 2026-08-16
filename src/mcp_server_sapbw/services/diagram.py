@@ -36,7 +36,8 @@ _NODE_STYLE: dict[LineageNodeType, tuple[str, str]] = {
     "infosource": ("#fed7aa", "#c2410c"),
     "dso": ("#bfdbfe", "#1d4ed8"),  # blue - persisted staging/EDW
     "adso": ("#c7d2fe", "#4338ca"),
-    "cube": ("#ddd6fe", "#6d28d9"),  # violet - aggregated
+    "infocube": ("#ddd6fe", "#6d28d9"),  # violet - aggregated
+    "virtualprovider": ("#ede9fe", "#5b21b6"),
     "multiprovider": ("#e9d5ff", "#7e22ce"),
     "compositeprovider": ("#bbf7d0", "#15803d"),  # green - virtual consumption layer
     "infoobject": ("#fecdd3", "#be123c"),  # rose - master data
@@ -52,7 +53,8 @@ _TYPE_LABEL: dict[LineageNodeType, str] = {
     "infosource": "InfoSource",
     "dso": "DSO",
     "adso": "Advanced DSO",
-    "cube": "InfoCube",
+    "infocube": "InfoCube",
+    "virtualprovider": "VirtualProvider",
     "multiprovider": "MultiProvider",
     "compositeprovider": "CompositeProvider",
     "infoobject": "InfoObject",

@@ -18,9 +18,10 @@ on the DataSource name alone can never match.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any
+from typing import Any, cast
 
 from ..core.dialect import like_term
+from ..models.objects import normalise_object_type
 from ..models.provenance import UnsupportedResult
 from ..models.transformations import (
     AggregationBehaviour,
@@ -47,18 +48,18 @@ from .texts import StoredText, TextsRepository, TextTableSpec
 
 _TEXT_SPEC = TextTableSpec("transformation_text", "TRANID", "classic")
 
+
 # RSTLOGO endpoint type code -> readable kind.
-_RSTLOGO_TO_KIND: dict[str, EndpointKind] = {
-    "RSDS": "datasource",
-    "TRCS": "infosource",
-    "ODSO": "dso",
-    "ADSO": "adso",
-    "CUBE": "infocube",
-    "MPRO": "multiprovider",
-    "HCPR": "compositeprovider",
-    "IOBJ": "infoobject",
-    "ELEM": "query_element",
-}
+def _endpoint_kind(code: str) -> EndpointKind:
+    """Decode a TLOGO code through the canonical table in ``models.objects``.
+
+    This was a local copy of that table. Three copies existed and had drifted, so the codes are now
+    decoded in one place. ``EndpointKind`` spells "untypable" ``other`` while the canonical
+    vocabulary says ``unknown``, so that one word is translated back here for schema compatibility.
+    """
+    resolved = normalise_object_type(code)
+    return cast("EndpointKind", "other" if resolved == "unknown" else resolved)
+
 
 # Rule-depth decodes. Every mapping below was read from the ABAP dictionary (DD03L -> DD07T fixed
 # domain values) on the live system rather than assumed, so the labels are SAP's own:
@@ -152,7 +153,7 @@ def _endpoint(type_code: Any, subtype: Any, name: Any) -> TransformationEndpoint
         return None
     return TransformationEndpoint(
         name=obj_name,
-        kind=_RSTLOGO_TO_KIND.get(code, "other"),
+        kind=_endpoint_kind(code),
         type_code=code,
         subtype=_clean(subtype),
     )

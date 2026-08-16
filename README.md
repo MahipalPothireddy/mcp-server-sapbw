@@ -48,6 +48,20 @@ own where-used lists), and can render a full markdown knowledge base on demand.
   layer violations including write-back loops, and more) plus decommission-candidate detection.
 - **Knowledge base** — a full markdown documentation set rendered on demand.
 
+## One name for one object
+
+Every object type comes from a single vocabulary, and every object carries a canonical reference:
+
+```json
+"ref": { "object_type": "infocube", "name": "SALES_CUBE", "id": "infocube:SALES_CUBE" }
+```
+
+`ref.id` is the key to join a `bw_describe_object` result against a `bw_get_lineage` node, a
+`bw_search_objects` hit, or a knowledge-base page. It is type-qualified because BW technical names
+are only *near*-unique — a DSO and an InfoObject can share one — so an unqualified name is not a safe
+graph key. Legacy spellings still normalise, and the TLOGO code BW stored is kept as `subtype` so an
+undecoded value stays visible.
+
 ## How firmly a fact is established
 
 Every fact that is not simply a row value carries an `evidence` object, in one vocabulary shared by

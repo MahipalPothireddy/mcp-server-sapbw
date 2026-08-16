@@ -6,6 +6,50 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — one canonical object model behind every surface (**breaking, pre-1.0**)
+
+Each subsystem had grown its own list of object types, and they had drifted:
+
+- `ProviderType`, `SearchObjectType` and `EndpointKind` called a basic InfoCube `infocube`;
+  `LineageNodeType` called the same object **`cube`**. A caller correlating a `bw_describe_object`
+  result against `bw_get_lineage` nodes had to know the two words meant one thing, and nothing said
+  so. No test noticed, because the suite passed either way.
+- `LineageNodeType` had no `virtualprovider` at all, so a virtual provider arrived as a plain cube
+  and the distinction the provider vocabulary makes was silently discarded.
+- `EndpointKind` spelled "untypable" `other`, `LineageNodeType` spelled it `unknown`.
+- The RSTLOGO code table was written out three times — in the lineage service, in the transformation
+  repository, and again as the table resolver's kind list — so keeping them in step was a matter of
+  remembering to.
+
+`models/objects.py` is now the single vocabulary (`BwObjectType`), the single RSTLOGO decode
+(`TLOGO_TO_TYPE`), and the single normaliser (`normalise_object_type`). `TYPE_ALIASES` accepts every
+legacy spelling, so a stored `cube` from an older response still resolves.
+
+**Breaking:** a basic InfoCube in a lineage graph is now `infocube`, not `cube`, and a virtual
+provider is `virtualprovider` rather than being flattened into a cube. Diagram styling and legends
+follow.
+
+`BwObjectRef` is the canonical identity — `object_type` + `name`, with a computed `id` of
+`<type>:<NAME>`. It is type-qualified because BW technical names are only *near*-unique (a DSO and an
+InfoObject can share one), so an unqualified name is not a safe graph key. `Provider`,
+`ProviderSummary`, `SearchHit` and `LineageNode` all expose `ref`, derived automatically, so one
+InfoCube has one key across three unrelated tools. A lineage node keeps its own `id` as the graph's
+internal key, because the edges reference it.
+
+Two bugs the canonical model surfaced immediately, both found by comparing the id from
+`bw_describe_object` against the one from `bw_get_lineage` for the same object:
+
+- **An object no transformation touches was typed `unknown`** in a lineage graph even though
+  `RSDCUBE` said exactly what it was. Node typing consulted transformations, CompositeProviders and
+  queries but never the provider catalogue. An isolated or retired cube is precisely the object
+  someone asks a lineage question about.
+- **A node upgraded from `unknown` to a real type kept a stale `ref`.** A node can be created before
+  its type is known — a neighbour hop names it first — and the derived reference was not rebuilt on
+  upgrade, so the two disagreed inside a single response.
+
+A test walks each subsystem vocabulary's own `Literal` and fails when a value does not normalise to a
+canonical type, so the next new spelling has to be a decision rather than an accident.
+
 ### Added — one evidence vocabulary, replacing seven
 
 The server was honest about uncertainty from the start, but in seven separate vocabularies: a part

@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .aggregation import KeyFigureAggregation
 from .description import Description
 from .evidence import Evidence, evidence_for
+from .objects import BwObjectRef, normalise_object_type
 from .provenance import Provenance
 
 # Unified provider/object type. Cube variants are split by RSDCUBE.CUBETYPE (B/M/V).
@@ -197,6 +198,9 @@ class Provider(BaseModel):
 
     name: str
     object_type: ProviderType
+    #: Canonical reference. ``ref.id`` (``infocube:SALES_CUBE``) is the key to join this result
+    #: against a lineage node, a search hit or a docs page - one spelling, type-qualified.
+    ref: BwObjectRef | None = None
     subtype: str | None = None  # ODSOTYPE / CUBESUBTYPE / IOBJTP raw code, when meaningful
     infoobject_kind: InfoObjectKind | None = None  # only for object_type == 'infoobject'
     description: Description | None = None
@@ -218,6 +222,16 @@ class Provider(BaseModel):
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 
+    @model_validator(mode="after")
+    def _derive_ref(self) -> Provider:
+        if self.ref is None:
+            self.ref = BwObjectRef(
+                object_type=normalise_object_type(self.object_type),
+                name=self.name,
+                subtype=self.subtype,
+            )
+        return self
+
 
 class ProviderSummary(BaseModel):
     """Compact provider entry for list/search results."""
@@ -226,10 +240,19 @@ class ProviderSummary(BaseModel):
 
     name: str
     object_type: ProviderType
+    ref: BwObjectRef | None = None
     description_short: str | None = None
     active: bool = True
     info_area: str | None = None
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_ref(self) -> ProviderSummary:
+        if self.ref is None:
+            self.ref = BwObjectRef(
+                object_type=normalise_object_type(self.object_type), name=self.name
+            )
+        return self
 
 
 class SearchHit(BaseModel):
@@ -239,9 +262,18 @@ class SearchHit(BaseModel):
 
     name: str
     object_type: SearchObjectType
+    ref: BwObjectRef | None = None
     description_short: str | None = None
     matched_on: Literal["name", "description"]
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _derive_ref(self) -> SearchHit:
+        if self.ref is None:
+            self.ref = BwObjectRef(
+                object_type=normalise_object_type(self.object_type), name=self.name
+            )
+        return self
 
 
 class ObjectNotFound(BaseModel):
