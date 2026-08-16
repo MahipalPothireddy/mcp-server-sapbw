@@ -103,12 +103,21 @@ _INBOUND = {
 # Write-back shapes. SELF_DSO is written from itself; A_DSO and B_DSO each feed the other.
 # TRANID, SOURCENAME, TARGETNAME, TARGETTYPE
 _SELF_LOOPS = [("TR_SELF", "SELF_DSO", "SELF_DSO", "ODSO")]
-# Every source <> target edge, which is what the two-cycle scan reads.
+# Every source <> target edge, which is what the write-back cycle scan reads.
+# TRANID, SOURCENAME, SOURCETYPE, TARGETNAME, TARGETTYPE - both endpoint types, because typing one
+# side only gives an object two graph keys and no cycle is ever found.
 _ALL_EDGES = [
-    ("TR_AB", "A_DSO", "B_DSO"),
-    ("TR_BA", "B_DSO", "A_DSO"),
-    ("TR_M1", "ORD_DSO", "MERGE_DSO"),  # one-way: must not be reported
-    ("TR_L1", "L1_DSO", "L2_DSO"),
+    ("TR_AB", "A_DSO", "ODSO", "B_DSO", "ODSO"),
+    ("TR_BA", "B_DSO", "ODSO", "A_DSO", "ODSO"),
+    ("TR_M1", "ORD_DSO", "ODSO", "MERGE_DSO", "ODSO"),  # one-way: must not be reported
+    ("TR_L1", "L1_DSO", "ODSO", "L2_DSO", "ODSO"),
+    # A three-object loop. The previous detector looked only for pairs and could not see this.
+    # Named LOOP_* on purpose: the SAP customer namespaces begin with Y and Z, so names in those
+    # namespaces trip the customer-metadata leak check - correctly, since it cannot tell a
+    # synthetic example from a real object.
+    ("TR_LOOP1", "LOOP_A", "ODSO", "LOOP_B", "ODSO"),
+    ("TR_LOOP2", "LOOP_B", "ODSO", "LOOP_C", "ODSO"),
+    ("TR_LOOP3", "LOOP_C", "ODSO", "LOOP_A", "ODSO"),
 ]
 
 
@@ -482,8 +491,8 @@ def test_self_loop_is_reported_as_high_severity() -> None:
     assert finding.evidence[0].source_key["TRANID"] == "TR_SELF"
 
 
-def test_two_cycle_is_reported_once_with_both_transformations() -> None:
-    findings = _by_kind(_violations(), "two_cycle")
+def test_two_object_cycle_is_reported_once_with_both_transformations() -> None:
+    findings = [f for f in _by_kind(_violations(), "cycle") if len(f.affected_objects) == 2]
     assert len(findings) == 1  # the pair, not one finding per direction
     finding = findings[0]
     assert finding.affected_objects == ["A_DSO", "B_DSO"]  # deterministic order
@@ -492,14 +501,31 @@ def test_two_cycle_is_reported_once_with_both_transformations() -> None:
     assert len(finding.evidence) == 2
 
 
+def test_a_three_object_cycle_is_reported() -> None:
+    """The gap the old pair-only detector declared in a caveat: A -> B -> C -> A."""
+    findings = [f for f in _by_kind(_violations(), "cycle") if len(f.affected_objects) == 3]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.affected_objects == ["LOOP_A", "LOOP_B", "LOOP_C"]
+    assert finding.metrics["member_count"] == 3
+    assert finding.metrics["tran_ids"] == ["TR_LOOP1", "TR_LOOP2", "TR_LOOP3"]
+    assert "3 objects" in finding.title
+    # Canonical ids, so a member can go straight to bw_describe_object.
+    assert finding.metrics["object_ids"] == ["dso:LOOP_A", "dso:LOOP_B", "dso:LOOP_C"]
+
+
 def test_one_way_edges_are_not_cycles() -> None:
-    objects = {obj for f in _by_kind(_violations(), "two_cycle") for obj in f.affected_objects}
+    objects = {obj for f in _by_kind(_violations(), "cycle") for obj in f.affected_objects}
     assert "MERGE_DSO" not in objects
     assert "L2_DSO" not in objects
 
 
 def test_cycle_scope_is_declared() -> None:
-    assert any("Longer cycles" in c for c in _violations().caveats)
+    """The caveat must now name the real bound (the edge scan), not a missing capability."""
+    caveats = " ".join(_violations().caveats)
+    assert "any length" in caveats
+    assert "edge scan" in caveats
+    assert "Longer cycles" not in caveats
 
 
 def test_existing_layer_violations_still_reported() -> None:

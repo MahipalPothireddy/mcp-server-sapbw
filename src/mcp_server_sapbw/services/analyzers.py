@@ -28,6 +28,7 @@ from ..connectors.ecc import EccConnector
 from ..models.chains import FrequencyClass, ScheduleMatrixEntry
 from ..models.ecc import ExitBranch, ExitInventory
 from ..models.findings import Finding, ScenarioReport, Severity
+from ..models.objects import BwObjectRef, normalise_object_type
 from ..models.provenance import Provenance, UnsupportedResult
 from ..repositories.base import Repository
 from ..repositories.chains import ChainsRepository
@@ -38,6 +39,7 @@ from ..repositories.sources import SourcesRepository
 from ..repositories.transformations import TransformationsRepository
 from . import latency
 from .exit_analysis import ExitAnalysisService
+from .graph import ObjectGraph
 from .load_closure import LoadClosureService, cadence_of
 
 # RSTLOGO endpoint type codes (verified live, B5).
@@ -64,6 +66,10 @@ SCENARIO_TITLES: dict[str, str] = {
 }
 
 _SCAN_CAP = 5000  # hard cap on rows pulled for bulk edge scans
+# A cycle of 40 objects would otherwise cite 40 transformations; a finding points at its evidence
+# rather than reproducing all of it, and metrics.tran_ids carries the complete list.
+_CYCLE_EVIDENCE_CAP = 6
+_PAIR = 2  # a two-member cycle reads better as "each feeds the other" than "across 2 objects"
 _MERGED_INBOUND_CAP = 20  # inbound transformations examined per merged DSO for the field matrix
 _CADENCE_CHECK_CAP = 12  # looked-up objects whose cadence is resolved per finding
 _MANY_ENH_FIELDS = 5  # appended fields at/above which an enhancement is substantial
@@ -1509,7 +1515,7 @@ class Analyzers(Repository):
         )
         findings += self._deep_stack_violations(max_dso_depth, limit)
         findings += self._self_loop_violations(limit)
-        findings += self._two_cycle_violations(limit)
+        findings += self._cycle_violations(limit)
         return ScenarioReport(
             scenario="layer_violations",
             title=SCENARIO_TITLES["layer_violations"],
@@ -1518,8 +1524,10 @@ class Analyzers(Repository):
             truncated=len(findings) >= limit,
             caveats=[
                 f"Deep-stack threshold is {max_dso_depth} DSO->DSO hops; adjust via max_dso_depth.",
-                "Write-back detection covers self-loops and two-object cycles. Longer cycles "
-                f"(A->B->C->A) are not searched; the edge scan is capped at {_SCAN_CAP} rows.",
+                "Write-back cycles are detected at any length, not just pairs: each finding names "
+                "every object in the loop. Self-loops are reported separately. The only bound is "
+                f"the edge scan, capped at {_SCAN_CAP} rows - a cycle whose edges fall outside "
+                "that scan would be missed.",
             ],
         )
 
@@ -1573,59 +1581,84 @@ class Analyzers(Repository):
             )
         return findings
 
-    def _two_cycle_violations(self, limit: int) -> list[Finding]:
-        """Two objects that each feed the other: load order decides the data, and nothing fixes it.
+    def _cycle_violations(self, limit: int) -> list[Finding]:
+        """Every cyclic group of objects, of any length.
 
-        Detected from the full edge set rather than a per-object walk, so one capped scan finds
-        every pair. Each pair is reported once.
+        This used to look only for pairs that feed each other, and said so: ``A -> B -> C -> A``
+        was not searched. A three-object loop has no correct load order either, so it is the same
+        finding with a longer member list - and on a landscape where objects write back to their own
+        layer it is the more likely shape.
+
+        The graph component reports strongly connected components, which is both complete and
+        linear: every member of a component is reachable from every other, so no load order for the
+        group produces a defined result. The edge scan is still capped, and that cap is the only
+        reason this could be incomplete - stated in the caveats.
         """
         rows = self._fetch_transform(
-            ["TRANID", "SOURCENAME", "TARGETNAME"],
+            # Both endpoint types are read, not just the target's. Typing one side and leaving the
+            # other 'unknown' gives one object two graph keys - it appears as unknown:X when it is a
+            # source and dso:X when it is a target - so the edges never join up and no cycle is ever
+            # found. Exactly the identity split the canonical object model exists to prevent.
+            ["TRANID", "SOURCENAME", "SOURCETYPE", "TARGETNAME", "TARGETTYPE"],
+            # Self-loops are excluded here rather than filtered afterwards: they are reported
+            # separately with their own explanation, and against a 5,000-row cap it is worth not
+            # spending rows on edges that will be discarded.
             ["SOURCENAME <> ''", "TARGETNAME <> ''", "SOURCENAME <> TARGETNAME"],
             [],
             limit=_SCAN_CAP,
             order_by=["SOURCENAME", "TARGETNAME"],
         )
-        edges: dict[tuple[str, str], str] = {}
-        for tranid, src, tgt in rows:
+        graph = ObjectGraph()
+        tran_by_edge: dict[tuple[str, str], str] = {}
+        for tranid, src, src_type, tgt, tgt_type in rows:
             source, target = _clean(src), _clean(tgt)
-            if source and target:
-                edges.setdefault((source, target), str(tranid))
+            if not source or not target:
+                continue
+            src_ref = BwObjectRef(object_type=normalise_object_type(src_type), name=source)
+            tgt_ref = BwObjectRef(object_type=normalise_object_type(tgt_type), name=target)
+            graph.add_edge(src_ref, tgt_ref)
+            tran_by_edge.setdefault((src_ref.id, tgt_ref.id), str(tranid).strip())
 
         findings: list[Finding] = []
-        reported: set[tuple[str, str]] = set()
-        for (source, target), tranid in sorted(edges.items()):
-            back = edges.get((target, source))
-            if back is None:
-                continue
-            pair = (source, target) if source < target else (target, source)
-            if pair in reported:
-                continue
-            reported.add(pair)
+        for cycle in graph.cycles():
+            names = [key.split(":", 1)[1] for key in cycle.members]
+            tran_ids = sorted(
+                {tran for edge in cycle.edges if (tran := tran_by_edge.get((edge.src, edge.dst)))}
+            )
             findings.append(
                 Finding(
                     scenario="layer_violation",
                     severity="high",
-                    title="Write-back cycle: two objects each feed the other",
-                    affected_objects=list(pair),
+                    title=(
+                        "Write-back cycle: two objects each feed the other"
+                        if len(names) == _PAIR
+                        else f"Write-back cycle across {len(names)} objects"
+                    ),
+                    affected_objects=names,
                     evidence=[
-                        self.provenance("transformation", {"TRANID": tranid, "OBJVERS": "A"}),
-                        self.provenance("transformation", {"TRANID": back, "OBJVERS": "A"}),
+                        self.provenance("transformation", {"TRANID": tran, "OBJVERS": "A"})
+                        for tran in tran_ids[:_CYCLE_EVIDENCE_CAP]
                     ],
                     recommendation=(
                         "Break the cycle. Decide which object is authoritative for the shared "
-                        "fields and derive the other from it one way, or introduce a third object "
-                        "for the derived values. A cycle has no correct load order, so this cannot "
-                        "be resolved by scheduling."
+                        "fields and derive the others from it one way, or introduce a separate "
+                        "object for the derived values. A cycle has no correct load order, so this "
+                        "cannot be resolved by scheduling."
                     ),
                     detail=(
-                        "Transformations exist in both directions between these two objects, so "
-                        "which one holds current data depends on which chain ran last."
+                        "Transformations connect these objects in a loop, so every one of them is "
+                        "downstream of every other. Which of them holds current data depends on "
+                        "which chain ran last, and a failed load cannot be re-run to a defined "
+                        "state."
                     ),
                     metrics={
-                        "kind": "two_cycle",
-                        "objects": list(pair),
-                        "tran_ids": sorted({tranid, back}),
+                        "kind": "cycle",
+                        "member_count": len(names),
+                        "objects": names,
+                        # Canonical ids too, so a caller can hand a member straight to
+                        # bw_describe_object or match it against a lineage node.
+                        "object_ids": cycle.members,
+                        "tran_ids": tran_ids,
                     },
                 )
             )

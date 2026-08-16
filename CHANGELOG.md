@@ -6,6 +6,42 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — the object graph as a component, and write-back cycles of any length
+
+Every dependency question had its own traversal: the lineage service walked transformations, the
+layer analyzer built a separate adjacency map, the load closure walked chains, the field-lineage
+service walked rules. Each was correct, and none could answer a question the others already had the
+data for. The visible cost was a caveat on the layer analyzer:
+
+> Write-back detection covers self-loops and two-object cycles. Longer cycles (A->B->C->A) are not
+> searched.
+
+A three-object loop has no correct load order either, and it was invisible.
+
+`ObjectGraph` holds nodes keyed by canonical id and answers those questions once: `neighbours`,
+`reachable` (with a depth bound), `paths` (every simple route between two objects, with the cap
+reported rather than hidden), `cycles`, and `stats`.
+
+**Cycles are reported as strongly connected components, not enumerated loops.** Enumerating
+elementary cycles is exponential and has to be truncated, which answers "here are some cycles we
+found before giving up". Tarjan's algorithm is linear, needs no cap, and gives the more useful
+statement: every object in a component of two or more is reachable from every other, so *no* load
+order for the group is correct. It is iterative rather than recursive because a real BW dependency
+chain is hundreds of objects deep and a recursive version would turn a legitimate answer into a
+stack overflow — a 2,000-node test pins that.
+
+The layer analyzer now uses it. Findings name every object in a loop, carry canonical ids in
+`metrics.object_ids`, and the caveat states the real remaining bound (the 5,000-row edge scan)
+instead of a missing capability.
+
+One bug caught while wiring it up, and it is the exact failure the canonical object model exists to
+prevent: the first version typed the *target* endpoint of each transformation but not the source, so
+one object got two graph keys — `unknown:X` as a source, `dso:X` as a target — the edges never joined
+and **no cycle was ever found**. Both endpoint types are now read.
+
+Measured on the reference system: 1,223 transformation edges, 1,579 objects, 1,215 edges, max fan-in
+31 — and zero cycles. The analyzer can now say none exist rather than that it did not look.
+
 ### Added — one failure shape, and no exception escapes a tool
 
 Failure arrived in two incompatible forms. Four structured results — `UnsupportedResult`,
