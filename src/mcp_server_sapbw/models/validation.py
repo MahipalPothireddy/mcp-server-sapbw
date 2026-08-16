@@ -59,6 +59,11 @@ VALIDATION_STATE_RANK: dict[str, int] = {
 #: The state a scenario may reach without an external customer signing off.
 MAX_INTERNAL_STATE: ValidationState = "REAL_BW_VALIDATED"
 
+#: States asserting that a human checked the answer. Both therefore require a named verifier, a
+#: verification date, and a ground truth recorded as independent - see
+#: :meth:`ValidationScenario._require_human_verification`.
+_VERIFIED_STATES: frozenset[str] = frozenset({"REAL_BW_VALIDATED", "CUSTOMER_VALIDATED"})
+
 #: How the MCP's answer compared with ground truth.
 #:
 #:   correct                 matched ground truth on every point checked
@@ -109,6 +114,10 @@ class GroundTruth(BaseModel):
     #: The expected answer, in whatever form the scenario checks: a set of names, a count, a value.
     expected: str = Field(min_length=1)
     established_by: str | None = None
+    #: When the human established it. This **is** the verification date, and a verified state
+    #: requires it: undated verification cannot be tied to a system state, and BW metadata changes
+    #: with every transport. Kept here rather than on the scenario so it stays attached to the thing
+    #: it dates.
     established_at: datetime | None = None
     notes: str | None = None
 
@@ -193,11 +202,8 @@ class ValidationScenario(BaseModel):
                 f"{self.correctness!r}. That state requires the answer to have been checked and "
                 "found right; running without error is INTEGRATION_TESTED."
             )
-        if self.state in ("REAL_BW_VALIDATED", "CUSTOMER_VALIDATED") and self.ground_truth is None:
-            raise ValueError(
-                f"{self.scenario_id} claims {self.state} with no ground truth recorded, so "
-                "there is nothing the answer was checked against."
-            )
+        if self.state in _VERIFIED_STATES:
+            self._require_human_verification()
         if (
             self.correctness == "correct_but_incomplete"
             and self.claimed_completeness != "lower_bound"
@@ -207,6 +213,43 @@ class ValidationScenario(BaseModel):
                 "lower bound. An incomplete answer presented as complete is a defect, not a pass."
             )
         return self
+
+    def _require_human_verification(self) -> None:
+        """Everything a verified state needs beyond the call having returned.
+
+        Defect V1 from the pre-validation assessment: the state required a passing verdict and a
+        recorded ground truth, but not a *person*. So it could be claimed on a truth nobody is named
+        as having established, on no date, by a method reading the same tables this server reads -
+        which is not verification, it is a round trip.
+
+        Each condition raises its own message so a rejection says which one failed rather than
+        leaving the author to guess.
+        """
+        truth = self.ground_truth
+        if truth is None:
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} with no ground truth recorded, so "
+                "there is nothing the answer was checked against."
+            )
+        if not (self.human_expert or "").strip():
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} with no named human_expert. A verified "
+                "state asserts that a person checked the answer, so that person has to be named."
+            )
+        if truth.established_at is None:
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} with no verification date "
+                "(ground_truth.established_at). Undated verification cannot be tied to a system "
+                "state, and BW metadata changes with every transport."
+            )
+        if not truth.independent:
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} on a ground truth recorded as NOT "
+                "independent. A truth read from the same metadata this server reads proves the SQL "
+                "round-tripped; it cannot catch a wrong assumption about what a table means, "
+                "because it shares the assumption. Record an independent method, or keep the "
+                "scenario at INTEGRATION_TESTED."
+            )
 
     @property
     def passed(self) -> bool:
