@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .aggregation import KeyFigureAggregation
 from .description import Description
+from .errors import ErrorCategory, ErrorCode, derive_failure_fields
 from .evidence import Evidence, evidence_for
 from .objects import BwObjectRef, normalise_object_type
 from .provenance import Provenance
@@ -286,6 +287,17 @@ class ObjectNotFound(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["not_found"] = "not_found"
+    code: ErrorCode = "object_not_found"
+    category: ErrorCategory | None = None
+    remedy: str | None = None
+    retryable: bool | None = None
     name: str
     searched_types: list[str] = Field(default_factory=list)
     detail: str
+
+    @model_validator(mode="after")
+    def _derive(self) -> ObjectNotFound:
+        self.category, self.retryable, self.remedy = derive_failure_fields(
+            self.code, self.category, self.retryable, self.remedy
+        )
+        return self

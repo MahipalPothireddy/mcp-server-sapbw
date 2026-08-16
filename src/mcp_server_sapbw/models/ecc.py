@@ -16,8 +16,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .errors import ErrorCategory, ErrorCode, derive_failure_fields
 from .transformations import RoutineAnalysis
 
 # ADT addresses each object kind under its own path segment.
@@ -168,6 +169,17 @@ class ConnectorUnavailable(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["connector_not_configured"] = "connector_not_configured"
+    code: ErrorCode = "connector_not_configured"
+    category: ErrorCategory | None = None
+    remedy: str | None = None
+    retryable: bool | None = None
     connector: Literal["ecc"] = "ecc"
     configured_profiles: list[str] = Field(default_factory=list)
     detail: str
+
+    @model_validator(mode="after")
+    def _derive(self) -> ConnectorUnavailable:
+        self.category, self.retryable, self.remedy = derive_failure_fields(
+            self.code, self.category, self.retryable, self.remedy
+        )
+        return self

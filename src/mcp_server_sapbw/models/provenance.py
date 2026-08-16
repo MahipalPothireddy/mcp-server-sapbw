@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .errors import ErrorCategory, ErrorCode, derive_failure_fields
 
 
 class Provenance(BaseModel):
@@ -31,12 +33,27 @@ class UnsupportedResult(BaseModel):
     Returned instead of raising or guessing when the capability resolver reports that a
     required table/column is absent. ``missing`` names the object(s) that were looked for;
     ``alternative`` names the correct object for this release when one is known.
+
+    ``code``/``category``/``remedy`` are the canonical failure fields, identical in meaning to those
+    on :class:`~.errors.BwError`, so a caller branches on one field whichever surface failed. The
+    ``status`` literal stays for compatibility.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["unsupported_on_release"] = "unsupported_on_release"
+    code: ErrorCode = "unsupported_on_release"
+    category: ErrorCategory | None = None
+    remedy: str | None = None
+    retryable: bool | None = None
     missing: list[str] = Field(default_factory=list)
     release: str
     alternative: str | None = None
     detail: str
+
+    @model_validator(mode="after")
+    def _derive(self) -> UnsupportedResult:
+        self.category, self.retryable, self.remedy = derive_failure_fields(
+            self.code, self.category, self.retryable, self.remedy
+        )
+        return self

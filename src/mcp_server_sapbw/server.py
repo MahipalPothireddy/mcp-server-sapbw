@@ -23,7 +23,7 @@ from typing import Any, Literal, Protocol, cast
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
 from fastmcp.utilities.types import Image
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import __version__
 from .connectors.base import ConnectorRegistry
@@ -52,6 +52,13 @@ from .models.chains import (
 )
 from .models.diagram import DiagramFormat, DiagramResult
 from .models.ecc import ConnectorUnavailable, ExitInventory
+from .models.errors import (
+    BwError,
+    ErrorCategory,
+    ErrorCode,
+    derive_failure_fields,
+    from_exception,
+)
 from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
 from .models.health import ProviderHealth
@@ -189,11 +196,22 @@ class BudgetResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal["budget_exceeded"] = "budget_exceeded"
+    code: ErrorCode = "budget_exceeded"
+    category: ErrorCategory | None = None
+    remedy: str | None = None
+    retryable: bool | None = None
     tool: str
     reason: str
     queries_spent: int
     elapsed_seconds: float
     budget: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _derive(self) -> "BudgetResult":
+        self.category, self.retryable, self.remedy = derive_failure_fields(
+            self.code, self.category, self.retryable, self.remedy
+        )
+        return self
 
 
 class ChainListResult(BaseModel):
@@ -711,6 +729,23 @@ def _readonly_tool(func: Callable[..., Any]) -> Any:
                     elapsed_seconds=exc.elapsed_seconds,
                     budget=cast("dict[str, Any]", budget.snapshot()),
                 )
+            except Exception as exc:  # deliberately broad; see below
+                # Anything else becomes a structured failure rather than an opaque MCP error.
+                # Eleven exception classes could previously escape here, so a locked-down user
+                # hitting the read-only guard, a mistyped profile name and a dropped HANA session
+                # were indistinguishable to a program. from_exception forwards a message only for
+                # the families scrubbed at their raise site, so this path cannot leak a host name.
+                failure = from_exception(exc, tool=name)
+                _LOG.warning("tool=%s failed: code=%s (%s)", name, failure.code, type(exc).__name__)
+                return failure
+
+    # Widen the declared return type to include the failure branches, once, here. Every tool can
+    # return a BudgetResult or a BwError, and a schema that does not say so is a schema a client
+    # will reject at validation time - which is how this was found. Doing it in the decorator keeps
+    # 46 signatures honest without 46 edits, and means a new tool cannot forget.
+    declared = budgeted.__annotations__.get("return")
+    if declared is not None:
+        budgeted.__annotations__["return"] = declared | BudgetResult | BwError
 
     return mcp.tool(annotations={"readOnlyHint": True})(budgeted)
 

@@ -48,6 +48,30 @@ own where-used lists), and can render a full markdown knowledge base on demand.
   layer violations including write-back loops, and more) plus decommission-candidate detection.
 - **Knowledge base** — a full markdown documentation set rendered on demand.
 
+## When a call cannot answer
+
+Every failure comes back as a structured result, never an opaque error string:
+
+```json
+{
+  "status": "error",
+  "code": "read_only_violation",
+  "category": "guardrail",
+  "retryable": false,
+  "message": "...",
+  "remedy": "This server issues SELECT only ...",
+  "detail": { "exception": "ReadOnlyViolation", "tool": "bw_get_chain" }
+}
+```
+
+`code` is stable and safe to branch on. `category` groups codes a caller would treat alike
+(`not_found`, `unsupported`, `invalid_request`, `partial`, `configuration`, `transport`, `guardrail`,
+`internal`). `retryable` answers the only question a retry loop has. `remedy` says what to do next.
+
+An exception's own message is forwarded only for families whose text is scrubbed at the raise site;
+anything else is reported by type, so a failure path cannot carry a host name or a credential into a
+response.
+
 ## One name for one object
 
 Every object type comes from a single vocabulary, and every object carries a canonical reference:

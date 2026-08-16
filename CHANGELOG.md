@@ -6,6 +6,37 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — one failure shape, and no exception escapes a tool
+
+Failure arrived in two incompatible forms. Four structured results — `UnsupportedResult`,
+`ObjectNotFound`, `BudgetResult`, `ConnectorUnavailable` — each had a `status` string and its own
+field names, with no shared taxonomy and nothing saying what to do next. Everything else escaped as
+one of **eleven exception classes**, reaching the caller as an opaque error string: a locked-down
+user hitting the read-only guard, a mistyped profile name and a dropped HANA session were
+indistinguishable to a program.
+
+`BwError` is the single envelope: a stable machine `code`, a coarse `category` to branch on without
+enumerating codes, `retryable` for the only question a retry loop has, and `remedy` saying what to
+do. Category, retryability and remedy are *derived* from the code by one table, so a new code cannot
+arrive half-defined — a test asserts every declared code has all three.
+
+The tool wrapper now converts any escaping exception into a `BwError`, mapping each family to a
+distinct code (`read_only_violation`, `profile_not_found`, `connection_failed`, `query_failed`,
+`unsupported_on_release`, `capability_undetermined`, `profile_misconfigured`, `output_failed`,
+`invalid_argument`, `internal_error`). Subclasses map through their base.
+
+**Secrets cannot travel this path.** An exception's own message is forwarded only for the families
+whose text is scrubbed at the raise site; anything unrecognised is reported by *type* with a fixed
+message, because an unrecognised exception is exactly where a host name or a DSN could be embedded.
+Two tests assert a host and a credential planted in a `RuntimeError` do not reach the response.
+
+The four legacy results keep their `status` literals and gain the canonical `code`/`category`/
+`remedy`/`retryable`, so a caller branches on one field whichever surface failed.
+
+One integration fix this surfaced: every tool's declared return type is now widened to include the
+failure branches, in the decorator rather than across 46 signatures. Without it a client validating
+structured output against the schema **rejects the failure response** — which is how it was found.
+
 ### Changed — one canonical object model behind every surface (**breaking, pre-1.0**)
 
 Each subsystem had grown its own list of object types, and they had drifted:
