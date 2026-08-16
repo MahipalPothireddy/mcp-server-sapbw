@@ -16,7 +16,8 @@ Everything produced here begins with ``SELECT`` and therefore passes the connect
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -51,6 +52,47 @@ class SelectQuery:
 
     sql: str
     parameters: list[Any] = field(default_factory=list)
+
+
+# --- capability-read recording (off unless explicitly switched on) -----------------------------
+#
+# The capability contract needs to know which declared logical tables the code actually reads. A
+# grep for `from_logical="..."` undercounts, because eight call sites pass the name as a variable
+# fed from a module-level spec table - the text tables, the search sources, the provider catalogue
+# and the declared-lookup stores are all reached that way, and a grep reports them as dead.
+#
+# Recording at this chokepoint measures the answer instead of inferring it. It is off by default and
+# costs one `is None` check per query when off, so it is never a production cost.
+# Single-element holder rather than a module-level rebind, matching the pattern used for the server
+# runtime so no `global` statement is needed.
+_recorder: dict[str, set[str]] = {}
+
+
+def _record_read(logical: str) -> None:
+    observed = _recorder.get("reads")
+    if observed is not None:
+        observed.add(logical)
+
+
+@contextmanager
+def record_reads() -> Iterator[set[str]]:
+    """Collect the logical tables read inside the block.
+
+    Used by the capability-contract check, which exercises the server and compares what was really
+    read against what the resolver declares. Nested blocks are supported; it is not thread-safe by
+    design, being a build-time measurement tool rather than a runtime feature.
+    """
+    observed: set[str] = set()
+    previous = _recorder.get("reads")
+    _recorder["reads"] = observed
+    try:
+        yield observed
+    finally:
+        if previous is None:
+            _recorder.pop("reads", None)
+        else:
+            _recorder["reads"] = previous
+            previous |= observed  # an outer block also saw whatever the inner one read
 
 
 def needs_active_version(physical_table: str) -> bool:
@@ -145,6 +187,7 @@ class SqlDialect:
         ``where`` conditions use ``?`` placeholders whose values are supplied in ``params``.
         Unless ``compare_versions`` is set, ``OBJVERS = 'A'`` is appended for versioned tables.
         """
+        _record_read(from_logical)
         physical, qualified = self._resolve(from_logical)
         column_list = ", ".join(columns) if columns else "*"
         conditions: list[str] = list(where or [])

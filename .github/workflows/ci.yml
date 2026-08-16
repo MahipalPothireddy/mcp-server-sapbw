@@ -46,6 +46,30 @@ jobs:
       - name: Pytest (offline only)
         run: pytest
 
+  capability-contract:
+    name: capability contract (no undeclared drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install (with dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Fails when a declared capability has neither a reader nor a stated intent, and when
+      # docs/capability-contract.md no longer matches what the code declares. Runs the suite
+      # itself, with read recording on, so capabilities reached through a variable are counted
+      # rather than reported as dead by a grep. Offline, like every other check here.
+      - name: Contract check
+        run: python scripts/capability_contract.py --check
+
   security:
     name: secret scan + customer-metadata leak check
     runs-on: ubuntu-latest
