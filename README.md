@@ -12,7 +12,7 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **50 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **55 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -72,6 +72,9 @@ onboarding exercise, not a development one.
 - **Snapshots & environment comparison** — what changed since last week, and what differs between
   QA and production, with the BDLS rewrite and locally-rebuilt objects corrected for rather than
   reported as thousands of differences.
+- **Compound analysis** — one call per analyst question (an object, a report, a chain, a proposed
+  change, a wrong number), composed from the granular readers and returned with an audit row per
+  section naming the tool that reproduces it.
 - **Risk analyzers** — the eight landscape-specific analyses (latency contracts, schedule risk,
   layer violations including circular dependencies of any length) plus decommission-candidate
   detection.
@@ -233,6 +236,60 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
 | `bw_cache_status` | `system` | What extracted metadata and how many snapshots are on local disk, and where |
 | `bw_refresh_cache` | `system`, `scope="all"` | Invalidate cached extracts by scope |
+
+### Compound analysis
+
+Each of these composes six or seven of the granular tools below into one answer. They exist
+**alongside** the granular tools, not instead of them: if you know exactly what you want, ask for
+exactly that.
+
+| Tool | Parameters | The question it answers |
+|---|---|---|
+| `bw_analyze_object` | `system`, `name`, `depth=2`, `detail=auto` | Everything about one provider or InfoObject |
+| `bw_analyze_query` | `system`, `query`, `detail=auto` | What a report reads, who sees what, when its data is current |
+| `bw_analyze_process_chain` | `system`, `chain_id`, `days=90` | What a chain does, what it loads, how reliably it runs |
+| `bw_assess_change_impact` | `system`, `name`, `depth=3`, `detail=auto` | What a change reaches, and what to verify before transporting |
+| `bw_troubleshoot_missing_data` | `system`, `target`, `detail=auto` | Why a report shows wrong or missing data, layer by layer |
+
+All five return the same envelope, so you learn one contract:
+
+- **`summary`** — the answer as factual sentences, each supported by a section that actually ran.
+- **`dependencies` / `consumers`** — normalised across sections, so one list answers "what feeds
+  this" regardless of which reader established each link. Each carries `advisory`, set only where
+  the link was *derived* (parsed from ABAP, or a generated table name resolved by convention).
+- **`risks`** — judgements, always separable from fact, most severe first, each with a
+  recommendation and citing the record it came from. No scenario analyzer is re-run: a risk is a
+  reading of a record the analysis already holds.
+- **`steps`** — an audit row per reader: its status, the physical tables it read, and **the granular
+  tool that reproduces it**. That last field is what makes a composed answer checkable rather than
+  merely detailed, and a test asserts every cited name is actually registered.
+- **`limitations`** — what cannot be concluded, with a machine-readable `reason`
+  (`unsupported_on_release`, `heuristic_lower_bound`, `budget_exhausted`, `truncated`,
+  `metadata_dead_end`, `connector_not_configured`, `reader_caveat`). Constituent readers' own
+  caveats are carried up rather than dropped — merging results without them produces an answer more
+  confident than any of its parts.
+- **`confidence`** — coverage and evidence basis as separate components, **never one number**. A
+  release missing a metadata table and a dependency parsed out of ABAP are both "less certain", but
+  one is fixed by a different BW release and the other cannot be fixed at all; collapsing them into
+  a percentage would hide which.
+- **`next_actions`** — the next step as a call you can actually make, with the tool and arguments
+  named, generated from what was found rather than from a template.
+
+Three behaviours are specific to these tools:
+
+- **A section that could not be read is never an empty one.** `unsupported`, `failed`,
+  `connector_required` and `skipped_budget` are distinct statuses, so "this object has no consumers"
+  and "consumers cannot be read on this release" never come back the same.
+- **A partial answer beats no answer.** Five readers draw on one per-call budget. When it runs out
+  mid-composition the sections already gathered are returned, the rest are recorded
+  `skipped_budget`, and `stopped_on_budget` is set — where a granular tool returns a `BudgetResult`
+  and nothing else.
+- **`unsupported` is not `not_found`.** If the release cannot report the subject's object type you
+  get an `UnsupportedResult`, not "no such object" — those have different remedies, and reporting
+  the first as the second sends you hunting for a typo in a name that is spelled correctly.
+
+`detail` bounds the embedded payloads with the same rule `bw_describe_object` and `bw_get_lineage`
+use; counts stay exact and each trimmed payload names the resource holding the whole record.
 
 ### Snapshots and environment comparison
 

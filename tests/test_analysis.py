@@ -1,0 +1,532 @@
+"""Compound analysis: the composition machinery, and the claim that the answer is auditable.
+
+Most of these tests exist because a composed answer fails differently from a granular one. A single
+reader returning nothing is visible; the same reader returning nothing *inside* a merged answer
+reads as a fact about the system. So the tests here are mostly about the difference between "we
+looked and found none" and "we could not look":
+
+* every audit row names a granular tool that is actually registered, so a section can be re-run
+* an unsupported section, a failed section and a budget-skipped section are three distinct statuses
+* one reader failing never costs the others
+* confidence is components, never a percentage, and is never inferred upward from what was gathered
+
+Offline: the connection is scripted, so no BW system is contacted.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+from fastmcp import Client
+
+from mcp_server_sapbw import server
+from mcp_server_sapbw.core.budget import BudgetExceeded
+from mcp_server_sapbw.models.analysis import Analysis, AnalysisLimitation, RelatedObject
+from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from mcp_server_sapbw.models.objects import BwObjectRef
+from mcp_server_sapbw.models.providers import ObjectNotFound
+from mcp_server_sapbw.repositories.chains import ChainsRepository
+from mcp_server_sapbw.repositories.hana import HanaRepository
+from mcp_server_sapbw.repositories.health import HealthRepository
+from mcp_server_sapbw.repositories.providers import ProvidersRepository
+from mcp_server_sapbw.repositories.queries import QueriesRepository
+from mcp_server_sapbw.repositories.transformations import TransformationsRepository
+from mcp_server_sapbw.services.analysis import (
+    AnalysisReaders,
+    AnalysisService,
+    _reason_for,
+    _Run,
+)
+from mcp_server_sapbw.services.lineage import LineageService
+from mcp_server_sapbw.services.load_closure import LoadClosureService
+
+SCHEMA = "TESTSCHEMA"
+
+# Every logical table the composed readers may reach for. Present by default; a test removes one to
+# prove that an absent table becomes a recorded `unsupported` section rather than an empty answer.
+_TABLES = {
+    "dso_header": "RSDODSO",
+    "dso_field": "RSDODSOIOBJ",
+    "dso_text": "RSDODSOT",
+    "adso_header": "RSOADSO",
+    "cube_header": "RSDCUBE",
+    "composite_header": "RSOHCPR",
+    "infoobject": "RSDIOBJ",
+    "infoobject_text": "RSDIOBJT",
+    "transformation": "RSTRAN",
+    "transformation_rule": "RSTRANRULE",
+    "transformation_field": "RSTRANFIELD",
+    "routine_source": "RSAABAP",
+    "dtp": "RSBKDTP",
+    "chain_attr": "RSPCCHAINATTR",
+    "chain_text": "RSPCCHAINT",
+    "chain_edges": "RSPCCHAIN",
+    "log_chain": "RSPCLOGCHAIN",
+    "process_log": "RSPCPROCESSLOG",
+    "query_dir": "RSZCOMPDIR",
+    "query_provider": "RSZCOMPIC",
+    "element_dir": "RSZELTDIR",
+    "element_xref": "RSZELTXREF",
+    "element_text": "RSZELTTXT",
+    "request_status": "RSSTATMANPART",
+    "cs_tables": "M_CS_TABLES",
+    "object_dependencies": "OBJECT_DEPENDENCIES",
+    "hana_views": "VIEWS",
+    "auth_value": "RSECVAL",
+}
+
+
+class ScriptedConnection:
+    """Rows by physical table, with two injectable faults.
+
+    ``fail_on`` makes one table's read raise, and ``budget_after`` exhausts the per-call budget
+    partway through. Both model things that genuinely happen mid-composition and that a granular
+    tool never has to survive: there, the call simply fails.
+    """
+
+    def __init__(
+        self,
+        *,
+        rows: dict[str, list[tuple[Any, ...]]] | None = None,
+        fragments: dict[str, list[tuple[Any, ...]]] | None = None,
+        fail_on: str | None = None,
+        budget_after: int | None = None,
+    ) -> None:
+        self._rows = rows or {}
+        # Matched on a SQL fragment rather than a table, because one table answers several different
+        # questions with different column shapes - RSTRAN is read once per lineage direction.
+        self._fragments = fragments or {}
+        self._fail_on = fail_on
+        self._budget_after = budget_after
+        self.statements = 0
+
+    def execute_select(
+        self, sql: str, parameters: Sequence[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        self.statements += 1
+        if self._budget_after is not None and self.statements > self._budget_after:
+            raise BudgetExceeded(
+                reason="query budget exhausted", queries=self.statements, elapsed_seconds=1.0
+            )
+        if self._fail_on and f'"{self._fail_on}"' in sql:
+            raise RuntimeError("scripted read failure")
+        for fragment, rows in self._fragments.items():
+            if fragment in sql:
+                return rows
+        for physical, rows in self._rows.items():
+            if f'"{physical}"' in sql:
+                return rows
+        return []
+
+
+def _capability(present: set[str] | None = None) -> CapabilityRecord:
+    present = present if present is not None else set(_TABLES)
+    return CapabilityRecord(
+        system="qa",
+        bw_release="7.50",
+        abap_schema=SCHEMA,
+        discovered_at=datetime.now(UTC),
+        tables={
+            logical: TableStatus(
+                logical_name=logical,
+                resolved_name=physical if logical in present else None,
+                present=logical in present,
+                schema_name=SCHEMA if logical in present else None,
+            )
+            for logical, physical in _TABLES.items()
+        },
+    )
+
+
+# A provider that exists, so the anchor section resolves and the rest of the composition can run.
+_ROWS: dict[str, list[tuple[Any, ...]]] = {
+    "RSDODSO": [("", "SALES", "DEVUSER", "SD")],
+    "RSDODSOIOBJ": [("DOC", 1, "X"), ("AMOUNT", 2, "")],
+    "RSDODSOT": [("E", "Sales orders", "Daily sales order line items")],
+}
+
+
+def _service(
+    *,
+    present: set[str] | None = None,
+    rows: dict[str, list[tuple[Any, ...]]] | None = None,
+    fragments: dict[str, list[tuple[Any, ...]]] | None = None,
+    fail_on: str | None = None,
+    budget_after: int | None = None,
+) -> AnalysisService:
+    conn = ScriptedConnection(
+        rows=rows if rows is not None else _ROWS,
+        fragments=fragments,
+        fail_on=fail_on,
+        budget_after=budget_after,
+    )
+    cap = _capability(present)
+    return AnalysisService(
+        AnalysisReaders(
+            system="qa",
+            capability=cap,
+            providers=ProvidersRepository(conn, cap),
+            lineage=LineageService(conn, cap),
+            transformations=TransformationsRepository(conn, cap),
+            queries=QueriesRepository(conn, cap),
+            chains=ChainsRepository(conn, cap),
+            load_closure=LoadClosureService(conn, cap),
+            health=HealthRepository(conn, cap),
+            hana=HanaRepository(conn, cap),
+            query_auth_exposure=lambda _query: pytest.fail("not reached in these tests"),
+        )
+    )
+
+
+def _analysis(**kwargs: Any) -> Analysis:
+    result = _service(**kwargs).analyze_object("SALES_DSO")
+    assert isinstance(result, Analysis), result
+    return result
+
+
+# A flow with real edges: STAGE_DSO --TR1--> SALES_DSO --TR2--> SALES_CUBE, plus a transformation
+# whose routine reads SALES_DSO (the consumer BW's own where-used list cannot show).
+_FLOW_FRAGMENTS: dict[str, list[tuple[Any, ...]]] = {
+    # lineage downstream: (target name, target tlogo, transformation id)
+    "SOURCENAME = ?": [("SALES_CUBE", "CUBE", "TR2")],
+    # lineage upstream: (source name, source tlogo, transformation id)
+    "TARGETNAME = ?": [("STAGE_DSO", "ODSO", "TR1")],
+}
+
+
+# --- the envelope every compound tool returns ---------------------------------------------
+
+
+def test_an_object_analysis_fills_the_shared_envelope() -> None:
+    """One contract across all five questions, so a client learns it once."""
+    analysis = _analysis()
+    assert analysis.kind == "object"
+    assert analysis.system == "qa"
+    assert analysis.subject_name == "SALES_DSO"
+    assert analysis.summary, "a composed answer with no summary is just five payloads"
+    assert analysis.steps, "no audit trail means the answer cannot be checked"
+    assert analysis.confidence.level in ("high", "medium", "low")
+    assert analysis.next_actions
+
+
+def test_a_missing_object_is_not_found_rather_than_an_empty_analysis() -> None:
+    """An envelope full of nulls would read as 'this object has no dependencies'."""
+    result = _service(rows={}).analyze_object("NOSUCH")
+    assert isinstance(result, ObjectNotFound)
+
+
+# --- the audit trail is the point ---------------------------------------------------------
+
+
+def test_every_audit_row_names_a_tool_that_actually_exists() -> None:
+    """The auditability claim, enforced.
+
+    Each section says which granular tool reproduces it. If that name drifts from the registered
+    surface the claim silently becomes false, and a reader following it gets an unknown-tool error.
+    """
+
+    async def names() -> set[str]:
+        async with Client(server.mcp) as client:
+            return {t.name for t in await client.list_tools()}
+
+    registered = asyncio.run(names())
+    cited = {step.tool for step in _analysis().steps}
+    assert cited, "no tools cited"
+    assert cited <= registered, f"cited but not registered: {sorted(cited - registered)}"
+
+
+def test_audit_rows_carry_the_resolved_physical_tables() -> None:
+    """Section-level provenance: a reader can see which tables an answer rests on."""
+    rows = _analysis().steps
+    tables = {table for step in rows for table in step.source_tables}
+    assert "RSDODSO" in tables, "the resolved physical name should be recorded, not the logical one"
+
+
+def test_each_section_reports_a_status_and_a_count() -> None:
+    analysis = _analysis()
+    definition = next(s for s in analysis.steps if s.section == "definition")
+    assert definition.status == "complete"
+    assert definition.record_count == 2  # the two scripted DSO fields
+
+
+# --- one reader failing must not cost the others ------------------------------------------
+
+
+def test_an_absent_table_makes_a_section_unsupported_not_empty() -> None:
+    """'This release cannot report consumers' and 'there are none' are different answers."""
+    analysis = _analysis(present=set(_TABLES) - {"object_dependencies"})
+    calcviews = next(s for s in analysis.steps if s.section == "consumer_calcviews")
+    assert calcviews.status == "unsupported"
+    assert any(limitation.reason == "unsupported_on_release" for limitation in analysis.limitations)
+    # and the rest of the analysis still arrived
+    assert analysis.definition is not None
+    assert next(s for s in analysis.steps if s.section == "definition").status == "complete"
+
+
+def test_a_broken_reader_is_recorded_and_the_analysis_continues() -> None:
+    analysis = _analysis(fail_on="RSZCOMPDIR")
+    failed = [s for s in analysis.steps if s.status == "failed"]
+    assert failed, "a raising reader should be recorded, not swallowed"
+    assert analysis.definition is not None
+    assert analysis.confidence.sections_failed == len(failed)
+    assert any("could not be read" in limitation.limitation for limitation in analysis.limitations)
+
+
+def test_an_unsupported_section_is_not_counted_as_complete() -> None:
+    analysis = _analysis(present=set(_TABLES) - {"object_dependencies"})
+    assert analysis.confidence.sections_unsupported >= 1
+    assert analysis.confidence.level in ("medium", "low")
+
+
+# --- the budget: a partial answer beats no answer -----------------------------------------
+
+
+def test_budget_exhaustion_returns_the_sections_already_gathered() -> None:
+    """The deliberate difference from a granular tool, which returns a BudgetResult and nothing.
+
+    Five readers draw on one per-call allowance, so a later section can exhaust what earlier ones
+    left. Losing four completed sections to report the fifth would be a worse answer.
+    """
+    analysis = _analysis(budget_after=4)
+    assert analysis.stopped_on_budget is True
+    assert analysis.definition is not None, "sections gathered before the budget ran out are kept"
+    assert any(s.status == "skipped_budget" for s in analysis.steps)
+    assert any(limitation.reason == "budget_exhausted" for limitation in analysis.limitations)
+
+
+def test_sections_after_the_budget_are_not_attempted_again() -> None:
+    """Retrying would raise on the first statement, so remaining rows are recorded, not tried."""
+    conn = ScriptedConnection(rows=_ROWS, budget_after=4)
+    cap = _capability()
+    service = AnalysisService(
+        AnalysisReaders(
+            system="qa",
+            capability=cap,
+            providers=ProvidersRepository(conn, cap),
+            lineage=LineageService(conn, cap),
+            transformations=TransformationsRepository(conn, cap),
+            queries=QueriesRepository(conn, cap),
+            chains=ChainsRepository(conn, cap),
+            load_closure=LoadClosureService(conn, cap),
+            health=HealthRepository(conn, cap),
+            hana=HanaRepository(conn, cap),
+            query_auth_exposure=lambda _q: pytest.fail("not reached"),
+        )
+    )
+    result = service.analyze_object("SALES_DSO")
+    assert isinstance(result, Analysis)
+    spent = conn.statements
+    skipped = [s for s in result.steps if s.status == "skipped_budget"]
+    assert len(skipped) > 1, "only the first over-budget section was recorded"
+    # One statement over the bound raised; nothing after it was attempted.
+    assert spent == 5
+
+
+# --- confidence is components, never one number -------------------------------------------
+
+
+def test_confidence_carries_components_and_reasons_not_a_score() -> None:
+    """Collapsing coverage and evidence basis into a percentage would hide which one failed."""
+    confidence = _analysis().confidence
+    assert set(confidence.model_dump()) >= {
+        "level",
+        "sections_total",
+        "sections_complete",
+        "sections_unsupported",
+        "sections_failed",
+        "sections_skipped",
+        "advisory_relationships",
+        "reasons",
+    }
+    assert confidence.reasons
+    assert not any(
+        isinstance(value, float) and 0.0 < value < 1.0 for value in confidence.model_dump().values()
+    ), "confidence must not carry a probability-shaped number"
+
+
+def test_a_clean_run_says_so_rather_than_leaving_reasons_empty() -> None:
+    """An empty reasons list would read as 'unknown' rather than 'nothing was wrong'."""
+    confidence = _analysis().confidence
+    if confidence.sections_unsupported == 0 and confidence.sections_failed == 0:
+        assert any("every applicable section" in reason for reason in confidence.reasons)
+
+
+def test_gaps_lower_the_level_and_are_counted() -> None:
+    degraded = _analysis(present=set(_TABLES) - {"object_dependencies", "request_status", "dtp"})
+    assert degraded.confidence.sections_unsupported >= 2
+    assert degraded.confidence.level in ("medium", "low")
+
+
+def test_a_not_applicable_section_is_not_a_gap() -> None:
+    """A section that does not apply to this subject must not read as a coverage failure."""
+    run = _Run(_service()._r)
+    run.note_section("irrelevant", "bw_list_systems", "not_applicable")
+    confidence = run.confidence()
+    assert confidence.sections_total == 0
+    assert confidence.sections_unsupported == 0
+
+
+# --- relationships resolved from a real flow ----------------------------------------------
+
+
+def test_lineage_edges_become_dependencies_and_consumers() -> None:
+    """The normalised view: one list answers 'what feeds this' whichever reader established it."""
+    analysis = _analysis(fragments=_FLOW_FRAGMENTS)
+    assert "dso:STAGE_DSO" in {item.id for item in analysis.dependencies}
+    assert "infocube:SALES_CUBE" in {item.id for item in analysis.consumers}
+
+
+def test_a_relationship_records_the_transformation_it_runs_through() -> None:
+    """Without `via` a caller knows two objects are connected but not where to look."""
+    analysis = _analysis(fragments=_FLOW_FRAGMENTS)
+    upstream = next(i for i in analysis.dependencies if i.id == "dso:STAGE_DSO")
+    assert upstream.via == "TR1"
+    assert upstream.relationship == "upstream"
+
+
+def test_the_lineage_section_walks_upstream_only() -> None:
+    """The downstream half is walked by the impact section, which also finds routine consumers.
+
+    Asking for both directions here traversed every downstream hop twice: measured on a real DSO the
+    redundant call was 21s of a 31s analysis. Both graphs are still returned - `lineage` upstream
+    and `impact.graph` downstream - so nothing is lost and no hop is paid for twice.
+    """
+    analysis = _analysis(fragments=_FLOW_FRAGMENTS)
+    assert analysis.lineage is not None
+    assert analysis.lineage.direction == "upstream"
+    assert analysis.impact is not None
+    assert analysis.impact.graph.direction == "downstream"
+
+
+def test_a_declared_edge_is_not_marked_advisory() -> None:
+    """Advisory is reserved for derived links; marking a declared one would devalue the flag."""
+    analysis = _analysis(fragments=_FLOW_FRAGMENTS)
+    assert not any(item.advisory for item in analysis.dependencies)
+
+
+def test_the_summary_states_the_reach_of_a_change_split_by_basis() -> None:
+    result = _service(fragments=_FLOW_FRAGMENTS).assess_change_impact("SALES_DSO")
+    assert isinstance(result, Analysis)
+    joined = " ".join(result.summary)
+    assert "declared" in joined
+    assert result.kind == "change_impact"
+
+
+# --- relationships: declared and advisory never merge -------------------------------------
+
+
+def test_a_declared_relationship_wins_over_an_advisory_duplicate() -> None:
+    """Two readers can see the same edge; keeping the advisory one would understate it."""
+    ref = BwObjectRef(object_type="dso", name="STAGE_DSO")
+    analysis = Analysis(
+        kind="object",
+        system="qa",
+        subject_name="X",
+        title="t",
+        consumers=[
+            RelatedObject(ref=ref, relationship="downstream", advisory=True),
+            RelatedObject(ref=ref, relationship="downstream", advisory=False),
+        ],
+        confidence=_analysis().confidence,
+    )
+    assert len(analysis.consumers) == 1
+    assert analysis.consumers[0].advisory is False
+
+
+def test_the_same_object_in_two_roles_is_kept_twice() -> None:
+    """Deduping on the object alone would drop the fact that it is both a source and a consumer."""
+    ref = BwObjectRef(object_type="dso", name="STAGE_DSO")
+    analysis = Analysis(
+        kind="object",
+        system="qa",
+        subject_name="X",
+        title="t",
+        consumers=[
+            RelatedObject(ref=ref, relationship="downstream"),
+            RelatedObject(ref=ref, relationship="consumer_routine", advisory=True),
+        ],
+        confidence=_analysis().confidence,
+    )
+    assert len(analysis.consumers) == 2
+    assert analysis.advisory_consumer_count == 1
+
+
+# --- risks --------------------------------------------------------------------------------
+
+
+def test_risks_are_ordered_most_severe_first() -> None:
+    analysis = _analysis()
+    severities = [risk.severity for risk in analysis.risks]
+    ranks = ["info", "low", "medium", "high", "critical"]
+    assert severities == sorted(severities, key=ranks.index, reverse=True)
+
+
+def test_every_risk_carries_a_recommendation() -> None:
+    """A finding without an action is an observation, and the caller has to work out what to do."""
+    for risk in _analysis().risks:
+        assert risk.recommendation.strip()
+        assert risk.scenario.startswith("analysis.")
+
+
+def test_a_risk_is_never_raised_about_a_section_that_did_not_run() -> None:
+    """Judgement is derived only from records this analysis actually holds."""
+    analysis = _analysis(present=set(_TABLES) - {"request_status", "cs_tables"})
+    health_step = next(s for s in analysis.steps if s.section == "health")
+    assert health_step.status == "unsupported"
+    assert not any("changelog" in risk.title for risk in analysis.risks)
+
+
+# --- next actions are runnable -------------------------------------------------------------
+
+
+def test_next_actions_name_a_tool_and_say_why() -> None:
+    for action in _analysis().next_actions:
+        assert action.why.strip()
+        if action.tool:
+            assert action.tool.startswith("bw_")
+
+
+def test_next_actions_are_ordered() -> None:
+    orders = [action.order for action in _analysis().next_actions]
+    assert orders == sorted(orders)
+
+
+# --- caveat classification ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("caveat", "expected"),
+    [
+        ("routine reads are a heuristic lower bound", "heuristic_lower_bound"),
+        ("advisory: resolved by naming convention", "heuristic_lower_bound"),
+        ("response summarised: 60 of 900 nodes shown", "truncated"),
+        ("the row cap bound on providers", "truncated"),
+        ("customer-exit variables resolve in ABAP at runtime", "metadata_dead_end"),
+        ("something this build does not classify", "reader_caveat"),
+    ],
+)
+def test_a_reader_caveat_is_classified_for_machine_use(caveat: str, expected: str) -> None:
+    assert _reason_for(caveat) == expected
+
+
+def test_an_unclassifiable_caveat_is_still_carried_verbatim() -> None:
+    """Mis-labelling a reason would be worse than admitting it is unclassified."""
+    run = _Run(_service()._r)
+    run.absorb("section", ["a caveat with no recognisable marker"])
+    assert run.limitations == [
+        AnalysisLimitation(
+            scope="section",
+            limitation="a caveat with no recognisable marker",
+            reason="reader_caveat",
+        )
+    ]
+
+
+def test_constituent_caveats_are_carried_up_not_dropped() -> None:
+    """The classic composition bug: parts state their limits, the whole does not."""
+    analysis = _analysis(present=set(_TABLES) - {"cs_tables"})
+    assert analysis.limitations, "a degraded run reported no limitation at all"

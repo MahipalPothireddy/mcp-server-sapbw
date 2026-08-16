@@ -43,6 +43,7 @@ from .core.logging import get_logger
 from .core.paths import cache_dir as default_cache_dir
 from .core.profiles import ProfileManager
 from .core.snapshots import SnapshotStore, snapshot_file
+from .models.analysis import Analysis
 from .models.capability import CapabilityRecord, CapabilityReport
 from .models.chains import (
     Chain,
@@ -95,6 +96,7 @@ from .repositories.security import SecurityRepository
 from .repositories.sources import SourcesRepository
 from .repositories.threex import ThreeXRepository
 from .repositories.transformations import TransformationsRepository
+from .services.analysis import AnalysisReaders, AnalysisService
 from .services.analyzers import Analyzers
 from .services.capability_report import build_report
 from .services.diagram import build_layout, png_available, render_png, render_svg
@@ -132,6 +134,15 @@ _MAX_DOCGEN_PAGES = 5000
 _MAX_INLINE_FIELDS = 40
 _MAX_INLINE_NODES = 60
 _MAX_INLINE_EDGES = 90
+# Applied inside a composed answer only; see _shape_query. A query's element tree and its
+# field-lineage paths are the two payloads that dominated a live compound response.
+_MAX_INLINE_ELEMENTS = 25
+_MAX_INLINE_PATHS = 25
+
+# A compound analysis walks the graph several times over, so its depth is bounded harder than a
+# granular lineage call's: the cost of one extra hop is multiplied by the number of sections that
+# traverse it, and a deep composed answer is usually worse than a shallow one plus a follow-up.
+_MAX_ANALYSIS_DEPTH = 5
 
 # How much of a result may be inlined before it is summarised. 'auto' decides per response.
 DetailLevel = Literal["auto", "summary", "full"]
@@ -347,6 +358,7 @@ class Runtime(Protocol):
         self, system: str, query: str
     ) -> QueryAuthExposure | UnsupportedResult: ...
     def routine_register(self, system: str) -> RoutineRegisterService: ...
+    def analysis(self, system: str) -> AnalysisService: ...
     def snapshots(self, system: str) -> SnapshotService: ...
     def snapshot_store(self, system: str) -> SnapshotStore | None: ...
     def exit_analysis(
@@ -722,6 +734,35 @@ class ServerRuntime:
     def routine_register(self, system: str) -> RoutineRegisterService:
         return RoutineRegisterService(
             self._connection(system), self.capability(system), self._cache(system)
+        )
+
+    def analysis(self, system: str) -> AnalysisService:
+        """The compound-analysis service, with every reader it composes built once.
+
+        Assembled here rather than inside the service for two reasons that both belong to the
+        runtime. The security repository must be built without a cache, and that rule is enforced
+        in one place; and ``LineageService`` and ``TransformationsRepository`` memoise per instance,
+        so an analysis rebuilding them per section would discard the memo that pays for it.
+        """
+        connection, capability, cache = (
+            self._connection(system),
+            self.capability(system),
+            self._cache(system),
+        )
+        return AnalysisService(
+            AnalysisReaders(
+                system=system,
+                capability=capability,
+                providers=ProvidersRepository(connection, capability, cache),
+                lineage=LineageService(connection, capability, cache),
+                transformations=TransformationsRepository(connection, capability, cache),
+                queries=QueriesRepository(connection, capability, cache),
+                chains=ChainsRepository(connection, capability, cache),
+                load_closure=LoadClosureService(connection, capability, cache),
+                health=HealthRepository(connection, capability, cache),
+                hana=HanaRepository(connection, capability, cache),
+                query_auth_exposure=lambda query: self.query_auth_exposure(system, query),
+            )
         )
 
     def close(self) -> None:
@@ -1839,6 +1880,230 @@ def bw_review_scenario(
     """Run one analysis by id: 9.1-9.8, "layer_violations", or "unused_providers"."""
     limit, _ = _clamp_page(limit, 0)
     return runtime().analyzers(system).run_scenario(scenario, limit=limit)
+
+
+# --- compound analysis tools -------------------------------------------------------------
+#
+# Each of these composes six or seven of the granular tools above into one answer, in the shape
+# `models.analysis.Analysis` describes. They exist **alongside** the granular tools, not instead of
+# them: a caller who knows exactly what they want should still ask for exactly that, and every
+# section of a composed answer names the granular tool that reproduces it so any part can be checked
+# on its own.
+#
+# What they add beyond saving round trips:
+#
+# * `steps` - an audit row per reader, with its status and the physical tables it read. A section
+#   that is absent says whether it did not apply or the release could not report it.
+# * `limitations` - what cannot be concluded, with a machine-readable reason, so "nothing found" and
+#   "could not look" are never the same answer.
+# * `confidence` - coverage and evidence basis as separate components, never one number.
+# * a partial answer when the per-call budget runs out, rather than a BudgetResult and nothing else.
+
+
+#: What a compound tool returns. Named because all five share it and each one also needs it as the
+#: argument type of the shaper.
+_AnalysisResult = Analysis | ObjectNotFound | UnsupportedResult
+
+
+@_readonly_tool
+def bw_analyze_object(
+    system: str, name: str, depth: int = 2, *, detail: DetailLevel = "auto"
+) -> _AnalysisResult:
+    """Everything about one provider or InfoObject in a single auditable answer.
+
+    Composes: definition and description, lineage both ways, downstream blast radius including
+    routine-embedded consumers, volume and currency, the chains that load it, the reports that read
+    it, and the calc views that read its generated table.
+
+    Read ``confidence`` and ``limitations`` before the payloads. A section the release cannot report
+    is named in ``steps`` with status ``unsupported`` rather than coming back empty, because "this
+    object has no consumers" and "consumers cannot be read here" are different answers and only one
+    of them is about the object.
+
+    ``detail`` bounds the embedded field list and lineage graphs exactly as it does on
+    ``bw_describe_object`` and ``bw_get_lineage``; counts stay exact either way.
+    """
+    result = runtime().analysis(system).analyze_object(name, depth=_clamp_depth(depth))
+    return _shape_analysis(result, system=system, detail=detail)
+
+
+@_readonly_tool
+def bw_analyze_query(system: str, query: str, *, detail: DetailLevel = "auto") -> _AnalysisResult:
+    """Everything about one BEx report: what it reads, who sees what, and when its data is current.
+
+    Composes: the query definition and element tree, field-level lineage toward the DataSource,
+    usage and decommission signal, authorisation exposure (whether two users legitimately see
+    different numbers), and the cadence of the chain feeding its provider.
+
+    ``query`` may be the technical name (COMPID) or the COMPUID. Customer-exit variables come back
+    as a metadata dead end: they can be named, but their values resolve in ABAP at runtime.
+    """
+    return _shape_analysis(
+        runtime().analysis(system).analyze_query(query), system=system, detail=detail
+    )
+
+
+@_readonly_tool
+def bw_analyze_process_chain(system: str, chain_id: str, days: int = 90) -> _AnalysisResult:
+    """Everything about one process chain: structure, reliability, what it loads, where it is weak.
+
+    Composes: the chain with its nested sub-chains resolved, runtime statistics over the retained
+    log window, and the providers it actually loads walked recursively through those sub-chains -
+    which is where most loads live rather than in the top-level step list.
+
+    Durations reflect contention where chains overlap, and observed overlaps are reported as a risk
+    rather than the p95 being presented as a fixed property of the chain.
+    """
+    return runtime().analysis(system).analyze_process_chain(chain_id, days=max(1, min(days, 365)))
+
+
+@_readonly_tool
+def bw_assess_change_impact(
+    system: str, name: str, depth: int = 3, *, detail: DetailLevel = "auto"
+) -> _AnalysisResult:
+    """What a change to this object reaches, and what to verify before transporting it.
+
+    Composes the blast radius from three directions that each miss something the others catch:
+    declared transformations downstream, routines that read the object (invisible to BW's own
+    where-used list), reports that read it, and calc views that read its generated table - the last
+    of which BW will not warn about at all, because the view reads the generated table directly.
+
+    ``next_actions`` is the pre-transport checklist, generated from what was actually found rather
+    than from a template, and it opens with taking a snapshot: comparing one afterwards is the only
+    way to prove what the change altered, which a transport log does not say.
+    """
+    result = runtime().analysis(system).assess_change_impact(name, depth=_clamp_depth(depth))
+    return _shape_analysis(result, system=system, detail=detail)
+
+
+@_readonly_tool
+def bw_troubleshoot_missing_data(
+    system: str, target: str, *, detail: DetailLevel = "auto"
+) -> _AnalysisResult:
+    """Diagnose a report or provider showing wrong or missing data, layer by layer.
+
+    Walks the layers in the order they actually explain incidents, which is not the order they are
+    usually looked at. First what the object reads, then **whether the data arrived** (the request
+    ledger: a failed or stale load explains missing rows directly), then whether the load that
+    should have delivered it ran, and only then the transformation logic. Most incidents are
+    answered by the second or third question, and opening with routine source spends the call on the
+    least likely cause.
+
+    For a query it also checks authorisation exposure, because a report restricted on an
+    authorisation-relevant characteristic returns different rows per user - which presents exactly
+    as missing data with no load fault anywhere.
+
+    ``risks`` comes back ordered most severe first: work down it. Each entry names the object to
+    inspect and cites the record it was derived from.
+    """
+    return _shape_analysis(
+        runtime().analysis(system).troubleshoot_missing_data(target), system=system, detail=detail
+    )
+
+
+def _clamp_depth(depth: int) -> int:
+    """A composed answer fans out per hop, so depth is bounded harder than on a granular tool."""
+    return max(1, min(depth, _MAX_ANALYSIS_DEPTH))
+
+
+def _shape_analysis(
+    result: _AnalysisResult, *, system: str, detail: DetailLevel
+) -> _AnalysisResult:
+    """Apply the same field and graph bounds a granular tool applies, to each embedded payload.
+
+    Measured against a live system: one object analysis came back at 79 KiB and a query analysis at
+    90 KiB, dominated by a 171-field provider and two full lineage graphs. Context spent on that is
+    context unavailable for reasoning, and a compound tool embeds several payloads at once - so the
+    shaping matters more here than on the granular tools it composes, not less.
+
+    The bounds are the *same* ones, deliberately: a caller who has learned what ``detail`` does to
+    ``bw_describe_object`` should not have to learn a second rule. Counts stay exact, and a trimmed
+    payload keeps its own caveat naming the resource URI holding the whole record.
+    """
+    if not isinstance(result, Analysis) or detail == "full":
+        return result
+    updates: dict[str, Any] = {}
+    if result.definition is not None:
+        updates["definition"] = _shape_provider(result.definition, system=system, detail=detail)
+    if result.query is not None:
+        updates["query"] = _shape_query(result.query, system=system, detail=detail)
+    if result.query_lineage is not None:
+        updates["query_lineage"] = _shape_query_lineage(
+            result.query_lineage, system=system, detail=detail
+        )
+    if result.lineage is not None:
+        updates["lineage"] = _shape_graph(result.lineage, detail=detail)
+    if result.impact is not None:
+        updates["impact"] = result.impact.model_copy(
+            update={"graph": _shape_graph(result.impact.graph, detail=detail)}
+        )
+    if result.trace is not None:
+        updates["trace"] = result.trace.model_copy(
+            update={"graph": _shape_graph(result.trace.graph, detail=detail)}
+        )
+    return result.model_copy(update=updates) if updates else result
+
+
+def _shape_query(query: Query, *, system: str, detail: DetailLevel) -> Query:
+    """Bound a query's element tree, which dominates a composed answer.
+
+    Measured live: a 39-element query analysis came back at 90 KiB, most of it the element tree and
+    its edges. Applied only inside a composed answer - ``bw_get_query`` still returns the whole
+    definition, because asking for one query on its own *is* a request for exactly that, while a
+    composed answer has five other payloads competing for the same reply.
+    """
+    total = len(query.elements)
+    if detail == "full" or (detail == "auto" and total <= _MAX_INLINE_ELEMENTS):
+        return query
+    kept = query.elements[:_MAX_INLINE_ELEMENTS]
+    kept_ids = {element.eltuid for element in kept}
+    return query.model_copy(
+        update={
+            "elements": kept,
+            # Both endpoints must be retained, so the trimmed tree stays a valid subgraph rather
+            # than a set of edges pointing at elements the reply no longer carries.
+            "edges": [
+                e for e in query.edges if e.parent_uid in kept_ids and e.child_uid in kept_ids
+            ],
+            "caveats": [
+                *query.caveats,
+                f"element tree summarised: {len(kept)} of {total} elements shown, with the edges "
+                f"between them. Read bw://{system}/query/{query.compid or query.compuid} for the "
+                "whole definition, or call bw_get_query, or call again with detail='full'.",
+            ],
+        }
+    )
+
+
+def _shape_query_lineage(
+    lineage: QueryLineage, *, system: str, detail: DetailLevel
+) -> QueryLineage:
+    """Bound the field-path list, keeping the paths that actually resolved to a field.
+
+    Which paths are kept is not arbitrary. A ``field`` resolution is the field's own derivation; a
+    ``provider`` resolution is a fallback that looks like field lineage and is not. Keeping the
+    resolved ones first means a trimmed answer loses the least informative paths rather than an
+    arbitrary slice, and the counts of what was dropped stay in the caveat.
+    """
+    total = len(lineage.paths)
+    if detail == "full" or (detail == "auto" and total <= _MAX_INLINE_PATHS):
+        return lineage
+    ranked = sorted(
+        lineage.paths, key=lambda p: {"field": 0, "provider": 1, "none": 2}[p.resolution]
+    )
+    kept = ranked[:_MAX_INLINE_PATHS]
+    dropped = total - len(kept)
+    return lineage.model_copy(
+        update={
+            "paths": kept,
+            "caveats": [
+                *lineage.caveats,
+                f"field paths summarised: {len(kept)} of {total} shown, resolved paths first, so "
+                f"the {dropped} omitted are the least specific. Call bw_get_query_lineage for "
+                "every path, or call again with detail='full'.",
+            ],
+        }
+    )
 
 
 # --- documentation generation tool -------------------------------------------------------

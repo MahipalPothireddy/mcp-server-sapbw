@@ -19,9 +19,11 @@ from mcp_server_sapbw import server
 from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
 from mcp_server_sapbw.core.profiles import EccProfile
 from mcp_server_sapbw.core.snapshots import IN_MEMORY, SnapshotStore
+from mcp_server_sapbw.models.analysis import Analysis, AnalysisConfidence
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.ecc import ConnectorUnavailable
-from mcp_server_sapbw.models.provenance import UnsupportedResult
+from mcp_server_sapbw.models.provenance import Provenance, UnsupportedResult
+from mcp_server_sapbw.models.providers import ObjectNotFound, Provider, ProviderField
 from mcp_server_sapbw.models.security import QueryAuthExposure
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.hana import HanaRepository
@@ -34,6 +36,7 @@ from mcp_server_sapbw.repositories.sources import SourcesRepository
 from mcp_server_sapbw.repositories.threex import ThreeXRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import CacheStatus, RefreshResult, SystemStatus
+from mcp_server_sapbw.services.analysis import AnalysisReaders, AnalysisService
 from mcp_server_sapbw.services.analyzers import Analyzers
 from mcp_server_sapbw.services.docgen import DocGenerator
 from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
@@ -69,7 +72,13 @@ _TABLES = {
 }
 
 
-def _capability() -> CapabilityRecord:
+def _capability(extra: dict[str, str] | None = None) -> CapabilityRecord:
+    """The fixture release.
+
+    ``extra`` widens it for one test. Kept opt-in rather than added to ``_TABLES``: declaring a
+    table present opens every code path that reads it, and paths this fake cannot answer with the
+    right column shape would fail tests that have nothing to do with the table being added.
+    """
     return CapabilityRecord(
         system="qa",
         bw_release="7.50",
@@ -79,7 +88,7 @@ def _capability() -> CapabilityRecord:
             logical: TableStatus(
                 logical_name=logical, resolved_name=physical, present=True, schema_name="TESTSCHEMA"
             )
-            for logical, physical in _TABLES.items()
+            for logical, physical in {**_TABLES, **(extra or {})}.items()
         },
     )
 
@@ -101,6 +110,10 @@ class _Conn:
             return [("DAILY_LOAD", "FINANCE", "ACT")]
         if "RSPCCHAINT" in sql:
             return [("DAILY_LOAD", "Daily finance load")]
+        if "RSPCCHAIN" in sql:  # steps: TYPE, VARIANTE, LNR, EVENTP_START/GREEN/RED
+            return [("LOADING", "DTP_1", 1, "", "", "")]
+        if "RSPCPROCESSLOG" in sql:  # per-step runtimes; empty is a valid measured window
+            return []
         if "RSPCLOGCHAIN" in sql:
             if "ZEIT" in sql:  # median-start-times query (CHAIN_ID, ZEIT)
                 return [("DAILY_LOAD", "080000")]
@@ -210,8 +223,8 @@ class _Conn:
 
 
 class FakeRuntime:
-    def __init__(self) -> None:
-        self._cap = _capability()
+    def __init__(self, *, extra_tables: dict[str, str] | None = None) -> None:
+        self._cap = _capability(extra_tables)
         self._snapshot_store: SnapshotStore | None = None
 
     def list_systems(self) -> list[SystemStatus]:
@@ -278,6 +291,29 @@ class FakeRuntime:
 
     def routine_register(self, system: str) -> RoutineRegisterService:
         return RoutineRegisterService(_Conn(), self._cap)
+
+    def analysis(self, system: str) -> AnalysisService:
+        """Every reader an analysis composes, over the one scripted connection.
+
+        Built the way the real runtime builds it - one instance per reader, shared across sections -
+        so the fixture exercises the memoisation path rather than a shape the server never uses.
+        """
+        conn = _Conn()
+        return AnalysisService(
+            AnalysisReaders(
+                system=system,
+                capability=self._cap,
+                providers=ProvidersRepository(conn, self._cap),
+                lineage=LineageService(conn, self._cap),
+                transformations=TransformationsRepository(conn, self._cap),
+                queries=QueriesRepository(conn, self._cap),
+                chains=ChainsRepository(conn, self._cap),
+                load_closure=LoadClosureService(conn, self._cap),
+                health=HealthRepository(conn, self._cap),
+                hana=HanaRepository(conn, self._cap),
+                query_auth_exposure=lambda query: self.query_auth_exposure(system, query),
+            )
+        )
 
     def snapshots(self, system: str) -> SnapshotService:
         return SnapshotService(_Conn(), self._cap)
@@ -453,6 +489,166 @@ def test_hana_crossings_via_client() -> None:
     payload = result.structured_content
     body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
     assert body["total_count"] == 0  # empty fixture; the tool path works end to end
+
+
+# --- compound analysis --------------------------------------------------------------------
+
+
+def test_analyze_object_via_client() -> None:
+    """The composed answer reaches the client with its audit trail and confidence intact."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_analyze_object", {"system": "qa", "name": "SALES_DSO"}))
+    )
+    assert body["kind"] == "object"
+    assert body["subject_name"] == "SALES_DSO"
+    assert body["summary"]
+    assert body["steps"], "no audit trail reached the client"
+    assert body["confidence"]["level"] in ("high", "medium", "low")
+    assert body["confidence"]["reasons"]
+
+
+def test_analyze_query_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(asyncio.run(_call("bw_analyze_query", {"system": "qa", "query": "QRY1"})))
+    assert body["kind"] == "query"
+    assert body["subject_name"] == "QRY1"
+    assert body["query"]["compid"] == "QRY1"
+    assert any(step["section"] == "security" for step in body["steps"])
+
+
+#: Chain structure and per-step runtimes, which the base fixture leaves absent. Declared only for
+#: the chain tests, so the two tables' code paths do not open for every other test.
+_CHAIN_TABLES = {"chain_edges": "RSPCCHAIN", "process_log": "RSPCPROCESSLOG"}
+
+
+def test_analyze_process_chain_via_client() -> None:
+    server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
+    body = _report_body(
+        asyncio.run(_call("bw_analyze_process_chain", {"system": "qa", "chain_id": "DAILY_LOAD"}))
+    )
+    assert body["kind"] == "process_chain"
+    assert body["chain"]["chain_id"] == "DAILY_LOAD"
+    assert any(step["section"] == "runtimes" for step in body["steps"])
+
+
+def test_analyze_process_chain_reports_an_absent_table_as_unsupported() -> None:
+    """Not as 'no such chain'. The two have different remedies, and only one is about the chain.
+
+    Without this distinction a release that cannot report chain structure sends the caller hunting
+    for a typo in an id that is spelled correctly.
+    """
+    server.set_runtime(FakeRuntime())  # base fixture: chain_edges absent
+    body = _report_body(
+        asyncio.run(_call("bw_analyze_process_chain", {"system": "qa", "chain_id": "DAILY_LOAD"}))
+    )
+    assert body["code"] == "unsupported_on_release"
+    # The logical name is reported, because an absent table has no resolved physical name to give.
+    assert "chain_edges" in body["missing"]
+
+
+def test_assess_change_impact_via_client() -> None:
+    """The pre-transport checklist is generated from what was found, and opens with a snapshot."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_assess_change_impact", {"system": "qa", "name": "ADSO_T"}))
+    )
+    assert body["kind"] == "change_impact"
+    tools = [action["tool"] for action in body["next_actions"]]
+    assert tools[0] == "bw_create_snapshot"
+    assert "bw_find_layer_violations" in tools
+    assert "bw_check_load_latency" in tools
+
+
+def test_troubleshoot_missing_data_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_troubleshoot_missing_data", {"system": "qa", "target": "QRY1"}))
+    )
+    assert body["kind"] == "missing_data"
+    assert any(step["section"] == "subject" for step in body["steps"])
+    assert body["next_actions"]
+
+
+def test_a_compound_answer_bounds_its_embedded_payloads() -> None:
+    """A composed answer embeds several payloads at once, so the bound matters more here, not less.
+
+    Measured live before this was applied: 79 KiB for one object analysis and 90 KiB for one query,
+    dominated by a 171-field provider and two full lineage graphs. The bounds are the same ones
+    ``bw_describe_object`` and ``bw_get_lineage`` apply, so a caller learns one rule.
+    """
+    wide = Provider(
+        name="WIDE_DSO",
+        object_type="dso",
+        key_field_names=["K"],
+        fields=[
+            ProviderField(
+                name=("K" if i == 0 else f"F{i:03d}"),
+                position=i,
+                is_key=i == 0,
+                provenance=Provenance(source_table="RSDODSOIOBJ"),
+            )
+            for i in range(120)
+        ],
+        provenance=Provenance(source_table="RSDODSO"),
+    )
+    analysis = Analysis(
+        kind="object",
+        system="qa",
+        subject_name="WIDE_DSO",
+        title="t",
+        definition=wide,
+        confidence=AnalysisConfidence(level="high"),
+    )
+
+    trimmed = server._shape_analysis(analysis, system="qa", detail="auto")
+    assert isinstance(trimmed, Analysis) and trimmed.definition is not None
+    assert len(trimmed.definition.fields) < 120
+    assert any("field list summarised" in c for c in trimmed.definition.caveats)
+    # The resource URI holding the whole record is named, so nothing becomes unreachable.
+    assert any("bw://qa/provider/WIDE_DSO" in c for c in trimmed.definition.caveats)
+
+    whole = server._shape_analysis(analysis, system="qa", detail="full")
+    assert isinstance(whole, Analysis) and whole.definition is not None
+    assert len(whole.definition.fields) == 120
+
+
+def test_shaping_leaves_a_not_found_untouched() -> None:
+    """The shaper runs on every return, so it has to pass the failure branches through."""
+    missing = ObjectNotFound(name="X", detail="nope")
+    assert server._shape_analysis(missing, system="qa", detail="auto") is missing
+
+
+def test_a_compound_tool_reports_a_missing_subject_as_not_found() -> None:
+    """An envelope of nulls would read as 'this object has no dependencies'."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_analyze_query", {"system": "qa", "query": "NOSUCHQUERY"}))
+    )
+    assert body["code"] == "object_not_found"
+
+
+def test_compound_tools_cite_only_registered_tools() -> None:
+    """Across all five: every audit row and next action must name a tool a client can call.
+
+    This is what makes a composed answer auditable rather than merely detailed - each section can be
+    re-run on its own. A drifted name silently turns that promise into an unknown-tool error.
+    """
+    server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
+    registered = set(asyncio.run(_list_tool_names()))
+    cited: set[str] = set()
+    for tool, args in (
+        ("bw_analyze_object", {"system": "qa", "name": "SALES_DSO"}),
+        ("bw_analyze_query", {"system": "qa", "query": "QRY1"}),
+        ("bw_analyze_process_chain", {"system": "qa", "chain_id": "DAILY_LOAD"}),
+        ("bw_assess_change_impact", {"system": "qa", "name": "ADSO_T"}),
+        ("bw_troubleshoot_missing_data", {"system": "qa", "target": "QRY1"}),
+    ):
+        body = _report_body(asyncio.run(_call(tool, args)))
+        cited |= {step["tool"] for step in body["steps"]}
+        cited |= {a["tool"] for a in body["next_actions"] if a["tool"]}
+    assert cited, "no tools were cited by any compound answer"
+    assert cited <= registered, f"cited but not registered: {sorted(cited - registered)}"
 
 
 # --- snapshots and environment comparison -------------------------------------------------

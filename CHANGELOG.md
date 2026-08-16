@@ -6,6 +6,71 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — compound analysis tools with an auditable evidence trail
+
+Five tools (`bw_analyze_object`, `bw_analyze_query`, `bw_analyze_process_chain`,
+`bw_assess_change_impact`, `bw_troubleshoot_missing_data`), each composing six or seven of the
+granular readers into one answer. They sit **alongside** the 50 granular tools rather than replacing
+them: a caller who knows what they want should still ask for exactly that.
+
+The risk in merging six payloads is that the result becomes unverifiable — five answers flattened
+together read as one authoritative statement, and a reader cannot tell which part came from a
+metadata row, which came from a heuristic, and which section was silently absent because the release
+could not report it. Everything below exists to prevent that:
+
+- **An audit row per section**, naming its status, the physical tables it read, and **the granular
+  tool that reproduces it**. That last field is what makes the answer checkable rather than merely
+  detailed: any section can be re-run alone and compared. A test asserts every cited name is
+  actually registered, because a drifted name would turn the promise into an unknown-tool error.
+- **`unsupported`, `failed`, `connector_required`, `skipped_budget` and `empty` are five distinct
+  statuses.** "This object has no consumers" and "consumers cannot be read on this release" are
+  different answers, only one of them is about the object, and they have different remedies.
+- **`limitations` carry a machine-readable reason**, so a caller can filter on what it can act on
+  instead of parsing sentences. Constituent readers' own caveats are carried up rather than dropped:
+  each reader states its scope limit honestly, and merging the results without them yields an answer
+  more confident than any of its parts.
+- **`confidence` is components, never a number.** A percentage would merge coverage (how much could
+  be read) with basis (how firmly each fact is established); a missing metadata table is fixed by a
+  different BW release and a dependency parsed out of ABAP cannot be fixed at all, so collapsing them
+  would hide which one applies. A test asserts nothing probability-shaped appears in it.
+- **A partial answer beats no answer.** Five readers draw on one per-call budget, so a later section
+  can exhaust what earlier ones left. The sections already gathered are returned, the rest are
+  recorded `skipped_budget` without being attempted, and `stopped_on_budget` is set — a deliberate
+  difference from a granular tool, where stopping early leaves nothing worth keeping.
+- **Judgement is derived only from records the analysis already holds** and stays in `risks`. No
+  scenario analyzer is re-run, so nothing in `risks` can be true of a section that did not run.
+- **`next_actions` name a tool and its arguments**, generated from what was found rather than from a
+  template. `bw_assess_change_impact` opens its checklist with taking a snapshot, because comparing
+  one afterwards is the only way to prove what a change altered — a transport log does not say.
+
+`bw_troubleshoot_missing_data` walks the layers in the order that actually explains incidents rather
+than the order they are usually looked at: what the object reads, then **whether the data arrived**
+(the request ledger — a failed or stale load explains missing rows directly), then whether the load
+that should have delivered it ran, and only then the transformation logic. For a query it also checks
+authorisation exposure, because a report restricted on an authorisation-relevant characteristic
+returns different rows per user, which presents exactly as missing data with no load fault anywhere.
+
+Two things found by running these against the live system, both fixed:
+
+- **An object analysis spent 21 of 31 seconds walking lineage in both directions** while the impact
+  section immediately after it walked the downstream half again. The lineage section now walks
+  upstream only; both graphs are still returned (`lineage` upstream, `impact.graph` downstream) and
+  no hop is paid for twice. 31s to 20s on the same object.
+- **Composed answers reached 90 KiB**, dominated by a 171-field provider, two full lineage graphs and
+  a 39-element query tree. Context spent on that is context unavailable for reasoning, and a compound
+  tool embeds several payloads at once — so the same `detail` bounds the granular tools use are now
+  applied to each embedded payload, plus two new ones for the query element tree and the field-path
+  list. 79 KiB to 41 KiB, 70 KiB to 31 KiB. Counts stay exact and each trimmed payload names the
+  resource holding the whole record.
+
+### Fixed — a fully successful analysis returned an empty audit trail
+
+The audit row was written on the failure paths only, with the success row expected from the method
+that records a section's contribution — but that method refines an existing row rather than creating
+one. The result was that the best case was the least checkable one, which for a feature whose entire
+value rests on the audit trail is the wrong way round. Found by the test that asserts every cited
+tool is registered, on a run where nothing was cited at all.
+
 ### Added — snapshots and environment comparison
 
 Four tools (`bw_create_snapshot`, `bw_list_snapshots`, `bw_compare_snapshots`,
