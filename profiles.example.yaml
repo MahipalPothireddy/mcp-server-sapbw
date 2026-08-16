@@ -7,6 +7,12 @@
 # Every tool/resource/prompt takes a `system:` argument naming one of these profiles.
 # The server is stateless across calls; connections are pooled per profile.
 #
+# WHAT DO WE GRANT THIS USER? See docs/deployment-modes.md. It publishes both supported
+# postures - a full technical read, and a least-privilege allow-list - as runnable GRANT scripts,
+# and states per grant group what withholding it costs. `bw_access_report(system)` then reports
+# which posture is actually in force, which reads were refused, and the exact statements to fix
+# them. A refused read is never reported as a BW release limitation.
+#
 # SERVING MORE THAN ONE CUSTOMER FROM ONE INSTALL? Set `tenant` on every profile.
 # Everybody calls their production system "prd", so without a tenant two customers' aliases carry
 # no distinguishing information and their extract caches and snapshot stores resolve to the same
@@ -23,6 +29,12 @@ systems:
     abap_schema: auto           # resolve at connect; do NOT hardcode SAPABAP1
     encrypt: true
     read_only_user: true        # assert no write grants; fail closed if any are found
+    # How this user was provisioned. Declared, never inferred - the server reports what it was
+    # actually allowed to read and flags a disagreement, so a profile claiming a full technical
+    # read whose dictionary probe is refused says so instead of quietly answering less.
+    # One of: technical_read least_privilege unknown (default: unknown).
+    # See docs/deployment-modes.md for both grant scripts and what each mode gives up.
+    access_mode: technical_read
     # Which environment this points at. Declared, never inferred: the server will not guess from
     # an alias, because `prd_copy` would read as production and `production_2` would not, and
     # being wrong means someone reads production figures believing they are looking at QA.

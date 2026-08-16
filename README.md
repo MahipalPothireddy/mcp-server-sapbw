@@ -12,7 +12,7 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **56 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **57 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -234,6 +234,7 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_system_profile` | `system` | Release, ABAP schema, object-model variants, log window, table presence/counts |
 | `bw_refresh_capabilities` | `system` | Re-run capability discovery, replacing the cached record |
 | `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
+| `bw_access_report` | `system` | Which deployment mode is in force, which reads were refused, and the exact grants to fix them |
 | `bw_support_matrix` | `tool?`, `release?`, `system?` | Which tool works on which BW release — **no connection required** |
 | `bw_cache_status` | `system` | What extracted metadata and how many snapshots are on local disk, and where |
 | `bw_refresh_cache` | `system`, `scope="all"` | Invalidate cached extracts by scope |
@@ -247,11 +248,18 @@ Three answers, in increasing specificity, and the first needs nothing from you:
 | Which tools work on BW 7.4 / 7.5 / BW/4HANA? | `bw_support_matrix` | no |
 | Which questions resolve on *my* system? | `bw_capability_report` | yes |
 | What does this server do with metadata object X? | [`docs/capability-contract.md`](docs/capability-contract.md) | no |
+| What do we grant the connecting user? | [`docs/deployment-modes.md`](docs/deployment-modes.md) | no |
+| What is this user actually allowed to read? | `bw_access_report` | yes |
+
+A fourth answer matters when the first three come back thin: **a refused read is not a missing
+feature.** A user without SELECT on `DD02L` used to make the server report `adso: false` and then
+"not available on BW 7.50" — pointing you at a BW upgrade for something one `GRANT SELECT` fixes.
+Denial and absence are now recorded separately, and `bw_access_report` names the grant.
 
 `bw_support_matrix` is keyed by **tool**, because that is the unit the question is asked in. Its
 `requires` field bridges to the capability contract and is **measured**, by attributing each metadata
 read to the tool that caused it while the offline suite runs — so it cannot drift the way a
-hand-written mapping across 56 tools would. It is a lower bound: everything listed really is read,
+hand-written mapping across 57 tools would. It is a lower bound: everything listed really is read,
 and a code path no test reaches contributes nothing.
 
 There is deliberately no `supported` verdict. Every value says where the claim comes from:
@@ -259,7 +267,7 @@ There is deliberately no `supported` verdict. Every value says where the claim c
 not everything verified there), `unverified` (**nobody has run it against that release — not a
 prediction**), `needs_connector`, `unknown`.
 
-Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 39 tools `verified`, 15 `expected`, 2
+Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 40 tools `verified`, 15 `expected`, 2
 connector-gated. Every other release reports `unverified` for every tool. That is an absence of
 evidence stated rather than filled in — which metadata objects a release carries is exactly what the
 capability resolver discovers at connect time, and predicting it from a version number would be
@@ -422,6 +430,25 @@ The register's line counts and portfolio totals cover **every** routine, but pat
 covers only the largest `parse_budget` of them, because parsing means fetching source. An entry
 with `analyzed=false` therefore reports **no** pattern counts rather than zeroes — zeroes would
 read as "this routine is clean".
+
+### BW 3.x dataflow
+
+| Tool | Parameters | Purpose |
+|---|---|---|
+| `bw_list_3x_flows` | `system`, `datasource?`, `only_without_transformation=false`, `limit`, `offset` | DataSources reaching BW through a 3.x transfer structure, with their rule profile |
+| `bw_get_transfer_rules` | `system`, `transfer_structure` | Field-level transfer rules for one transfer structure |
+| `bw_list_update_rules` | `system`, `limit=100` | Active 3.x update rules: InfoSource → target |
+
+Not legacy trivia on a 7.50 system. The 3.x path is `DataSource → InfoSource → transfer structure
+→ communication structure → update rules → target`, against the 7.x path's single transformation
+plus DTP. Where a DataSource has **no** 7.x transformation its transfer rules *are* the live load
+logic — over a thousand of them on the reference system, mostly master data — and lineage that
+ignores them stops dead at that DataSource. Read `has_seven_x_transformation` first; set
+`only_without_transformation` to list just those.
+
+A rule that is a constant or a direct assignment is fully described by the rule itself. A
+conversion routine or a formula holds its logic elsewhere, so those are reported as the mechanism
+rather than as resolved logic.
 
 ### Lineage
 
@@ -639,6 +666,10 @@ budget, so a resource read cannot run unbounded either.
 - **Read-only, permanently.** The server issues `SELECT` only. There is no code path that can write
   to a BW system — enforced in the connection layer, not by convention. Connections configured with
   `read_only_user: true` are refused (fail closed) if the user holds any write grant.
+- **Two provisioning postures, both documented.** A full technical read, or a least-privilege
+  allow-list. [`docs/deployment-modes.md`](docs/deployment-modes.md) carries both as runnable
+  `GRANT` scripts and states per group what withholding it costs; `bw_access_report` reports which
+  is in force. A refused read is reported as a refused read, never as a BW release limitation.
 - **No data retention off-box.** Metadata is cached locally per profile (git-ignored SQLite);
   runtime statistics are never cached beyond an hour. Nothing is transmitted to third parties.
 - **One install can serve several customers without their data meeting.** See below.

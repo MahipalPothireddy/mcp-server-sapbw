@@ -29,9 +29,9 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 
 | Release | verified | expected | unverified | needs_connector | unknown |
 |---|---|---|---|---|---|
-| `BW 7.40` | 0 | 0 | 54 | 2 | 0 |
-| `BW 7.50` | 39 | 15 | 0 | 2 | 0 |
-| `BW/4HANA 2.0` | 0 | 0 | 54 | 2 | 0 |
+| `BW 7.40` | 0 | 0 | 55 | 2 | 0 |
+| `BW 7.50` | 40 | 15 | 0 | 2 | 0 |
+| `BW/4HANA 2.0` | 0 | 0 | 55 | 2 | 0 |
 
 ## Per tool
 
@@ -39,6 +39,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 
 | Tool | `BW 7.40` | `BW 7.50` | `BW/4HANA 2.0` | Validation | Requires |
 |---|---|---|---|---|---|
+| `bw_access_report` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_analyze_object` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `object_dependencies`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_analyze_process_chain` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_edges`, `chain_text`, `log_chain` |
 | `bw_analyze_query` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider` |

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mcp_server_sapbw.core.profiles import (
+    Profile,
     ProfileConfigError,
     ProfileManager,
     ProfileNotFoundError,
@@ -338,3 +339,110 @@ def test_ecc_profile_declares_which_bw_systems_it_serves(tmp_path: Path) -> None
     assert manager.get_ecc("ecc_dev").serves == ["prd"]
     # The sandbox declares nothing, so it can never be resolved as the source for a BW system.
     assert manager.get_ecc("ecc_sandbox").serves == []
+
+
+# --- every documented option must actually take effect ------------------------------------
+#
+# These exist because eight of them did not. The loader enumerated fields by hand and silently
+# dropped the rest, so `cache_enabled: false` - which SECURITY.md publishes as the way to keep
+# customer metadata off local disk - left the cache on and wrote ABAP routine source to disk
+# anyway. The model was tested; the loader was not, because every other test constructs Profile
+# directly. A YAML round trip is the only thing that catches it.
+
+_FULL_YAML = """
+systems:
+  acme_prd:
+    host: ${BW_QA_HOST}
+    port: 30015
+    user: ${BW_QA_USER}
+    password: ${BW_QA_PASSWORD}
+    tenant: acme
+    environment: prod
+    access_mode: least_privilege
+    abap_schema: SAPHANADB
+    encrypt: true
+    ssl_validate_certificate: false
+    ssl_trust_store: /etc/ssl/ca.pem
+    read_only_user: true
+    pool_size: 2
+    connect_timeout_seconds: 5
+    communication_timeout_seconds: 15
+    slow_query_ms: 250
+    cache_enabled: false
+"""
+
+
+def test_every_documented_option_survives_a_yaml_round_trip(tmp_path: Path) -> None:
+    profile = ProfileManager(_write(tmp_path, _FULL_YAML), env=_ENV).get("acme_prd")
+
+    assert profile.tenant == "acme"
+    assert profile.environment == "prod"
+    assert profile.access_mode == "least_privilege"
+    assert profile.pool_size == 2
+    assert profile.connect_timeout_seconds == 5.0
+    assert profile.communication_timeout_seconds == 15.0
+    assert profile.slow_query_ms == 250.0
+    assert profile.ssl_validate_certificate is False
+    assert profile.ssl_trust_store == "/etc/ssl/ca.pem"
+
+
+def test_cache_can_actually_be_turned_off_from_the_profile(tmp_path: Path) -> None:
+    """SECURITY.md's stated mechanism for no customer metadata at rest. It was inert."""
+    profile = ProfileManager(_write(tmp_path, _FULL_YAML), env=_ENV).get("acme_prd")
+    assert profile.cache_enabled is False
+
+
+def test_tenant_isolation_reaches_the_storage_identity(tmp_path: Path) -> None:
+    """A declared tenant is what separates two customers' caches; dropping it re-merged them."""
+    identity = ProfileManager(_write(tmp_path, _FULL_YAML), env=_ENV).get("acme_prd").identity
+    assert identity.tenant == "acme"
+    assert identity.isolated_by_tenant is True
+    assert identity.is_production is True
+    assert identity.key.startswith("acme-acme_prd-")
+
+
+def test_no_model_field_can_be_silently_unsettable(tmp_path: Path) -> None:
+    """The drift guard. A field added to Profile must be reachable from YAML, or named here.
+
+    Without this the next option added is inert exactly like the last eight, and nothing fails.
+    """
+    # `name` is the YAML key itself, so it is not a setting inside the block.
+    settable = set(Profile.model_fields) - {"name"}
+    assert ProfileManager(_write(tmp_path, _FULL_YAML), env=_ENV).names() == ["acme_prd"]
+
+    covered = {
+        line.strip().split(":", 1)[0]
+        for line in _FULL_YAML.splitlines()
+        if line.startswith("    ") and ":" in line
+    }
+    missing = sorted(settable - covered)
+    assert missing == [], f"Profile fields not exercised through YAML: {missing}"
+
+
+def test_a_misspelled_option_is_rejected_rather_than_ignored(tmp_path: Path) -> None:
+    """`cache_enable: false` would otherwise read as "cache on" with no complaint."""
+    bad = _FULL_YAML.replace("cache_enabled: false", "cache_enable: false")
+    with pytest.raises(ProfileConfigError, match="unrecognised setting"):
+        ProfileManager(_write(tmp_path, bad), env=_ENV)
+
+
+def test_a_string_option_interpolates_an_environment_variable(tmp_path: Path) -> None:
+    """Passthrough fields keep ${VAR} support, so a tenant can come from the environment."""
+    text = _FULL_YAML.replace("tenant: acme", "tenant: ${CUSTOMER}")
+    profile = ProfileManager(_write(tmp_path, text), env={**_ENV, "CUSTOMER": "globex"}).get(
+        "acme_prd"
+    )
+    assert profile.tenant == "globex"
+
+
+def test_an_out_of_range_option_is_rejected(tmp_path: Path) -> None:
+    """Validation now reaches passthrough fields; before, the value was discarded unchecked."""
+    bad = _FULL_YAML.replace("pool_size: 2", "pool_size: 99")
+    with pytest.raises(ProfileConfigError):
+        ProfileManager(_write(tmp_path, bad), env=_ENV)
+
+
+def test_a_misspelled_ecc_option_is_rejected(tmp_path: Path) -> None:
+    bad = _ECC_YAML + "    use_tsl: false\n"
+    with pytest.raises(ProfileConfigError, match="unrecognised setting"):
+        ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)

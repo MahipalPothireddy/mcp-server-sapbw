@@ -6,6 +6,88 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — three tools were registered but absent from the README
+
+`bw_list_3x_flows`, `bw_get_transfer_rules` and `bw_list_update_rules` were registered, callable and
+verified, and named nowhere in the tool catalogue — so the BW 3.x dataflow, which on the reference
+system is the live load logic for over a thousand DataSources, looked unsupported to anyone reading
+the README. Two headline counts were also a release behind.
+
+The catalogue now has a **BW 3.x dataflow** section, and `tests/test_tool_surface.py` asserts that
+every registered tool, prompt and resource kind appears in the README, that the headline counts
+match the live surface, and that no catalogue row names a tool that does not exist. Nothing
+re-derived the catalogue before; that is why it drifted.
+
+### Fixed — eight documented profile options were silently discarded
+
+Measured, not theorised: a YAML round trip proved it.
+
+`_build_profile` enumerated the fields it copied out of `profiles.yaml` by hand, and the list had
+fallen eight behind the model. `tenant`, `environment`, `access_mode`, `pool_size`,
+`connect_timeout_seconds`, `communication_timeout_seconds`, `slow_query_ms` and `cache_enabled` were
+parsed, ignored, and replaced with defaults. Nothing warned.
+
+The consequential one is **`cache_enabled: false`**, which `SECURITY.md` publishes as the way to keep
+customer metadata off local disk. A customer who set it still had ABAP routine source and query
+definitions written to disk on every call. A published security control that did nothing.
+
+`tenant` being dropped also made the previous entry's isolation work inert for anyone configuring it
+through YAML — two customers were re-merged onto one cache file by the loader after being separated
+by the naming rule.
+
+Every test constructed `Profile(...)` directly, so the model was well covered and the loader was not
+covered at all. The loader now passes everything it does not specially handle straight through to
+pydantic, so a field added to the model reaches YAML automatically; an unrecognised key is an error
+rather than silence (a misspelled `cache_enable: false` used to read as "cache on"); an out-of-range
+value raises `ProfileConfigError` instead of a raw pydantic traceback; and a test asserts every
+`Profile` field is exercised through a YAML round trip, so the list cannot fall behind again.
+
+### Added — an explicit security model with two deployment modes
+
+The provisioning question, answered: *what do we grant this user, and what does withholding part of
+it cost?* Two postures are published as runnable `GRANT` scripts in
+[`docs/deployment-modes.md`](docs/deployment-modes.md) — `technical_read` (SELECT on the ABAP schema
+plus `CATALOG READ`) and `least_privilege` (an explicit allow-list) — with the cost of each of the
+eleven grant groups stated up front rather than discovered one failing tool at a time.
+
+`access_mode` on the profile declares which was provisioned. It is never inferred, the same rule
+`environment` follows; the server observes what it was actually allowed to read and reports a
+disagreement instead of absorbing it.
+
+New tool **`bw_access_report(system)`**: mode in force, per-group state, `grants_required` as
+ready-to-run statements, and `blocked_tools` derived from the support matrix's measured per-tool read
+attribution rather than a hand-kept list. A test asserts every capability discovery tracks belongs to
+exactly one grant group, so a table added later cannot become an ungranted dependency the grant
+script omits.
+
+### Fixed — a missing grant was reported as a missing BW feature
+
+The failure mode underneath the above, and the reason the modes had to exist. A refused read and an
+object a release does not carry both end in no rows, and discovery recorded them identically:
+
+- `_probe_abap_existence` had no guard at all, so a refused `DD02L` read escaped as a raw driver
+  exception and took the whole profile down.
+- `_probe_hana_objects` and the discover-tier probes swallowed the failure into "absent".
+
+Measured consequence: denying the discover-tier read produced `object_models = {adso: false,
+composite_provider: false}` on a BW 7.50 system, cached for 24 hours, after which every ADSO and
+CompositeProvider tool returned *"not available on BW 7.50"*. A release limitation, with a release
+named, for a missing `GRANT SELECT`. The two remedies point in opposite directions — a different BW
+release versus one grant — and the customer was pointed at the wrong one.
+
+`TableStatus.probe` now records `present | absent | denied | failed | not_probed`, so "the catalog
+says no" and "the catalog would not tell me" are different answers. `present: bool` is unchanged
+because every gating call site reads it and a denial correctly gates the same way an absence does.
+`CapabilityRecord.object_models_undetermined` names variants reading `false` for lack of evidence, so
+that `false` cannot be read as "this system does not use them". `unsupported_result()` returns the new
+non-retryable `permission_denied` code when the cause was a refusal, and points at `bw_access_report`
+instead of naming a release. Denial is classified from the driver's numeric code where available
+(HANA 258, never 259 — that is genuine absence) and from message markers otherwise; an unclassified
+failure reads as `failed`, never as a confirmed absence.
+
+Discovery deliberately survives a refused dictionary read rather than raising: the report that
+explains which grant is missing is the one tool you need at that moment.
+
 ### Fixed — two customers on one install could share a cache file, and an alias could escape it
 
 Both were measured, not theorised.
@@ -100,7 +182,7 @@ all three:
   asks whether RSPCPROCESSLOG is present. The matrix is keyed by tool, and `requires` bridges to the
   contract.
 - **`requires` is measured, not written by hand.** Each tool call opens a nested read-recording scope,
-  so the logical tables it asks for are attributed to it. A hand-written mapping across 56 tools would
+  so the logical tables it asks for are attributed to it. A hand-written mapping across 57 tools would
   drift the first time a tool gained a reader, and drift silently with nothing to contradict it. It is
   a lower bound — everything listed really is read, and a code path no test reaches contributes
   nothing — and the matrix says so rather than letting the list be read as complete.
@@ -121,7 +203,7 @@ things. `unverified` means the requirements are known but nobody has run the too
 means this build could not measure what the tool needs — reported as such and never as an empty
 requirement list, which would turn a measurement gap into a claim of universal compatibility.
 
-On BW 7.50: **39 tools verified, 15 expected, 2 connector-gated.** Published as
+On BW 7.50: **40 tools verified, 15 expected, 2 connector-gated.** Published as
 `docs/support-matrix.md` and `support_matrix.json`, generated by `scripts/support_matrix.py`, and
 checked by CI the same way the capability contract is. The staleness check is a CI step rather than a
 test on purpose: establishing the measurement runs the suite in a subprocess, so a test that
@@ -134,9 +216,9 @@ Averaging would have hidden that behind three verified capabilities.
 
 ### Added — every tool is now called over the protocol at least once
 
-`tests/test_tool_surface.py` invokes all 56 tools through a real client. It began as the measurement
+`tests/test_tool_surface.py` invokes all 57 tools through a real client. It began as the measurement
 the support matrix needs — a tool never invoked at the tool boundary has no requirement measurement,
-and 22 of 56 were unanswerable — but it stands on its own: the rest of the suite tests repositories
+and 22 of them were unanswerable — but it stands on its own: the rest of the suite tests repositories
 and services directly and reached the tool boundary for a subset, so a tool could have a parameter
 name that does not match its reader, a return type FastMCP cannot schematise, or an exception escaping
 the failure envelope, and nothing would have noticed. The argument table must name every registered

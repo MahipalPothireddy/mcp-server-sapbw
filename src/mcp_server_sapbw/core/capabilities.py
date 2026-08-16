@@ -18,8 +18,9 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Any, Protocol
 
-from ..models.capability import CapabilityRecord, HanaRepoStyle, TableStatus
+from ..models.capability import CapabilityRecord, HanaRepoStyle, ProbeOutcome, TableStatus
 from ..models.provenance import UnsupportedResult
+from .connection import is_permission_denied
 from .dialect import quote_ident
 from .profiles import ABAP_SCHEMA_AUTO, Profile
 
@@ -210,14 +211,58 @@ def unsupported_result(
     alternative: str | None = None,
     detail: str | None = None,
 ) -> UnsupportedResult:
-    """Build a structured 'unsupported on this release' result for a repository to return."""
+    """Build a structured "cannot answer that here" result for a repository to return.
+
+    Two causes reach this function and they are not the same answer. If any of ``missing`` was
+    *refused* rather than observed absent, the result says so and carries the ``permission_denied``
+    code - which makes it non-retryable and points at a grant. Reporting a missing privilege as a
+    release limitation, with a release name attached, sends a customer to plan an upgrade for
+    something one ``GRANT SELECT`` would fix.
+    """
     listed = ", ".join(missing)
+    unreadable = [name for name in missing if record.is_unreadable(name)]
+    if unreadable:
+        blocked = ", ".join(unreadable)
+        return UnsupportedResult(
+            code="permission_denied",
+            missing=list(missing),
+            release=record.bw_release,
+            alternative=alternative,
+            detail=detail
+            or (
+                f"{blocked} could not be read by the connected user, so whether "
+                f"{record.bw_release} carries it is unknown - this is not a statement that the "
+                "release lacks it. Run bw_access_report for the exact grant required."
+            ),
+        )
     return UnsupportedResult(
         missing=list(missing),
         release=record.bw_release,
         alternative=alternative,
         detail=detail or f"{listed} not available on {record.bw_release}",
     )
+
+
+#: Outcome of a probe attempt: the rows if it ran, and why it did not if it failed. ``None`` rows
+#: with a ``denied``/``failed`` outcome is the case a boolean could not express - the difference
+#: between "the catalog says no" and "the catalog would not tell me".
+_ProbeAttempt = tuple[list[tuple[Any, ...]] | None, ProbeOutcome]
+
+
+def _attempt(
+    connection: SupportsSelect, sql: str, parameters: Sequence[Any] | None = None
+) -> _ProbeAttempt:
+    """Run a discovery probe, classifying a failure as refused or merely broken.
+
+    Every probe goes through here so no discovery read can silently turn a refusal into an
+    observed absence. ``present``/``absent`` is the caller's decision from the rows; this function
+    only reports whether it got to see any.
+    """
+    try:
+        rows = connection.execute_select(sql, parameters)
+    except Exception as exc:
+        return None, ("denied" if is_permission_denied(exc) else "failed")
+    return rows, "present"
 
 
 class CapabilityResolver:
@@ -231,7 +276,7 @@ class CapabilityResolver:
         discovered = self._discover(schema, connection)
         tables.update(discovered.table_status)
         self._populate_row_counts(schema, tables, connection)
-        object_models = self._detect_object_models(tables, discovered)
+        object_models, undetermined_models = self._detect_object_models(tables, discovered)
         hana_repo = self._detect_hana_repo_style(connection)
         retention = self._measure_retention(schema, tables, connection)
 
@@ -240,6 +285,7 @@ class CapabilityResolver:
             bw_release=release,
             abap_schema=schema,
             object_models=object_models,
+            object_models_undetermined=undetermined_models,
             hana_repo_style=hana_repo,
             processlog_retention_days=retention,
             tables=tables,
@@ -287,24 +333,20 @@ class CapabilityResolver:
     def _probe_abap_existence(
         self, schema: str, connection: SupportsSelect
     ) -> dict[str, TableStatus]:
+        """Existence-tier probe against DD02L.
+
+        A refusal here is not fatal, deliberately. Every table reads as unknown, which is honest,
+        and the server stays up so ``bw_access_report`` can name the grant that would fix it -
+        raising instead would take away the only tool able to explain the failure.
+        """
         physical_names = sorted(set(ABAP_TABLES.values()))
         placeholders = ", ".join("?" for _ in physical_names)
         query = (
             f"SELECT TABNAME FROM {quote_ident(schema)}.{quote_ident('DD02L')} "
             f"WHERE TABNAME IN ({placeholders})"
         )
-        present = {str(row[0]).upper() for row in connection.execute_select(query, physical_names)}
-        result: dict[str, TableStatus] = {}
-        for logical, physical in ABAP_TABLES.items():
-            found = physical.upper() in present
-            result[logical] = TableStatus(
-                logical_name=logical,
-                resolved_name=physical if found else None,
-                tier="existence",
-                present=found,
-                schema_name=schema if found else None,
-            )
-        return result
+        rows, outcome = _attempt(connection, query, physical_names)
+        return self._existence_statuses(ABAP_TABLES, rows, outcome, schema=schema)
 
     def _probe_hana_objects(self, connection: SupportsSelect) -> dict[str, TableStatus]:
         physical_names = sorted(set(HANA_VIEWS.values()))
@@ -313,21 +355,35 @@ class CapabilityResolver:
             "SELECT VIEW_NAME FROM SYS.VIEWS "
             f"WHERE SCHEMA_NAME = 'SYS' AND VIEW_NAME IN ({placeholders})"
         )
-        try:
-            present = {
-                str(row[0]).upper() for row in connection.execute_select(query, physical_names)
-            }
-        except Exception:
-            present = set()
+        rows, outcome = _attempt(connection, query, physical_names)
+        return self._existence_statuses(HANA_VIEWS, rows, outcome, schema="SYS")
+
+    @staticmethod
+    def _existence_statuses(
+        catalog: dict[str, str],
+        rows: list[tuple[Any, ...]] | None,
+        outcome: ProbeOutcome,
+        *,
+        schema: str,
+    ) -> dict[str, TableStatus]:
+        """Turn one existence probe into per-table statuses.
+
+        When the probe never ran, every table carries the probe's own outcome rather than
+        ``absent``. HANA filters catalog views by privilege, so a reader without ``CATALOG READ``
+        gets an empty result rather than an error - which is why an empty *successful* read is
+        still recorded as ``absent`` but the report warns about it separately.
+        """
+        seen = {str(row[0]).upper() for row in rows} if rows is not None else set()
         result: dict[str, TableStatus] = {}
-        for logical, physical in HANA_VIEWS.items():
-            found = physical.upper() in present
+        for logical, physical in catalog.items():
+            found = rows is not None and physical.upper() in seen
             result[logical] = TableStatus(
                 logical_name=logical,
                 resolved_name=physical if found else None,
                 tier="existence",
                 present=found,
-                schema_name="SYS" if found else None,
+                probe=("present" if found else "absent") if rows is not None else outcome,
+                schema_name=schema if found else None,
             )
         return result
 
@@ -339,11 +395,23 @@ class CapabilityResolver:
         query = (
             f"SELECT TABNAME FROM {quote_ident(schema)}.{quote_ident('DD02L')} WHERE TABNAME LIKE ?"
         )
+        undetermined: set[str] = set()
         for group, pattern in DISCOVER_PATTERNS.items():
-            try:
-                rows = connection.execute_select(query, [pattern])
-            except Exception:
-                rows = []
+            rows, outcome = _attempt(connection, query, [pattern])
+            if rows is None:
+                # The failure that motivated this whole distinction: swallowing it recorded
+                # "this release has no Advanced DSOs / CompositeProviders", which downstream
+                # became "not available on BW 7.50" - a release limitation, for a missing GRANT.
+                undetermined.add(group)
+                members[group] = []
+                status[group] = TableStatus(
+                    logical_name=group,
+                    resolved_name=None,
+                    tier="discover",
+                    present=False,
+                    probe=outcome,
+                )
+                continue
             found = sorted({str(r[0]).upper() for r in rows})
             members[group] = found
             resolved = self._pick_representative(group, found)
@@ -352,9 +420,10 @@ class CapabilityResolver:
                 resolved_name=resolved,
                 tier="discover",
                 present=bool(found),
+                probe="present" if found else "absent",
                 schema_name=schema if found else None,
             )
-        return _Discovered(members=members, table_status=status)
+        return _Discovered(members=members, table_status=status, undetermined=undetermined)
 
     @staticmethod
     def _pick_representative(group: str, found: list[str]) -> str | None:
@@ -374,12 +443,24 @@ class CapabilityResolver:
 
     def _detect_object_models(
         self, tables: dict[str, TableStatus], discovered: _Discovered
-    ) -> dict[str, bool]:
+    ) -> tuple[dict[str, bool], list[str]]:
+        """``(variant -> present, variants whose detection was inconclusive)``.
+
+        The second element is what keeps the first honest. ``object_models`` has to stay a
+        ``dict[str, bool]`` - it is a published field that callers branch on - so a variant whose
+        probe was refused still reads ``False`` there. Naming it here is what stops that ``False``
+        from being read as "this system does not use them".
+        """
+
         def present(logical: str) -> bool:
             status = tables.get(logical)
             return status is not None and status.present
 
-        return {
+        def indeterminate(logical: str) -> bool:
+            status = tables.get(logical)
+            return status is not None and status.unreadable
+
+        models = {
             "classic_dso": present("dso_header"),
             "adso": bool(discovered.members.get("adso")),
             "composite_provider": bool(discovered.members.get("composite_provider")),
@@ -387,6 +468,20 @@ class CapabilityResolver:
             # Open ODS View has no single reliable table; detection deferred to B2.
             "open_ods_view": False,
         }
+        # A variant is inconclusive when the evidence its detection rests on was never read:
+        # the discover-tier pattern for adso/composite_provider, the header table for the rest.
+        inconclusive: set[str] = {
+            variant
+            for variant in ("adso", "composite_provider")
+            if variant in discovered.undetermined
+        }
+        for variant, logical in (
+            ("classic_dso", "dso_header"),
+            ("multiprovider", "multiprovider_part"),
+        ):
+            if indeterminate(logical):
+                inconclusive.add(variant)
+        return models, sorted(inconclusive)
 
     def _detect_hana_repo_style(self, connection: SupportsSelect) -> HanaRepoStyle:
         query = (
@@ -445,8 +540,18 @@ class CapabilityResolver:
 
 
 class _Discovered:
-    """Internal carrier for discover-tier results."""
+    """Internal carrier for discover-tier results.
 
-    def __init__(self, members: dict[str, list[str]], table_status: dict[str, TableStatus]) -> None:
+    ``undetermined`` names the families whose pattern probe never ran, so an empty member list can
+    be told apart from a family this release genuinely lacks.
+    """
+
+    def __init__(
+        self,
+        members: dict[str, list[str]],
+        table_status: dict[str, TableStatus],
+        undetermined: set[str] | None = None,
+    ) -> None:
         self.members = members
         self.table_status = table_status
+        self.undetermined = undetermined or set()

@@ -9,6 +9,10 @@
   enforced at the connection layer, not by convention.
 - **Fail closed on write grants.** When a profile sets `read_only_user: true`, the server asserts
   that the connecting user holds no write/DDL/execute grants and refuses the connection otherwise.
+- **A refused read is never reported as a missing feature.** Discovery records "you may not read
+  this" separately from "this release does not have it", because the remedies are opposite — a
+  grant versus a different BW release. `bw_access_report(system)` names the exact SELECT privileges
+  to request and what stays unanswerable until they are granted.
 - **Secrets by environment variable only.** Credentials are supplied via `${VAR}` interpolation.
   No secret is ever stored in code, configuration committed to the repo, logs, test fixtures, or
   error messages. Host names and connection strings are scrubbed from all error text before it
@@ -20,6 +24,17 @@
   metadata to any external endpoint. Diagram rendering is local; there is no hosted renderer.
 - **Bounded per call.** Every tool runs inside a query and time budget, so a single call cannot
   issue unbounded statements or hold a database session indefinitely.
+
+## Which privileges to provision
+
+Two postures are supported: a full technical read, or an explicit least-privilege allow-list.
+**[docs/deployment-modes.md](docs/deployment-modes.md)** carries both as runnable `GRANT` scripts,
+states per grant group what withholding it costs, and explains why `CATALOG READ` matters (HANA
+filters `SYS` catalog views by privilege rather than erroring, so withholding it makes the HANA
+layer look absent instead of inaccessible).
+
+Declare which posture you provisioned as `access_mode` on the profile. The server compares that
+against what it was actually allowed to read and reports a disagreement rather than absorbing it.
 
 ## What the server writes to disk
 
@@ -51,6 +66,8 @@ intellectual property is stored at rest**, specifically:
   Deleting the file is equally safe.
 - **Turn it off.** Set `cache_enabled: false` on the profile. Nothing is then written to disk, at
   the cost of re-reading on every call. Use this where customer metadata at rest is not acceptable.
+  Confirm it took effect with `bw_cache_status(system)`, which reports `cache_enabled`. A profile
+  option that is misspelled is now rejected at load rather than ignored.
 
 ### 2. Generated documentation (only when you ask)
 

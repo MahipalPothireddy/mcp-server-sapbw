@@ -30,6 +30,7 @@ from . import __version__
 from .connectors.base import ConnectorRegistry
 from .connectors.bi import FileBiConnector
 from .connectors.ecc import EccConnector
+from .core.access import build_access_report
 from .core.budget import (
     DEFAULT_MAX_QUERIES,
     DEFAULT_MAX_SECONDS,
@@ -48,6 +49,7 @@ from .core.paths import cache_file
 from .core.profiles import ProfileManager
 from .core.snapshots import SnapshotStore, snapshot_file
 from .core.support import support_matrix
+from .models.access import AccessReport
 from .models.analysis import Analysis
 from .models.capability import CapabilityRecord, CapabilityReport
 from .models.chains import (
@@ -365,6 +367,7 @@ class Runtime(Protocol):
     def list_systems(self) -> list[SystemStatus]: ...
     def identity(self, system: str) -> StorageIdentity: ...
     def capability(self, system: str) -> CapabilityRecord: ...
+    def access_report(self, system: str) -> AccessReport: ...
     def refresh_capabilities(self, system: str) -> CapabilityRecord: ...
     def refresh_cache(self, system: str, scope: str) -> RefreshResult: ...
     def cache_status(self, system: str) -> CacheStatus: ...
@@ -444,6 +447,21 @@ class ServerRuntime:
 
     def refresh_capabilities(self, system: str) -> CapabilityRecord:
         return self.capability(system, refresh=True)
+
+    def access_report(self, system: str) -> AccessReport:
+        """Which deployment mode is in force for a profile, and what it cannot answer.
+
+        Built here rather than in the tool because it needs the profile, and a ``Profile`` holds
+        the password as a ``SecretStr`` - keeping it inside the runtime means no tool function ever
+        has a secret one attribute dereference away from its return value.
+        """
+        profile = self._profiles.get(system)
+        return build_access_report(
+            self.capability(system),
+            declared_mode=profile.access_mode,
+            read_only_asserted=profile.read_only_user,
+            matrix=support_matrix(),
+        )
 
     def _cache(self, system: str) -> SqliteCache | None:
         """The per-profile metadata cache, tied to the current capability fingerprint.
@@ -994,6 +1012,39 @@ def bw_capability_report(system: str) -> CapabilityReport:
     one of them is a gap in this server.
     """
     return build_report(runtime().capability(system))
+
+
+@_readonly_tool
+def bw_access_report(system: str) -> AccessReport:
+    """Which deployment mode this connection is in, and the exact grants to change it.
+
+    The provisioning question, answered from evidence rather than from the profile's claim: *what
+    is this user allowed to read, what does that cost, and what would we have to grant?*
+
+    Two postures are supported and both are legitimate. ``technical_read`` is SELECT across the
+    ABAP schema and the SYS catalog, and answers everything implemented here. ``least_privilege``
+    is an explicit allow-list, and answers less - but *which* questions it gives up is stated per
+    grant group here instead of being discovered one failed tool at a time.
+
+    The distinction this rests on is one the server could not previously make. A refused read and
+    an object a release does not have both end in no rows, so discovery reported them
+    identically - and a denied dictionary read therefore surfaced as "this system has no Advanced
+    DSOs", with tools going on to report "not available on BW 7.50". That points a customer at a
+    BW upgrade for something one ``GRANT SELECT`` fixes. Probes now record ``denied`` separately
+    from ``absent``, and this report is where that shows up:
+
+    * ``grants_required`` - ready-to-run statements for what was refused.
+    * ``blocked_tools`` - tools reading at least one refused object, from the support matrix's
+      measured attribution, so it cannot drift from what the tools really read. A lower bound.
+    * ``undetermined_object_models`` - variants reading ``False`` in ``bw_system_profile`` for lack
+      of evidence rather than for lack of the object.
+    * ``mode_mismatch`` - the profile's declared mode disagrees with the evidence, which is a
+      provisioning fault worth naming rather than absorbing.
+
+    A group reported ``granted`` was probed, not audited: this reports what was exercised on this
+    connection, not a permission review.
+    """
+    return runtime().access_report(system)
 
 
 @_readonly_tool

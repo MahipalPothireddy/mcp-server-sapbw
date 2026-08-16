@@ -17,9 +17,11 @@ from pydantic import SecretStr
 
 from mcp_server_sapbw import server
 from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
+from mcp_server_sapbw.core.access import build_access_report
 from mcp_server_sapbw.core.identity import StorageIdentity
 from mcp_server_sapbw.core.profiles import EccProfile
 from mcp_server_sapbw.core.snapshots import IN_MEMORY, SnapshotStore
+from mcp_server_sapbw.models.access import AccessReport
 from mcp_server_sapbw.models.analysis import Analysis, AnalysisConfidence
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.ecc import ConnectorUnavailable
@@ -249,6 +251,10 @@ class FakeRuntime:
 
     def capability(self, system: str) -> CapabilityRecord:
         return self._cap
+
+    def access_report(self, system: str) -> AccessReport:
+        """Built from the real manifest against the fixture record, so the wiring is exercised."""
+        return build_access_report(self._cap, declared_mode="technical_read", matrix=None)
 
     def refresh_capabilities(self, system: str) -> CapabilityRecord:
         return self._cap

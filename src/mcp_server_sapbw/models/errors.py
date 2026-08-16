@@ -53,6 +53,7 @@ ErrorCode = Literal[
     "profile_misconfigured",
     "connection_failed",
     "query_failed",
+    "permission_denied",
     "read_only_violation",
     "output_failed",
     "internal_error",
@@ -125,6 +126,13 @@ _CODE_SPEC: dict[str, tuple[ErrorCategory, bool, str]] = {
         True,
         "The statement failed at the driver. Retry once; if it persists the object may have been "
         "changed or the user may lack SELECT on it.",
+    ),
+    "permission_denied": (
+        "configuration",
+        False,
+        "The connected user may not read the object this answer needs. This is a grant, not a "
+        "release limitation: bw_access_report names the exact SELECT privileges to request and "
+        "what stays unanswerable until they are granted. Retrying will not help.",
     ),
     "read_only_violation": (
         "guardrail",
@@ -234,7 +242,14 @@ def error(code: ErrorCode, message: str, **detail: str) -> BwError:
 
 
 def code_for_exception(exc: BaseException) -> ErrorCode:
-    """The canonical code for an exception, walking its MRO so a subclass still maps."""
+    """The canonical code for an exception, walking its MRO so a subclass still maps.
+
+    A refused read is separated from a broken one before the class mapping is consulted: both
+    arrive as ``QueryError``, but only one of them is retryable, and telling a caller to retry a
+    missing grant would loop forever against an answer that cannot change.
+    """
+    if getattr(exc, "permission_denied", False) is True:
+        return "permission_denied"
     for klass in type(exc).__mro__:
         mapped = _EXCEPTION_CODES.get(klass.__name__)
         if mapped is not None:

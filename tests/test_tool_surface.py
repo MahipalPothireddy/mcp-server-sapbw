@@ -21,6 +21,7 @@ fails rather than quietly shrinking the matrix.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +43,7 @@ _ARGS: dict[str, dict[str, Any]] = {
     "bw_system_profile": {"system": _SYSTEM},
     "bw_refresh_capabilities": {"system": _SYSTEM},
     "bw_capability_report": {"system": _SYSTEM},
+    "bw_access_report": {"system": _SYSTEM},
     "bw_support_matrix": {},
     "bw_cache_status": {"system": _SYSTEM},
     "bw_refresh_cache": {"system": _SYSTEM},
@@ -170,3 +172,73 @@ def test_file_writing_tool_is_callable_over_the_protocol(tool: str, tmp_path: Pa
         args |= {"name": "ADSO_T", "depth": 2}
     body = _body(_call(tool, args))
     assert body is not None
+
+
+# --- the README has to describe what is actually registered --------------------------------
+#
+# Three tools (bw_list_3x_flows, bw_get_transfer_rules, bw_list_update_rules) were registered,
+# callable and never mentioned in the README, and two tool counts were a release behind. The
+# catalogue is the first thing a customer reads, and nothing re-derives it. These assert it.
+
+_README = Path(__file__).resolve().parents[1] / "README.md"
+
+
+def _readme() -> str:
+    return _README.read_text(encoding="utf-8")
+
+
+async def _surface() -> tuple[set[str], set[str], set[str]]:
+    async with Client(server.mcp) as client:
+        tools = {t.name for t in await client.list_tools()}
+        templates = {str(t.uriTemplate) for t in await client.list_resource_templates()}
+        templates |= {str(r.uri) for r in await client.list_resources()}
+        prompts = {p.name for p in await client.list_prompts()}
+    return tools, templates, prompts
+
+
+def test_readme_documents_every_registered_tool() -> None:
+    tools, _, _ = asyncio.run(_surface())
+    text = _readme()
+    missing = sorted(name for name in tools if f"`{name}`" not in text)
+    assert missing == [], f"registered but absent from README.md: {missing}"
+
+
+def test_readme_documents_every_prompt_and_resource() -> None:
+    _, templates, prompts = asyncio.run(_surface())
+    text = _readme()
+    missing_prompts = sorted(name for name in prompts if f"`{name}`" not in text)
+    assert missing_prompts == [], f"prompts absent from README.md: {missing_prompts}"
+
+    # A template is documented by its path shape; the {placeholder} names may differ in prose.
+    missing_uris = sorted(
+        uri for uri in templates if uri.split("://")[-1].split("/", 1)[-1].split("/")[0] not in text
+    )
+    assert missing_uris == [], f"resource kinds absent from README.md: {missing_uris}"
+
+
+def test_readme_headline_counts_are_current() -> None:
+    """The opening summary is a claim, and it was two behind.
+
+    Only the sentences that state a *total* are checked. A per-release verdict count ("40 tools
+    verified") is a different number that legitimately differs, so this asserts the exact phrasings
+    rather than scanning for any digit followed by "tools".
+    """
+    tools, templates, prompts = asyncio.run(_surface())
+    text = _readme()
+    summary = (
+        f"**{len(tools)} tools, {len(templates)} resource templates and {len(prompts)} prompts**"
+    )
+    assert summary in text, f"the opening summary does not read {summary!r}"
+    assert f"across {len(tools)} tools" in text, (
+        f"the support-matrix paragraph does not say 'across {len(tools)} tools'"
+    )
+
+
+def test_readme_names_no_tool_that_does_not_exist() -> None:
+    """The other direction: a catalogue row for a removed tool reads as a working feature."""
+    tools, _, _ = asyncio.run(_surface())
+    # Only the catalogue tables are checked. Elsewhere a `bw_`-prefixed token may legitimately be a
+    # field value rather than a tool - `bw_provider_view` is a lineage resolution basis, not a tool.
+    rows = re.findall(r"^\|\s*`(bw_[a-z0-9_]+)`\s*\|", _readme(), flags=re.MULTILINE)
+    ghosts = sorted(set(rows) - tools)
+    assert ghosts == [], f"README catalogue lists non-existent tool(s): {ghosts}"

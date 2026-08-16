@@ -76,7 +76,27 @@ class ConnectionFailure(Exception):
 
 
 class QueryError(Exception):
-    """A query failed at the driver (message is scrubbed of secrets)."""
+    """A query failed at the driver (message is scrubbed of secrets).
+
+    ``errorcode`` carries the driver's numeric code when one was available. It is preserved
+    deliberately: the original exception is dropped (``from None``) so its unscrubbed message
+    cannot leak, and the code is the only reliable way to tell a denied read from an absent
+    object afterwards. A number is not a secret.
+    """
+
+    def __init__(self, message: str, *, errorcode: int | None = None) -> None:
+        super().__init__(message)
+        self.errorcode = errorcode
+
+    @property
+    def permission_denied(self) -> bool:
+        """True when this failure was a refused read rather than a broken one.
+
+        Exposed as an attribute so :mod:`mcp_server_sapbw.models.errors` can map it to the right
+        code without importing this module or duplicating the marker list - it stays a leaf, and
+        the markers stay in the one place that owns driver semantics.
+        """
+        return is_permission_denied(self)
 
 
 # --- Connection-loss detection -----------------------------------------------------------
@@ -116,6 +136,43 @@ def is_connection_lost(error: BaseException) -> bool:
     """True when an error looks like the transport dropped rather than the query being wrong."""
     text = str(error).lower()
     return any(marker in text for marker in _CONNECTION_LOST_MARKERS)
+
+
+# --- Permission-denial detection ----------------------------------------------------------
+#
+# "I am not allowed to read that" and "that does not exist here" are the same shape to a caller -
+# both end in no rows - and they have opposite remedies: one is a GRANT, the other is a different
+# BW release. Conflating them makes the server report a missing privilege as a missing BW feature,
+# which sends a customer to upgrade their system instead of to their Basis team.
+#
+# HANA distinguishes them at the driver: 258 is insufficient privilege on an object that exists,
+# 259 is an invalid (absent) table name. 259 is deliberately NOT listed here.
+_PERMISSION_ERROR_CODES = frozenset({258, 10, 332})
+_PERMISSION_DENIED_MARKERS = frozenset(
+    {
+        "insufficient privilege",  # hdbcli 258 - the canonical one
+        "not authorized",
+        "no privilege",
+        "authorization failed",
+        "authorisation failed",
+        "access denied",
+    }
+)
+
+
+def is_permission_denied(error: BaseException) -> bool:
+    """True when an error says the user may not read the object, not that it is absent.
+
+    Checks the driver's numeric code first (authoritative) and falls back to message markers,
+    because :class:`QueryError` may have been raised by a layer that had only text. Heuristic on
+    the text path: a driver whose wording is not listed reads as an ordinary query failure, which
+    is the safe direction - an unclassified failure is never reported as a confirmed absence.
+    """
+    code = getattr(error, "errorcode", None)
+    if isinstance(code, int) and code in _PERMISSION_ERROR_CODES:
+        return True
+    text = str(error).lower()
+    return any(marker in text for marker in _PERMISSION_DENIED_MARKERS)
 
 
 def _strip_leading_noise(sql: str) -> str:
@@ -436,7 +493,9 @@ class ReadOnlyConnection:
             cursor.execute(sql, bound)
             return cursor.fetchall()
         except Exception as exc:
-            raise QueryError(self._scrubber.scrub(str(exc))) from None
+            raw_code = getattr(exc, "errorcode", None)
+            code = raw_code if isinstance(raw_code, int) else None
+            raise QueryError(self._scrubber.scrub(str(exc)), errorcode=code) from None
         finally:
             with suppress(Exception):
                 cursor.close()

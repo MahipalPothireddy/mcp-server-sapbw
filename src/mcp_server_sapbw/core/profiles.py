@@ -25,6 +25,7 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from ..models.access import AccessMode
 from .identity import Environment, StorageIdentity
 
 _VAR_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -76,6 +77,11 @@ class Profile(BaseModel):
     ssl_validate_certificate: bool = True
     ssl_trust_store: str | None = None
     read_only_user: bool = True
+    # How this user was provisioned, declared rather than inferred - the same rule as `environment`.
+    # The server observes what it was actually allowed to read and compares the two, so a profile
+    # claiming a full technical read whose dictionary probe is refused reports a provisioning fault
+    # instead of quietly answering less. See docs/deployment-modes.md.
+    access_mode: AccessMode = "unknown"
     # Ceiling on concurrent connections for this system. MCP tool functions run in a worker
     # threadpool, so simultaneous calls need separate connections — a driver connection cannot be
     # shared across threads. Growth is lazy: one analyst working sequentially only ever opens one.
@@ -241,32 +247,75 @@ def _resolve_password(raw: Mapping[str, Any], env: Mapping[str, str], *, profile
     return _resolve_field(raw_pw, env, field="password", profile=profile)
 
 
+#: Fields this loader resolves itself, because each needs more than a copy: secret handling,
+#: ``${VAR}`` interpolation into a non-string type, or a sentinel default.
+_EXPLICIT_PROFILE_FIELDS: frozenset[str] = frozenset(
+    {"name", "host", "port", "user", "password", "abap_schema"}
+)
+
+
 def _build_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]) -> Profile:
+    """Build one :class:`Profile` from its YAML block.
+
+    Everything not in :data:`_EXPLICIT_PROFILE_FIELDS` is passed through by name and validated by
+    pydantic, rather than enumerated here. That is deliberate and was a bug fix: the previous
+    hand-written list silently dropped eight documented options, ``cache_enabled: false`` among
+    them - so a customer who had turned the on-disk cache off still had ABAP routine source
+    written to disk, and nothing reported it. A field added to the model now reaches the loader
+    automatically, and an unknown key is an error instead of silence.
+    """
     if not isinstance(raw, Mapping):
         raise ProfileConfigError(f"profile '{name}' must be a mapping")
+
+    unknown = sorted(set(map(str, raw)) - set(Profile.model_fields))
+    if unknown:
+        raise ProfileConfigError(
+            f"profile '{name}' has unrecognised setting(s): {', '.join(unknown)}. "
+            "A misspelled option would otherwise be ignored without warning."
+        )
 
     password = _resolve_password(raw, env, profile=name)
     host = _resolve_str(raw, "host", env, profile=name, required=True)
     user = _resolve_str(raw, "user", env, profile=name, required=True)
     abap_schema = _resolve_str(raw, "abap_schema", env, profile=name, required=False)
 
-    return Profile(
-        name=name,
-        host=host,  # type: ignore[arg-type]
-        port=_resolve_port(raw, env, profile=name),
-        user=user,  # type: ignore[arg-type]
-        password=SecretStr(password),
-        abap_schema=abap_schema or ABAP_SCHEMA_AUTO,
-        encrypt=bool(raw.get("encrypt", True)),
-        ssl_validate_certificate=bool(raw.get("ssl_validate_certificate", True)),
-        ssl_trust_store=_resolve_str(raw, "ssl_trust_store", env, profile=name, required=False),
-        read_only_user=bool(raw.get("read_only_user", True)),
-    )
+    passthrough: dict[str, Any] = {}
+    for field, value in raw.items():
+        key = str(field)
+        if key in _EXPLICIT_PROFILE_FIELDS:
+            continue
+        # A string value may interpolate an environment variable, so `tenant: ${CUSTOMER}` works
+        # the same way every other string field does.
+        passthrough[key] = (
+            _resolve_field(value, env, field=key, profile=name) if isinstance(value, str) else value
+        )
+
+    try:
+        return Profile(
+            name=name,
+            host=host,  # type: ignore[arg-type]
+            port=_resolve_port(raw, env, profile=name),
+            user=user,  # type: ignore[arg-type]
+            password=SecretStr(password),
+            abap_schema=abap_schema or ABAP_SCHEMA_AUTO,
+            **passthrough,
+        )
+    except ValueError as exc:
+        # Pydantic names the field and the rejected value. Safe: the password is already a
+        # SecretStr by this point, so it renders masked rather than as its value.
+        raise ProfileConfigError(f"profile '{name}' is invalid: {exc}") from exc
 
 
 def _build_ecc_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]) -> EccProfile:
     if not isinstance(raw, Mapping):
         raise ProfileConfigError(f"ECC profile '{name}' must be a mapping")
+
+    unknown = sorted(set(map(str, raw)) - set(EccProfile.model_fields))
+    if unknown:
+        raise ProfileConfigError(
+            f"ECC profile '{name}' has unrecognised setting(s): {', '.join(unknown)}. "
+            "A misspelled option would otherwise be ignored without warning."
+        )
 
     password = _resolve_password(raw, env, profile=name)
     host = _resolve_str(raw, "host", env, profile=name, required=True)
