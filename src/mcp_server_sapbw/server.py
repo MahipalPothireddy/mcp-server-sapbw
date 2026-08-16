@@ -41,7 +41,7 @@ from .core.logging import configure as configure_logging
 from .core.logging import get_logger
 from .core.paths import cache_dir as default_cache_dir
 from .core.profiles import ProfileManager
-from .models.capability import CapabilityRecord
+from .models.capability import CapabilityRecord, CapabilityReport
 from .models.chains import (
     Chain,
     ChainRuntimes,
@@ -85,6 +85,7 @@ from .repositories.sources import SourcesRepository
 from .repositories.threex import ThreeXRepository
 from .repositories.transformations import TransformationsRepository
 from .services.analyzers import Analyzers
+from .services.capability_report import build_report
 from .services.diagram import build_layout, png_available, render_png, render_svg
 from .services.docgen import DocGenerator, DocGenResult
 from .services.exit_analysis import ExitAnalysisService
@@ -746,6 +747,27 @@ def bw_system_profile(system: str) -> CapabilityRecord:
 def bw_refresh_capabilities(system: str) -> CapabilityRecord:
     """Re-run capability discovery for a system, replacing the cached record."""
     return runtime().refresh_capabilities(system)
+
+
+@_readonly_tool
+def bw_capability_report(system: str) -> CapabilityReport:
+    """Which questions this server can actually answer on this system, and which it cannot.
+
+    Two facts have to meet before an answer exists: the server must implement a reader, and the
+    connected release must have the object. ``bw_system_profile`` reports the second;
+    ``docs/capability-contract.md`` reports the first; neither alone tells you whether a given
+    question resolves here. This crosses them and states the verdict per capability:
+
+    * ``usable`` - implemented here, present there.
+    * ``absent_on_system`` - implemented, but this release does not carry the object, so the
+      features built on it return an unsupported result rather than a thin answer.
+    * ``not_implemented`` - the object is on your system, but no reader exists yet. Fixable here.
+    * ``not_applicable`` - neither.
+
+    The distinction matters because the two failure modes look identical from the outside and only
+    one of them is a gap in this server.
+    """
+    return build_report(runtime().capability(system))
 
 
 @_readonly_tool

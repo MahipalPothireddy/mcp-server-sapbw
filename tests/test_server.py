@@ -290,6 +290,21 @@ def test_list_systems_via_client() -> None:
     assert systems[0]["name"] == "qa"
 
 
+def test_capability_report_via_client_separates_absent_from_unimplemented() -> None:
+    """The support profile reaches the client with a verdict per capability, and cites its basis."""
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(_call("bw_capability_report", {"system": "qa"}))
+    body = _report_body(result)
+
+    assert body["system"] == "qa"
+    assert body["bw_release"] == "7.50"
+    assert sum(body["totals"].values()) == len(body["capabilities"])
+    # The fixture record marks these 22 tables present, and they are all read by the server.
+    usable = {r["capability"] for r in body["capabilities"] if r["verdict"] == "usable"}
+    assert _TABLES.keys() <= usable
+    assert any("contract revision" in c for c in body["caveats"])
+
+
 def test_list_chains_via_client_has_provenance_and_total() -> None:
     server.set_runtime(FakeRuntime())
     result = asyncio.run(_call("bw_list_chains", {"system": "qa"}))

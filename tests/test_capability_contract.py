@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from mcp_server_sapbw.core.capabilities import ABAP_TABLES, DISCOVER_PATTERNS, HANA_VIEWS
+from mcp_server_sapbw.core.contract import contract, contract_revision
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CONTRACT = _ROOT / "docs" / "capability-contract.md"
@@ -111,3 +112,38 @@ def test_every_from_logical_reader_names_a_declared_capability() -> None:
     read = set(re.findall(r'from_logical="([a-z0-9_]+)"', blob))
     unknown = sorted(read - set(_declared()))
     assert not unknown, f"from_logical= names no such capability: {unknown}"
+
+
+# --- the shipped data file: the same contract, in the form the server reads ------------------
+
+
+def test_shipped_data_file_matches_the_markdown_artifact(
+    rows: dict[str, tuple[str, str, str]],
+) -> None:
+    """One contract, two renderings. A wheel must not disagree with the docs it shipped with."""
+    entries = contract()
+    assert entries, "capability_contract.json is missing from the package; " + _REGENERATE
+    assert set(entries) == set(rows), (
+        "the shipped data file and docs/capability-contract.md list different capabilities; "
+        + _REGENERATE
+    )
+    for name, entry in sorted(entries.items()):
+        state, obj, reason = rows[name]
+        assert (entry.state, entry.object_name) == (state, obj), (
+            f"`{name}` disagrees; {_REGENERATE}"
+        )
+        # The markdown escapes pipes for the table; compare on the unescaped text.
+        assert entry.reason.replace("|", "\\|") == reason, f"`{name}` reason differs; {_REGENERATE}"
+
+
+def test_shipped_contract_carries_a_revision() -> None:
+    """Identifies which contract a wheel shipped, so a support answer can cite it."""
+    revision = contract_revision()
+    assert revision and "+" in revision, f"contract revision is missing or malformed: {revision!r}"
+
+
+def test_implemented_flag_follows_the_state() -> None:
+    entries = contract()
+    for name, entry in sorted(entries.items()):
+        expected = entry.state in {"SUPPORTED", "PARTIAL", "DISCOVERY_ONLY"}
+        assert entry.implemented is expected, f"`{name}`: implemented disagrees with {entry.state}"

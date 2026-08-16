@@ -12,8 +12,11 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **45 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **46 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
+> What the server does with each metadata object it declares is published, per state, in
+> [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
+> `bw_capability_report` for the same thing crossed with what your own system actually has.
 > Still planned: a BI connector for scenarios 9.7/9.8 (report schedules and dashboards live outside
 > BW, so those two analyses return a template naming the connector required). The ECC source-system
 > connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
@@ -140,6 +143,7 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_list_systems` | — | Configured profiles and their discovery status (no host/credentials) |
 | `bw_system_profile` | `system` | Release, ABAP schema, object-model variants, log window, table presence/counts |
 | `bw_refresh_capabilities` | `system` | Re-run capability discovery, replacing the cached record |
+| `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
 | `bw_refresh_cache` | `system`, `scope="all"` | Invalidate cached extracts by scope |
 
 ### Process chains
