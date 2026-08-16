@@ -162,12 +162,6 @@ DECLARED_STATE: dict[str, tuple[str, str]] = {
         "yet resolved.",
     ),
     "comm_structure_field": ("PLANNED", "See comm_structure."),
-    "routine_source_3x": (
-        "PLANNED",
-        "RSAROUT/RSAROUTT hold 3.x routine source. bw_get_routine_code covers 7.x routines from "
-        "RSAABAP only, so a 3.x flow's conversion routines are currently named but not read.",
-    ),
-    "routine_text_3x": ("PLANNED", "See routine_source_3x."),
     "transfer_structure_field": (
         "PARTIAL",
         "RSTSFIELD is reached through the transfer-rule read rather than directly; the field list "
@@ -203,9 +197,12 @@ DECLARED_STATE: dict[str, tuple[str, str]] = {
     ),
     "variant_text": ("PARTIAL", "See variant."),
     "log_messages": (
-        "PLANNED",
-        "RSPCLOGS holds per-step chain messages. Runtime statistics come from RSPCPROCESSLOG; the "
-        "messages are what a failure diagnosis needs.",
+        "NOT_SUPPORTED",
+        "RSPCLOGS was declared as holding per-step chain messages. Verified against the "
+        "dictionary: it has four columns (TYPE, VARIANTE, INSTANCE, LOGHANDLE) and no message at "
+        "all - it is a pointer into the Application Log. Reading the messages needs BALHDR/BALMSG "
+        "or BAL_LOG_MSG_READ, neither of which this server declares, so the honest state is that "
+        "this table alone cannot answer the question it was declared for.",
     ),
     "hana_columns": (
         "PARTIAL",

@@ -96,8 +96,37 @@ field read as absent for the whole 24-hour TTL: a customer would see a feature t
 installed reporting nothing, with no error to explain it. The fingerprint now includes the server
 version, so an upgrade retires the cache. Costs one re-read; cannot mislead.
 
-Contract movement: `attribute`, `nav_attribute` and `element_prop` PLANNED → SUPPORTED (62 supported
-of 97 declared, 18 still PLANNED).
+### Added — the ABAP routine registry, and a corrected premise about BW 3.x routines
+
+`RSAROUT` was declared as holding 3.x routine source, and the 3.x conversion routines were therefore
+described as named but unreadable. Checked against the dictionary: `RSAROUT` holds no source at all —
+twelve columns, none of them ABAP. The source is in `RSAABAP` under the same code id, the table the
+7.x routines already come from. Measured on the reference system: all 164 transfer-rule conversion
+routines, all 4 transfer-structure start routines and all 3 update-rule routines resolve there. 3.x
+routine logic was never unreachable, only unattributed.
+
+What `RSAROUT` actually is, is a registry spanning both worlds: it types every one of the system's
+10,449 routines by the mechanism that owns it (9,971 transformation, 378 transfer-rule, 15 InfoObject
+conversion, 3 update-rule), and records how each uses its input — no source field, selected fields,
+or the whole source structure, which is the difference between a narrow and a wide change-impact
+surface. Transfer rules and update rules now carry that entry, with the description from `RSAROUTT`,
+the line count from `RSAABAP`, and provenance citing all three tables.
+
+Two honest-reporting details: a rule naming a routine the registry does not know reports no entry
+rather than an invented one, and 30 routines with an active-version row are *not* activated, so
+`active` is read from the flags rather than inferred from the row existing.
+
+### Changed — `log_messages` (RSPCLOGS) reclassified from PLANNED to NOT_SUPPORTED
+
+It was declared as holding per-step chain messages, which a failure diagnosis needs. It does not:
+four columns (`TYPE`, `VARIANTE`, `INSTANCE`, `LOGHANDLE`) and no message text — it is a pointer into
+the Application Log. Reading the messages needs `BALHDR`/`BALMSG` or `BAL_LOG_MSG_READ`, none of
+which this server declares. Recorded as not supported with that reason, rather than left as a plan
+that could not have worked.
+
+Contract movement: `attribute`, `nav_attribute`, `element_prop`, `routine_source_3x` and
+`routine_text_3x` PLANNED → SUPPORTED; `log_messages` PLANNED → NOT_SUPPORTED. **64 SUPPORTED of 97
+declared, 15 still PLANNED** (from 59/21 at the start of this work).
 
 ### Added — BW security: analysis authorisations
 

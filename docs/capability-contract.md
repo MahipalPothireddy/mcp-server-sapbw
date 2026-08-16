@@ -7,7 +7,7 @@ Declaring a capability is cheap; reading it is not, so the two are recorded
 separately and a drift check fails the build when a capability is declared with
 neither a reader nor a stated reason.
 
-**76 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
+**78 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
 
 | State | Meaning |
 |---|---|
@@ -21,7 +21,7 @@ neither a reader nor a stated reason.
 Presence of a table on *your* system is a separate question, answered per connection by
 `bw_system_profile`. This file records what the server would do with it if present.
 
-## SUPPORTED (62)
+## SUPPORTED (64)
 
 | Capability | Object | Notes |
 |---|---|---|
@@ -73,6 +73,8 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `query_provider` | `RSZCOMPIC` | read by the server |
 | `request_status` | `RSSTATMANPART` | read by the server |
 | `routine_source` | `RSAABAP` | read by the server |
+| `routine_source_3x` | `RSAROUT` | read by the server |
+| `routine_text_3x` | `RSAROUTT` | read by the server |
 | `source_system` | `RSBASIDOC` | read by the server |
 | `transfer_rule` | `RSTSRULES` | read by the server |
 | `transfer_structure` | `RSTS` | read by the server |
@@ -112,7 +114,7 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `composite_provider` | `RSOHCPR%` | Pattern RSOHCPR% establishes whether CompositeProviders exist. The tables it finds are declared as composite_header/composite_text, which are read. |
 | `query_stats` | `RSDDSTAT%` | Pattern RSDDSTAT% establishes which BW statistics variant a release carries; the names differ across 7.4/7.5/BW4. Query usage is read from RSZCOMPDIR.LASTUSED instead, which is present on every release, so no statistics table is read directly. |
 
-## PLANNED (18)
+## PLANNED (15)
 
 | Capability | Object | Notes |
 |---|---|---|
@@ -130,16 +132,14 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `job_header` | `TBTCO` | TBTCO/TBTCP/TBTCS carry job periodicity. Chain cadence is currently measured from observed run history, which is the more honest signal; the declared schedule would let the two be compared, and a divergence is itself a finding. |
 | `job_schedule` | `TBTCS` | See job_header. |
 | `job_steps` | `TBTCP` | See job_header. |
-| `log_messages` | `RSPCLOGS` | RSPCLOGS holds per-step chain messages. Runtime statistics come from RSPCPROCESSLOG; the messages are what a failure diagnosis needs. |
 | `report_dir` | `RSRREPDIR` | RSRREPDIR holds query generation status, which distinguishes a query that exists from one that is executable. |
-| `routine_source_3x` | `RSAROUT` | RSAROUT/RSAROUTT hold 3.x routine source. bw_get_routine_code covers 7.x routines from RSAABAP only, so a 3.x flow's conversion routines are currently named but not read. |
-| `routine_text_3x` | `RSAROUTT` | See routine_source_3x. |
 
-## NOT_SUPPORTED (3)
+## NOT_SUPPORTED (4)
 
 | Capability | Object | Notes |
 |---|---|---|
 | `dict_dataelement_text` | `DD04T` | DD04T holds data-element texts. Superseded for every current purpose by the domain-value decoding in services/aggregation.py, which reads DD07L/DD07T directly. |
 | `dict_tables` | `DD02L` | DD02L is used by the resolver's own existence probe, which issues its SQL directly rather than through the dialect. No feature reads it. |
 | `dict_tables_text` | `DD02T` | DD02T carries table descriptions. Object descriptions come from the BW text tables, which are the ones users recognise, so the dictionary texts are not surfaced. |
+| `log_messages` | `RSPCLOGS` | RSPCLOGS was declared as holding per-step chain messages. Verified against the dictionary: it has four columns (TYPE, VARIANTE, INSTANCE, LOGHANDLE) and no message at all - it is a pointer into the Application Log. Reading the messages needs BALHDR/BALMSG or BAL_LOG_MSG_READ, neither of which this server declares, so the honest state is that this table alone cannot answer the question it was declared for. |
 

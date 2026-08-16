@@ -24,6 +24,9 @@ _TABLES = {
     "update_rule": "RSUPDINFO",
     "update_rule_routine": "RSUPDROUT",
     "transformation": "RSTRAN",
+    "routine_source_3x": "RSAROUT",
+    "routine_text_3x": "RSAROUTT",
+    "routine_source": "RSAABAP",
 }
 
 # DS_LEGACY routes 3.x only. DS_BOTH has a 3.x route AND a 7.x transformation. DS_SHELL's transfer
@@ -44,7 +47,25 @@ _RULE_ROWS = [
     ("TS_LEGACY", "CS_LEGACY", "0PLANT", "", "1000", "", "", "", ""),
     ("TS_LEGACY", "CS_LEGACY", "0CURRENCY", "WAERS", "", "", "CONV_CURRENCY", "", ""),
     ("TS_LEGACY", "CS_LEGACY", "0AMOUNT", "", "", "", "", "FORM_01", ""),
+    # A rule naming a routine the registry does not know: reported as unresolved, never invented.
+    ("TS_LEGACY", "CS_LEGACY", "0UNIT", "MEINS", "", "CONV_ORPHAN", "", "", ""),
 ]
+
+# The ABAP routine registry. RSAROUT holds NO source - only a header per routine. The source is in
+# RSAABAP under the same code id, which is what makes 3.x routine logic reachable at all.
+#   CODEID -> (CODETP, OWNER, OBJSTAT, ACTIVFL, DEPENDENCY)
+_ROUTINE_HEADERS = {
+    "CONV_CURRENCY": ("TR", "DEVUSER", "ACT", "X", "1"),
+    "UPD_ROUT_A": ("UR", "DEVUSER", "ACT", "X", "2"),
+    # Present in the registry but never activated: an active-version row is not an active routine.
+    "CONV_STALE": ("TR", "DEVUSER", "", "", ""),
+}
+_ROUTINE_TEXTS = {  # (CODEID, LANGU, TXTLG)
+    ("CONV_CURRENCY", "E", "Currency conversion"),
+    ("CONV_CURRENCY", "D", "Waehrungsumrechnung"),
+    ("UPD_ROUT_A", "E", "Quantity split"),
+}
+_ROUTINE_LINES = {"CONV_CURRENCY": 42, "UPD_ROUT_A": 7}  # CONV_STALE has none
 
 
 class ScriptedConnection:
@@ -61,12 +82,21 @@ class ScriptedConnection:
         if "RSTSRULES" in sql:
             if "GROUP BY" in sql:
                 return list(_RULE_PROFILE)
-            wanted = str(parameters[0]) if parameters else ""
-            return [r for r in _RULE_ROWS if r[0] == wanted]
+            structure = str(parameters[0]) if parameters else ""
+            return [r for r in _RULE_ROWS if r[0] == structure]
+        ids = {str(p) for p in parameters or []}
+        if "RSAROUTT" in sql:
+            return [(c, lang, text) for c, lang, text in _ROUTINE_TEXTS if c in ids]
+        if "RSAROUT" in sql:
+            return [(c, *v) for c, v in _ROUTINE_HEADERS.items() if c in ids]
+        if "RSAABAP" in sql:
+            return [(c, n) for c, n in _ROUTINE_LINES.items() if c in ids]
         if "RSTS" in sql:  # transfer structures with a start routine
             return [("TS_LEGACY",)]
         if "RSUPDROUT" in sql:
-            return [("UPD_1", 2)]
+            if "COUNT(" in sql:
+                return [("UPD_1", 2)]
+            return [("UPD_1", "UPD_ROUT_A")]
         if "RSUPDINFO" in sql:
             if "TOTAL_COUNT" in sql or "COUNT(" in sql:
                 return [(1,)]
@@ -152,6 +182,80 @@ def test_update_rules_report_routine_count_and_start_routine() -> None:
     assert rules[0].target == "0MATERIAL"
     assert rules[0].has_start_routine is True
     assert rules[0].routine_count == 2
+
+
+# --- the ABAP routine registry (RSAROUT / RSAROUTT) --------------------------------------------
+
+
+def _rule(infoobject: str) -> Any:
+    rules = _repo().get_transfer_rules("TS_LEGACY")
+    assert not isinstance(rules, UnsupportedResult)
+    return next(r for r in rules if r.infoobject == infoobject)
+
+
+def test_conversion_routine_resolves_through_the_registry() -> None:
+    routine = _rule("0CURRENCY").routine
+    assert routine is not None
+    assert routine.code_id == "CONV_CURRENCY"
+    assert routine.kind == "transfer_rule"
+    assert routine.description == "Currency conversion"  # English preferred over German
+    assert routine.active is True
+    assert routine.source_dependency == "uses selected source-structure fields"
+
+
+def test_registry_reports_where_the_source_actually_is() -> None:
+    """RSAROUT holds no ABAP. The line count comes from RSAABAP under the same code id."""
+    routine = _rule("0CURRENCY").routine
+    assert routine is not None
+    assert routine.line_count == 42
+    assert routine.source_available is True
+    assert [p.source_table for p in routine.provenance] == ["RSAROUT", "RSAROUTT", "RSAABAP"]
+
+
+def test_rule_naming_an_unknown_routine_reports_none_rather_than_inventing_one() -> None:
+    rule = _rule("0UNIT")
+    assert rule.mechanism == "routine"  # BW says there is a routine
+    assert rule.routine is None  # the registry does not know it, and does not pretend to
+
+
+def test_non_routine_rules_carry_no_registry_entry() -> None:
+    assert _rule("0MATERIAL").routine is None
+    assert _rule("0PLANT").routine is None
+    assert _rule("0AMOUNT").routine is None
+
+
+def test_inactive_routine_is_not_reported_as_active() -> None:
+    """An active-version row is not an activated routine; 30 such rows exist on the live system."""
+    registry = _repo().routine_registry(["CONV_STALE"])
+    entry = registry["CONV_STALE"]
+    assert entry.active is False
+    assert entry.source_available is False
+    assert entry.line_count == 0
+    assert entry.source_dependency == "indeterminate"
+
+
+def test_update_rule_routines_are_resolved_not_only_counted() -> None:
+    rules = _repo().list_update_rules()
+    assert not isinstance(rules, UnsupportedResult)
+    routines = rules[0].routines
+    assert [r.code_id for r in routines] == ["UPD_ROUT_A"]
+    assert routines[0].kind == "update_rule"
+    assert routines[0].source_dependency == "uses the whole source structure"
+    assert routines[0].line_count == 7
+
+
+def test_absent_registry_leaves_rules_readable_without_routine_detail() -> None:
+    """The registry is an enrichment; losing it must not lose the rules themselves."""
+    rules = _repo(omit={"routine_source_3x"}).get_transfer_rules("TS_LEGACY")
+    assert not isinstance(rules, UnsupportedResult)
+    assert len(rules) == 5
+    assert all(r.routine is None for r in rules)
+    # The rule still says a routine exists, so the mechanism is not lost with the detail.
+    assert next(r for r in rules if r.infoobject == "0CURRENCY").mechanism == "routine"
+
+
+def test_registry_ignores_blank_code_ids() -> None:
+    assert _repo().routine_registry(["", "   "]) == {}
 
 
 def test_missing_tables_degrade_to_unsupported_rather_than_empty() -> None:
