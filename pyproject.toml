@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mcp-server-sapbw"
 version = "0.1.0"
-description = "Read-only, system-agnostic MCP server exposing SAP BW-on-HANA metadata as model-callable tools, resources, and prompts."
+description = "SAP BW technical-discovery MCP - a read-only, system-agnostic MCP server exposing SAP BW-on-HANA metadata as model-callable tools, resources, and prompts."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"

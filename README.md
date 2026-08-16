@@ -1,4 +1,6 @@
-# mcp-server-sapbw
+# SAP BW technical-discovery MCP
+
+<sub>Distribution name: `mcp-server-sapbw` · Python package: `mcp_server_sapbw`</sub>
 
 A read-only, system-agnostic [MCP](https://modelcontextprotocol.io) server that exposes the
 metadata of any **SAP BW-on-HANA** system as model-callable tools, resources, and prompts. Point
@@ -10,7 +12,8 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **45 tools, 7 resources and 6 prompts**, most of them exercised against a live BW 7.50 system.
+> **45 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> system.
 > Still planned: a BI connector for scenarios 9.7/9.8 (report schedules and dashboards live outside
 > BW, so those two analyses return a template naming the connector required). The ECC source-system
 > connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
@@ -89,6 +92,12 @@ cp .env.example .env
 ## MCP client configuration
 
 Local **stdio** transport. Example (Kiro `mcp.json`):
+
+> **Keep the config key short.** The server reports itself as *SAP BW technical-discovery MCP*, but
+> most clients build each tool's visible name by prefixing **the key you choose here**. With
+> `"sapbw"` the longest tool becomes `mcp_sapbw_bw_list_extractor_enhancements` (40 characters),
+> comfortably inside the 64-character limit. A long or hyphenated key can push names over it, or
+> produce an invalid identifier, and affected tools are then silently dropped.
 
 ```json
 {

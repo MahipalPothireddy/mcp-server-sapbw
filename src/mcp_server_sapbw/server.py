@@ -122,7 +122,13 @@ _MAX_INLINE_EDGES = 90
 # How much of a result may be inlined before it is summarised. 'auto' decides per response.
 DetailLevel = Literal["auto", "summary", "full"]
 
-mcp: FastMCP = FastMCP(name="sapbw", mask_error_details=True)
+# Human-readable server identity reported over the protocol. Distinct from the key a client uses in
+# its own config: most clients derive each tool's visible name by prefixing that key, and the result
+# must stay a valid identifier under 64 characters, so a short key such as "sapbw" is recommended in
+# the README rather than this display name.
+SERVER_NAME = "SAP BW technical-discovery MCP"
+
+mcp: FastMCP = FastMCP(name=SERVER_NAME, mask_error_details=True)
 
 _LOG = get_logger("server")
 
