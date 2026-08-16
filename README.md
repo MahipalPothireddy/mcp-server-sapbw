@@ -12,7 +12,7 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **57 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **58 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -236,6 +236,7 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
 | `bw_access_report` | `system` | Which deployment mode is in force, which reads were refused, and the exact grants to fix them |
 | `bw_support_matrix` | `tool?`, `release?`, `system?` | Which tool works on which BW release — **no connection required** |
+| `bw_performance_profile` | `tool?`, `growth?` | What each tool costs and what a bigger system does to it — **no connection required** |
 | `bw_cache_status` | `system` | What extracted metadata and how many snapshots are on local disk, and where |
 | `bw_refresh_cache` | `system`, `scope="all"` | Invalidate cached extracts by scope |
 
@@ -250,6 +251,7 @@ Three answers, in increasing specificity, and the first needs nothing from you:
 | What does this server do with metadata object X? | [`docs/capability-contract.md`](docs/capability-contract.md) | no |
 | What do we grant the connecting user? | [`docs/deployment-modes.md`](docs/deployment-modes.md) | no |
 | What is this user actually allowed to read? | `bw_access_report` | yes |
+| What will this cost on a system our size? | [`docs/performance.md`](docs/performance.md) / `bw_performance_profile` | no |
 
 A fourth answer matters when the first three come back thin: **a refused read is not a missing
 feature.** A user without SELECT on `DD02L` used to make the server report `adso: false` and then
@@ -259,7 +261,7 @@ Denial and absence are now recorded separately, and `bw_access_report` names the
 `bw_support_matrix` is keyed by **tool**, because that is the unit the question is asked in. Its
 `requires` field bridges to the capability contract and is **measured**, by attributing each metadata
 read to the tool that caused it while the offline suite runs — so it cannot drift the way a
-hand-written mapping across 57 tools would. It is a lower bound: everything listed really is read,
+hand-written mapping across 58 tools would. It is a lower bound: everything listed really is read,
 and a code path no test reaches contributes nothing.
 
 There is deliberately no `supported` verdict. Every value says where the claim comes from:
@@ -267,7 +269,7 @@ There is deliberately no `supported` verdict. Every value says where the claim c
 not everything verified there), `unverified` (**nobody has run it against that release — not a
 prediction**), `needs_connector`, `unknown`.
 
-Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 40 tools `verified`, 15 `expected`, 2
+Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 41 tools `verified`, 15 `expected`, 2
 connector-gated. Every other release reports `unverified` for every tool. That is an absence of
 evidence stated rather than filled in — which metadata objects a release carries is exactly what the
 capability resolver discovers at connect time, and predicting it from a version number would be
@@ -660,6 +662,35 @@ Resources share the tools' failure envelope — a failed read returns a structur
 `code`, `category`, `remedy` and `retryable` flag rather than an opaque transport error, and an
 absent table returns `unsupported_on_release` naming what is missing. They also share the per-call
 budget, so a resource read cannot run unbounded either.
+
+## Cost and scale
+
+Every call runs inside a budget — 5,000 statements and 300 seconds by default, overridable with
+`SAPBW_MAX_QUERIES_PER_CALL` / `SAPBW_MAX_SECONDS_PER_CALL`. Exhausting it returns a `BudgetResult`
+naming what was spent and where it stopped, never a hang or a silent truncation.
+
+A bound you only discover by hitting it is not something you can plan around, so
+[`docs/performance.md`](docs/performance.md) publishes the cost of every tool and
+`bw_performance_profile` answers the same question with no connection. Read `growth` first — it is
+the answer to "does this get worse on a system our size":
+
+| Growth | Tools | Meaning |
+|---|--:|---|
+| `constant` | 9 | Bounded by this build, not your landscape. Identical on any system. |
+| `per_page` | 12 | One page of rows; cost set by `limit`, with `total_count` behind it. |
+| `per_object` | 17 | Proportional to the one object named, not to how many exist. |
+| `per_graph_node` | 7 | Follows the connected subgraph — a hub costs far more than a leaf at equal depth. |
+| `per_system` | 13 | **Scans a whole class of objects.** Plan for these; each names the cap that stops it. |
+
+Two facts are kept apart rather than blended into a score. `fixture_payload_bytes` is **measured**
+against the synthetic fixtures, so CI can check it, but it is a floor: the fixtures hold about one
+object per type, so it isolates a reply's fixed shape overhead from its per-row cost. `growth` is
+**declared** from the code and cites the constant that bounds it, because a one-object fixture
+cannot demonstrate what four thousand objects do. Statement counts report `not_measured` rather
+than zero — budget charging lives in the connection layer, which the offline fixtures replace.
+
+A successful call that spent more than 80% of its budget logs a warning naming the spend. That is
+the early signal: it fires while the call still succeeds, which is when there is time to narrow it.
 
 ## Security model
 

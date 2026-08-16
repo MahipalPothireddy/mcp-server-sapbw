@@ -35,6 +35,7 @@ from .core.budget import (
     DEFAULT_MAX_QUERIES,
     DEFAULT_MAX_SECONDS,
     BudgetExceeded,
+    QueryBudget,
     query_budget,
 )
 from .core.cache import SqliteCache
@@ -46,6 +47,7 @@ from .core.logging import configure as configure_logging
 from .core.logging import get_logger
 from .core.paths import cache_dir as default_cache_dir
 from .core.paths import cache_file
+from .core.performance import performance_profile
 from .core.profiles import ProfileManager
 from .core.snapshots import SnapshotStore, snapshot_file
 from .core.support import support_matrix
@@ -73,6 +75,7 @@ from .models.findings import ScenarioReport
 from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
 from .models.health import ProviderHealth
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
+from .models.performance import PerformanceProfile
 from .models.provenance import UnsupportedResult
 from .models.providers import ObjectNotFound, Provider, ProviderType, SearchHit
 from .models.queries import Query, QueryLineage, QueryOriginFilter, QuerySummary, QueryUsage
@@ -922,7 +925,7 @@ def _readonly_tool(func: Callable[..., Any]) -> Any:
             record_tool_reads(name),
         ):
             try:
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
             except BudgetExceeded as exc:
                 _LOG.warning("tool=%s stopped on budget: %s", name, exc.reason)
                 return BudgetResult(
@@ -941,6 +944,8 @@ def _readonly_tool(func: Callable[..., Any]) -> Any:
                 failure = from_exception(exc, tool=name)
                 _LOG.warning("tool=%s failed: code=%s (%s)", name, failure.code, type(exc).__name__)
                 return failure
+            _report_cost(name, budget)
+            return result
 
     # Widen the declared return type to include the failure branches, once, here. Every tool can
     # return a BudgetResult or a BwError, and a schema that does not say so is a schema a client
@@ -951,6 +956,44 @@ def _readonly_tool(func: Callable[..., Any]) -> Any:
         budgeted.__annotations__["return"] = declared | BudgetResult | BwError
 
     return mcp.tool(annotations={"readOnlyHint": True})(budgeted)
+
+
+#: Fraction of the per-call budget above which a *successful* call is still worth a warning.
+#: Below this, cost goes to DEBUG - a quiet server is the default and every call would otherwise
+#: log a line nobody reads.
+_BUDGET_WARN_FRACTION = 0.8
+
+
+def _report_cost(tool: str, budget: QueryBudget) -> None:
+    """Log what a successful call cost, and warn when it nearly hit its bound.
+
+    A budget was only ever visible when it was exceeded, so a call that spent 4,999 of 5,000
+    statements looked exactly like one that spent three. That is the difference between "this
+    scales" and "this falls over on the next system twice the size", and it was invisible until
+    the moment it became a partial answer.
+
+    The warning is the early signal: it fires while the call is still succeeding, which is when
+    there is time to narrow it or raise the bound.
+    """
+    spent = budget.snapshot()
+    queries = int(spent["queries"])
+    elapsed = float(spent["elapsed_seconds"])
+    max_queries = int(spent["max_queries"])
+    max_seconds = float(spent["max_seconds"])
+    near_queries = max_queries > 0 and queries >= max_queries * _BUDGET_WARN_FRACTION
+    near_time = max_seconds > 0 and elapsed >= max_seconds * _BUDGET_WARN_FRACTION
+    if near_queries or near_time:
+        _LOG.warning(
+            "tool=%s succeeded near its bound: %d/%d statements in %.1f/%.0fs - "
+            "narrow the request or raise SAPBW_MAX_QUERIES_PER_CALL / SAPBW_MAX_SECONDS_PER_CALL",
+            tool,
+            queries,
+            max_queries,
+            elapsed,
+            max_seconds,
+        )
+    else:
+        _LOG.debug("tool=%s cost: %d statements in %.3fs", tool, queries, elapsed)
 
 
 def _budget_limits() -> tuple[int, float]:
@@ -1095,6 +1138,61 @@ def bw_support_matrix(
     if tool is not None and matrix.tool(tool) is None:
         return error("object_not_found", f"no registered tool named {tool!r}", id=tool)
     return _narrow_matrix(matrix, tool=tool, release=release, system=system)
+
+
+@_readonly_tool
+def bw_performance_profile(
+    tool: str | None = None, growth: str | None = None
+) -> PerformanceProfile | BwError:
+    """What each tool costs and what a bigger system does to it. **No connection required.**
+
+    The sizing question: *we have 40,000 InfoObjects and 1,200 chains - which of these calls will
+    still return, and what will they cost?* Every call is already bounded, so nothing runs away, but
+    a bound you only discover by hitting it is not something a customer can plan around.
+
+    Read ``growth`` first; it is the answer to "does this get worse on my system":
+
+    * ``constant`` - bounded by this build, not by your landscape. Identical on any system.
+    * ``per_page`` - one page of rows; cost is set by ``limit``, and ``total_count`` says what is
+      behind it.
+    * ``per_object`` - proportional to the single object named, not to how many exist.
+    * ``per_graph_node`` - follows the connected subgraph, so a hub object costs far more than a
+      leaf at the same depth.
+    * ``per_system`` - **scans a whole class of objects.** These are the calls to plan for on a
+      large landscape, and each names the cap that stops it.
+
+    Two facts, deliberately not blended into one score. ``fixture_payload_bytes`` is *measured*
+    against the synthetic fixtures, so it is checkable, but it is a floor: the fixtures hold about
+    one object per type, so it shows the fixed overhead of a reply's shape rather than per-row cost.
+    ``growth`` is *declared* from the code and cites the constant that bounds it, because a
+    one-object fixture cannot demonstrate what four thousand objects do. Statement counts are
+    reported as ``not_measured``, never as zero - budget charging lives in the connection layer,
+    which the offline fixtures replace.
+
+    Filter with ``tool`` or ``growth``.
+    """
+    profile = performance_profile()
+    if profile is None:
+        return error(
+            "internal_error",
+            "the performance-profile data file is missing from this installation; regenerate it "
+            "with python scripts/performance_profile.py",
+        )
+    if tool is not None and profile.tool(tool) is None:
+        return error("object_not_found", f"no registered tool named {tool!r}", id=tool)
+    known = sorted({entry.growth for entry in profile.tools})
+    if growth is not None and growth not in known:
+        return error(
+            "invalid_argument",
+            f"unknown growth class {growth!r}; this build reports {', '.join(known)}",
+        )
+    entries = [
+        entry
+        for entry in profile.tools
+        if (tool is None or entry.tool == tool) and (growth is None or entry.growth == growth)
+    ]
+    totals = {g: sum(1 for e in entries if e.growth == g) for g in {e.growth for e in entries}}
+    return profile.model_copy(update={"tools": entries, "totals": totals})
 
 
 def _narrow_matrix(

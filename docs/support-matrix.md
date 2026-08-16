@@ -29,9 +29,9 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 
 | Release | verified | expected | unverified | needs_connector | unknown |
 |---|---|---|---|---|---|
-| `BW 7.40` | 0 | 0 | 55 | 2 | 0 |
-| `BW 7.50` | 40 | 15 | 0 | 2 | 0 |
-| `BW/4HANA 2.0` | 0 | 0 | 55 | 2 | 0 |
+| `BW 7.40` | 0 | 0 | 56 | 2 | 0 |
+| `BW 7.50` | 41 | 15 | 0 | 2 | 0 |
+| `BW/4HANA 2.0` | 0 | 0 | 56 | 2 | 0 |
 
 ## Per tool
 
@@ -86,6 +86,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_list_systems` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_list_transformations` | `unverified` | `expected` | `unverified` | `unit_tested` | `transformation`, `transformation_text` |
 | `bw_list_update_rules` | `unverified` | `verified` | `unverified` | `not_validated` | - |
+| `bw_performance_profile` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_refresh_cache` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_refresh_capabilities` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_render_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `routine_source`, `transformation`, `transformation_step_rout` |

@@ -77,6 +77,13 @@ jobs:
       - name: Support matrix check
         run: python scripts/support_matrix.py --check
 
+      # Fails when docs/performance.md or the shipped performance_profile.json no longer matches the
+      # registered tools, their declared growth classes or their measured fixture payloads. A tool
+      # added without a growth class is simply absent from the profile, and a customer sizing this
+      # reads absence as "nothing to worry about".
+      - name: Performance profile check
+        run: python scripts/performance_profile.py --check
+
   security:
     name: secret scan + customer-metadata leak check
     runs-on: ubuntu-latest

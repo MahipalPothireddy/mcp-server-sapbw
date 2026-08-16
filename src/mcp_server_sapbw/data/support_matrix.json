@@ -885,6 +885,20 @@
       "implementation": null,
       "measurement": "measured",
       "needs_connector": null,
+      "note": "Measured to read no BW metadata.",
+      "releases": {
+        "BW 7.40": "unverified",
+        "BW 7.50": "verified",
+        "BW/4HANA 2.0": "unverified"
+      },
+      "requires": [],
+      "tool": "bw_performance_profile",
+      "validation": "not_validated"
+    },
+    {
+      "implementation": null,
+      "measurement": "measured",
+      "needs_connector": null,
       "note": "Clears the local cache.",
       "releases": {
         "BW 7.40": "unverified",
@@ -1064,16 +1078,16 @@
   "totals": {
     "BW 7.40": {
       "needs_connector": 2,
-      "unverified": 55
+      "unverified": 56
     },
     "BW 7.50": {
       "expected": 15,
       "needs_connector": 2,
-      "verified": 40
+      "verified": 41
     },
     "BW/4HANA 2.0": {
       "needs_connector": 2,
-      "unverified": 55
+      "unverified": 56
     }
   }
 }

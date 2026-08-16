@@ -45,6 +45,7 @@ _ARGS: dict[str, dict[str, Any]] = {
     "bw_capability_report": {"system": _SYSTEM},
     "bw_access_report": {"system": _SYSTEM},
     "bw_support_matrix": {},
+    "bw_performance_profile": {},
     "bw_cache_status": {"system": _SYSTEM},
     "bw_refresh_cache": {"system": _SYSTEM},
     # --- snapshots ----------------------------------------------------------------------
