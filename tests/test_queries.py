@@ -9,13 +9,18 @@ Synthetic names only. Landscape:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
-from mcp_server_sapbw.repositories.queries import QueriesRepository, classify_origin
+from mcp_server_sapbw.repositories.queries import (
+    _PROPERTY_COLUMNS,
+    QueriesRepository,
+    classify_origin,
+)
 from mcp_server_sapbw.services.lineage import LineageService
 
 SCHEMA = "TESTSCHEMA"
@@ -28,6 +33,7 @@ _TABLES = {
     "element_range": "RSZRANGE",
     "element_select": "RSZSELECT",
     "element_calc": "RSZCALC",
+    "element_prop": "RSZELTPROP",
     "global_variable": "RSZGLOBV",
     "transformation": "RSTRAN",
     "dtp": "RSBKDTP",
@@ -59,6 +65,51 @@ _CALC: dict[str, list[tuple[Any, ...]]] = {
         ("", "CNT", "MATERIAL", "PLANT", "", "", "", ""),
     ],
 }
+# RSZELTPROP per element, written by column name and projected into _PROPERTY_COLUMNS order below.
+# Naming the columns matters here: the row is 24 wide and a positional fixture silently tests the
+# wrong column the moment the SELECT list changes.
+#
+# E_RKF translates to USD and inverts its sign; E_CHAR displays along a hierarchy chosen by a
+# variable, aggregates locally as a last value, is hidden, and carries its own key date. Between
+# them they cover every code family: a literal source, a runtime-resolved source, a non-summation
+# local aggregation, a three-valued boolean, and BW's own defaults.
+_PROP_BY_NAME: dict[str, dict[str, str]] = {
+    "E_RKF": {
+        "TCUR": "USD",
+        "TCURFLAG": "1",
+        "CTTNM": "STD_RATE",
+        "NOSUMS": "U",
+        "SIGNINV": "X",
+    },
+    "E_CHAR": {
+        "HIENM": "HIER_VAR",
+        "HIENMFLAG": "3",
+        "STRT_LVL": "02",
+        "HRY_ACTIVE": "X",
+        "STRMEM_LAGGR": "12",
+        "LAGGR_DIR": "1",
+        "HIDDEN": "X",
+        "KEYDATE": "20260101",
+        "KEYDATEFLAG": "1",
+    },
+}
+# Unset columns default the way BW does: a NUMC flag holds '0'/'00', a CHAR column holds blank.
+_PROP_DEFAULTS = {"TCURFLAG": "0", "TCURDATEFLAG": "0", "TUOMFLAG": "0", "HIENMFLAG": "0"}
+_PROP_NUMC = {"STRT_LVL": "00", "STRMEM_LAGGR": "00", "LAGGR_DIR": "0", "KEYDATEFLAG": "0"}
+
+
+def _prop_row(values: dict[str, str]) -> tuple[Any, ...]:
+    """Project a by-name fixture onto the repository's SELECT list, minus the leading ELTUID."""
+    return tuple(
+        values.get(column, _PROP_DEFAULTS.get(column, _PROP_NUMC.get(column, "")))
+        for column in _PROPERTY_COLUMNS[1:]
+    )
+
+
+_PROP: dict[str, tuple[Any, ...]] = {
+    eltuid: _prop_row(values) for eltuid, values in _PROP_BY_NAME.items()
+}
+
 _GLOBV = {"USD_VAR": ("1", "3", "CURRENCY", "")}  # VPROCTP 3 = customer exit
 _TRANS_BY_TARGET = {
     "SALES_CUBE": [("SALES_DSO", "ODSO", "TR1")],
@@ -98,6 +149,9 @@ class ScriptedConnection:
         if "RSZCALC" in sql:
             ids = _in_params(sql, params)
             return [(k, *row) for k, rows in _CALC.items() if k in ids for row in rows]
+        if "RSZELTPROP" in sql:
+            ids = _in_params(sql, params)
+            return [(k, *row) for k, row in _PROP.items() if k in ids]
         if "RSZGLOBV" in sql:
             ids = _in_params(sql, params)
             return [(k, *v) for k, v in _GLOBV.items() if k in ids]
@@ -332,6 +386,124 @@ def test_query_caveat_warns_that_totals_will_not_match() -> None:
     assert "exception aggregation" in joined
     assert "CNT" in joined
     assert "not reproduced by adding the underlying rows up" in joined
+
+
+# --- element properties (RSZELTPROP) -----------------------------------------------------------
+
+
+@contextmanager
+def _property_override(eltuid: str, column: str, value: str) -> Iterator[None]:
+    """Replace one RSZELTPROP column by name, so a test never depends on a tuple index."""
+    index = _PROPERTY_COLUMNS.index(column) - 1  # the fixture rows omit the leading ELTUID
+    original = dict(_PROP)
+    _PROP[eltuid] = tuple(value if i == index else v for i, v in enumerate(original[eltuid]))
+    try:
+        yield
+    finally:
+        _PROP.clear()
+        _PROP.update(original)
+
+
+def test_currency_translation_is_read_with_its_translation_type() -> None:
+    props = _element("E_RKF").properties
+    assert props is not None
+    currency = props.currency_translation
+    assert currency is not None
+    assert (currency.target_currency, currency.translation_type) == ("USD", "STD_RATE")
+    assert currency.target_source is not None
+    assert currency.target_source.value_holds == "literal"
+    assert currency.target_source.runtime_resolved is False
+
+
+def test_sign_inversion_and_total_suppression_are_decoded() -> None:
+    props = _element("E_RKF").properties
+    assert props is not None
+    assert props.sign_inverted is True
+    assert props.total_suppressed is True
+    assert props.total_suppression == "Suppress the total unconditionally"
+
+
+def test_local_aggregation_uses_the_numeric_domain() -> None:
+    """STRMEM_LAGGR is domain RRLAGGR ('00'-'13'), not the three-letter exception codes."""
+    props = _element("E_CHAR").properties
+    assert props is not None
+    aggregation = props.local_aggregation
+    assert aggregation is not None
+    assert (aggregation.code, aggregation.label) == ("12", "Last value")
+    assert aggregation.is_summation is False
+    assert props.local_aggregation_direction == "Calculate along the rows"
+
+
+def test_summation_local_aggregation_is_not_reported_as_altering_the_value() -> None:
+    """'01' is summation, so it changes nothing about how the figure relates to its rows."""
+    with _property_override("E_CHAR", "STRMEM_LAGGR", "01"):
+        props = _element("E_CHAR").properties
+        assert props is not None
+        assert props.local_aggregation is not None
+        assert props.local_aggregation.is_summation is True
+        assert not any("aggregates locally" in r for r in props.changes_the_number)
+
+
+def test_runtime_resolved_hierarchy_is_flagged_not_reported_as_a_name() -> None:
+    props = _element("E_CHAR").properties
+    assert props is not None
+    hierarchy = props.display_hierarchy
+    assert hierarchy is not None
+    assert hierarchy.source is not None
+    assert hierarchy.source.runtime_resolved is True
+    assert hierarchy.source.value_holds == "variable_name"
+    assert hierarchy.start_level == 2
+    assert hierarchy.active is True
+
+
+def test_hidden_element_is_decoded_from_its_own_domain() -> None:
+    props = _element("E_CHAR").properties
+    assert props is not None
+    assert props.hidden is True
+    assert props.display == "Hide"
+
+
+def test_own_key_date_is_reported_as_changing_the_number() -> None:
+    props = _element("E_CHAR").properties
+    assert props is not None
+    assert props.key_date == "20260101"
+    assert props.key_date_source is not None
+    assert any("key date of its own" in r for r in props.changes_the_number)
+
+
+def test_changes_the_number_names_only_the_settings_that_do() -> None:
+    rkf = _element("E_RKF").properties
+    assert rkf is not None
+    reasons = " ".join(rkf.changes_the_number)
+    assert "translated to USD" in reasons
+    assert "sign is inverted" in reasons
+    # Total suppression hides a figure; it does not change the ones that are shown.
+    assert "suppress" not in reasons.lower()
+
+
+def test_query_caveat_names_the_elements_that_alter_their_value() -> None:
+    query = _repo().get_query("QUERY_SALES")
+    assert not isinstance(query, UnsupportedResult)
+    caveat = next(c for c in query.caveats if "alter their own value" in c)
+    assert "translated to USD" in caveat
+    assert "RKF_AMOUNT" in caveat  # named by MAPNAME where it has one
+
+
+def test_flag_set_without_a_stored_value_is_stated_honestly() -> None:
+    """852 elements declare a currency target on the reference system; only 817 store one."""
+    with _property_override("E_RKF", "TCUR", ""):
+        props = _element("E_RKF").properties
+        assert props is not None
+        reasons = " ".join(props.changes_the_number)
+        assert "declares" in reasons and "does not record" in reasons
+        assert "runtime" not in reasons  # a fixed value is not resolved at runtime
+
+
+def test_absent_property_table_is_stated_not_treated_as_nothing_configured() -> None:
+    query = _repo(present=set(_TABLES) - {"element_prop"}).get_query("QUERY_SALES")
+    assert not isinstance(query, UnsupportedResult)
+    assert all(e.properties is None for e in query.elements)
+    assert any("were not read" in c and "unknown rather than absent" in c for c in query.caveats)
 
 
 def test_no_aggregation_caveat_when_everything_sums() -> None:

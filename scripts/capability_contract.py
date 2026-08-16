@@ -125,11 +125,6 @@ DECLARED_STATE: dict[str, tuple[str, str]] = {
         "resolves during discovery.",
     ),
     # --- genuinely planned, with the feature named ------------------------------------------
-    "element_prop": (
-        "PLANNED",
-        "RSZELTPROP carries element display properties and axis placement. Needed to report where "
-        "a query element sits (rows, columns, free characteristics, filter).",
-    ),
     "dtp_request": (
         "PLANNED",
         "RSBKREQUEST holds per-DTP request history. Provider currency currently comes from "

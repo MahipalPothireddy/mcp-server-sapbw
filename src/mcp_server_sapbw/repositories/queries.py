@@ -19,6 +19,7 @@ from ..core.dialect import quote_ident
 from ..models.aggregation import AggregationRule, ExceptionAggregation
 from ..models.provenance import UnsupportedResult
 from ..models.queries import (
+    ElementProperties,
     ElementRole,
     ElementType,
     FieldLineageHop,
@@ -37,6 +38,7 @@ from ..models.queries import (
     VariableProcessingType,
 )
 from ..services.aggregation import build_exception_aggregation, decode_query_aggregation
+from ..services.element_properties import build_element_properties
 from ..services.field_lineage import FieldLineageService
 from ..services.lineage import LineageService
 from .base import Repository
@@ -131,6 +133,42 @@ _MAX_LINEAGE_IOBJ = 100
 # RSZCALC rows pulled per query. An element can hold many calculation steps, so this is generous
 # relative to the 500-element tree cap while still bounding a pathological formula.
 _CALC_ROW_CAP = 5000
+
+# RSZELTPROP columns read, in SELECT order. RSZELTPROP has 100 columns; these are the ones that say
+# something about what a value means rather than how it is formatted on screen. Named explicitly so
+# the row -> dict zip stays aligned, and so adding one is a visible change.
+_PROPERTY_COLUMNS: tuple[str, ...] = (
+    "ELTUID",
+    "TCUR",
+    "TCURFLAG",
+    "CTTNM",
+    "TCURDATE",
+    "TCURDATEFLAG",
+    "UOMNM",
+    "TUOM",
+    "TUOMFLAG",
+    "HIENM",
+    "HIENMFLAG",
+    "VERSION",
+    "DATETO",
+    "STRT_LVL",
+    "HRY_ACTIVE",
+    "STRMEM_LAGGR",
+    "LAGGR_DIR",
+    "NOSUMS",
+    "HIDDEN",
+    "SIGNINV",
+    "CONSTSEL",
+    "CUMUL",
+    "KEYDATE",
+    "KEYDATEFLAG",
+)
+# One RSZELTPROP row per element, so this only ever binds on a tree at the element cap.
+_PROPERTY_ROW_CAP = 1000
+
+# A caveat points at its evidence; it is not a second copy of it.
+_CAVEAT_NAMES = 8
+_CAVEAT_REASONS = 6
 
 
 @dataclass
@@ -258,6 +296,7 @@ class QueriesRepository(Repository):
         texts = self._element_texts(list(eltuids))
         restrictions = self._restrictions(list(eltuids))
         calc = self._calc_aggregation(list(eltuids))
+        properties = self._element_properties(list(eltuids))
 
         elements = [
             self._build_element(
@@ -265,7 +304,8 @@ class QueriesRepository(Repository):
                 directory.get(uid),
                 texts.get(uid),
                 restrictions.get(uid, []),
-                calc.get(uid),
+                calc=calc.get(uid),
+                properties=properties.get(uid),
             )
             for uid in sorted(eltuids)
         ]
@@ -300,6 +340,7 @@ class QueriesRepository(Repository):
             caveats=[
                 *(["element tree capped"] if truncated else []),
                 *self._aggregation_caveats(elements),
+                *self._property_caveats(elements),
             ],
             provenance=self.provenance("query_dir", {"COMPUID": compuid, "OBJVERS": "A"}),
         )
@@ -310,7 +351,9 @@ class QueriesRepository(Repository):
         directory: tuple[Any, Any, Any] | None,
         text: tuple[str | None, str | None] | None,
         restrictions: list[Restriction],
+        *,
         calc: _CalcAggregation | None = None,
+        properties: ElementProperties | None = None,
     ) -> QueryElement:
         deftp, mapname, reusable = directory if directory else (None, None, None)
         return QueryElement(
@@ -323,8 +366,69 @@ class QueriesRepository(Repository):
             calc_step_count=calc.step_count if calc else 0,
             standard_aggregation=calc.standard if calc else None,
             exception_aggregation=calc.exception if calc else None,
+            properties=properties,
             provenance=self.provenance("element_dir", {"ELTUID": uid, "OBJVERS": "A"}),
         )
+
+    # --- element properties (RSZELTPROP) --------------------------------------------------
+
+    def _element_properties(self, eltuids: list[str]) -> dict[str, ElementProperties]:
+        """Per-element settings that change what a value means.
+
+        One row per element, so one query for the whole tree. An element with no row simply has no
+        properties configured; an unavailable table is reported by :meth:`_property_caveats` rather
+        than left to look like "nothing is configured anywhere".
+        """
+        if not eltuids or not self.capability.is_available("element_prop"):
+            return {}
+        placeholders = ", ".join("?" for _ in eltuids)
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=list(_PROPERTY_COLUMNS),
+                    from_logical="element_prop",
+                    where=[f"ELTUID IN ({placeholders})"],
+                    params=list(eltuids),
+                    order_by=["ELTUID"],
+                ),
+                limit=_PROPERTY_ROW_CAP,
+            )
+        )
+        found: dict[str, ElementProperties] = {}
+        for row in rows:
+            record = dict(zip(_PROPERTY_COLUMNS, row, strict=False))
+            uid = _clean(record.get("ELTUID"))
+            if uid is None:
+                continue
+            found[uid] = build_element_properties(
+                record,
+                eltuid=uid,
+                provenance=self.provenance("element_prop", {"ELTUID": uid, "OBJVERS": "A"}),
+            )
+        return found
+
+    def _property_caveats(self, elements: list[QueryElement]) -> list[str]:
+        """Say which elements do something to their value, and when the table could not be read."""
+        if not self.capability.is_available("element_prop"):
+            return [
+                f"element display and calculation settings were not read: "
+                f"{self.physical('element_prop')} is absent on this release, so currency "
+                "translation, local aggregation, sign inversion and key-date overrides on this "
+                "query are unknown rather than absent"
+            ]
+        altered = [e for e in elements if e.properties and e.properties.changes_the_number]
+        if not altered:
+            return []
+        reasons = sorted(
+            {r for e in altered for r in (e.properties.changes_the_number if e.properties else [])}
+        )
+        named = [e.name or e.eltuid for e in altered[:_CAVEAT_NAMES]]
+        return [
+            f"{len(altered)} element(s) alter their own value before it is displayed, so the "
+            "figure shown is not the plain sum of the records behind it: "
+            + "; ".join(reasons[:_CAVEAT_REASONS])
+            + f". Affected: {', '.join(named)}"
+        ]
 
     # --- aggregation (RSZCALC) -----------------------------------------------------------
 

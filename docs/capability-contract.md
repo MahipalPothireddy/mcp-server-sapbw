@@ -7,7 +7,7 @@ Declaring a capability is cheap; reading it is not, so the two are recorded
 separately and a drift check fails the build when a capability is declared with
 neither a reader nor a stated reason.
 
-**75 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
+**76 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
 
 | State | Meaning |
 |---|---|
@@ -21,7 +21,7 @@ neither a reader nor a stated reason.
 Presence of a table on *your* system is a separate question, answered per connection by
 `bw_system_profile`. This file records what the server would do with it if present.
 
-## SUPPORTED (61)
+## SUPPORTED (62)
 
 | Capability | Object | Notes |
 |---|---|---|
@@ -52,6 +52,7 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `dtp` | `RSBKDTP` | read by the server |
 | `element_calc` | `RSZCALC` | read by the server |
 | `element_dir` | `RSZELTDIR` | read by the server |
+| `element_prop` | `RSZELTPROP` | read by the server |
 | `element_range` | `RSZRANGE` | read by the server |
 | `element_select` | `RSZSELECT` | read by the server |
 | `element_text` | `RSZELTTXT` | read by the server |
@@ -111,7 +112,7 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `composite_provider` | `RSOHCPR%` | Pattern RSOHCPR% establishes whether CompositeProviders exist. The tables it finds are declared as composite_header/composite_text, which are read. |
 | `query_stats` | `RSDDSTAT%` | Pattern RSDDSTAT% establishes which BW statistics variant a release carries; the names differ across 7.4/7.5/BW4. Query usage is read from RSZCOMPDIR.LASTUSED instead, which is present on every release, so no statistics table is read directly. |
 
-## PLANNED (19)
+## PLANNED (18)
 
 | Capability | Object | Notes |
 |---|---|---|
@@ -122,7 +123,6 @@ Presence of a table on *your* system is a separate question, answered per connec
 | `comm_structure` | `RSKS` | RSKS/RSKSFIELDNEW hold the 3.x communication structure between transfer rules and update rules. bw_list_update_rules reports the update rules; the structure between them is not yet resolved. |
 | `comm_structure_field` | `RSKSFIELDNEW` | See comm_structure. |
 | `dtp_request` | `RSBKREQUEST` | RSBKREQUEST holds per-DTP request history. Provider currency currently comes from RSSTATMANPART; this would add per-DTP durations and record counts. |
-| `element_prop` | `RSZELTPROP` | RSZELTPROP carries element display properties and axis placement. Needed to report where a query element sits (rows, columns, free characteristics, filter). |
 | `infopackage` | `RSLDPIO` | RSLDPIO/RSLDPSEL describe InfoPackages, the 3.x-era load step ahead of the transfer structure. Needed to complete a 3.x flow's upstream hop. |
 | `infopackage_selection` | `RSLDPSEL` | See infopackage. |
 | `infosource_header` | `RSIS` | RSIS/RSIST/RSISOSMAP describe InfoSources. Partly covered: the 3.x flow tools resolve the transfer-structure path, but the InfoSource object itself is not describable. |

@@ -21,6 +21,7 @@ from mcp_server_sapbw.models.hana import HanaCrossing, HanaCrossingReport
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.models.providers import AttributeRef, Provider
+from mcp_server_sapbw.models.queries import ElementProperties, Query, QueryElement
 from mcp_server_sapbw.services.docgen import (
     GENERATED_MARKER,
     DocGenerator,
@@ -28,6 +29,7 @@ from mcp_server_sapbw.services.docgen import (
     _LoadClosure,
     _render_attributes,
     _render_description,
+    _render_value_altering_elements,
     _safe_output_dir,
     _slug,
 )
@@ -179,6 +181,48 @@ def test_attribute_table_distinguishes_navigable_from_kind() -> None:
     assert "| `MATL_GROUP` | Material group | navigation | yes |" in rendered
     # Navigable on the base, not exposed here: kind says navigation, navigable says no.
     assert "| `MATL_TYPE` | - | navigation | no | - | yes | yes |" in rendered
+
+
+def test_value_altering_elements_are_listed_and_formatting_is_not() -> None:
+    """The section exists to answer 'why do our two numbers differ', so noise defeats it."""
+    prov = Provenance(source_table="RSZELTPROP")
+    query = Query(
+        compuid="Q1",
+        compid="QUERY_SALES",
+        provenance=Provenance(source_table="RSZCOMPDIR"),
+        elements=[
+            QueryElement(
+                eltuid="E_RKF",
+                element_type="restricted_key_figure",
+                name="RKF_AMOUNT",
+                provenance=prov,
+                properties=ElementProperties(
+                    eltuid="E_RKF",
+                    changes_the_number=["values are translated to USD"],
+                    provenance=prov,
+                ),
+            ),
+            QueryElement(
+                eltuid="E_PLAIN",
+                element_type="formula",
+                name="PLAIN",
+                provenance=prov,
+                properties=ElementProperties(
+                    eltuid="E_PLAIN", total_suppressed=True, provenance=prov
+                ),
+            ),
+        ],
+    )
+    rendered = "\n".join(_render_value_altering_elements(query))
+    assert "## Elements that change their own value" in rendered
+    assert "`RKF_AMOUNT`" in rendered and "translated to USD" in rendered
+    # Total suppression hides a figure without changing the ones shown, so it is not listed here.
+    assert "PLAIN" not in rendered
+
+
+def test_value_altering_section_omitted_when_nothing_alters_a_value() -> None:
+    query = Query(compuid="Q1", provenance=Provenance(source_table="RSZCOMPDIR"))
+    assert _render_value_altering_elements(query) == []
 
 
 def test_attribute_table_omitted_for_objects_without_attributes() -> None:

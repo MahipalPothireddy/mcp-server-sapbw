@@ -62,7 +62,42 @@ Provider field lists now resolve fields that *are* navigation attributes back to
 and attribute. On the reference system 2,756 InfoCube field rows are navigation attributes stored
 under an opaque `X__Y` name with nothing in the row saying where the value comes from.
 
-Contract movement: `attribute` and `nav_attribute` PLANNED → SUPPORTED (61 supported of 97 declared).
+### Added — query element properties: what happens to a number after its rows are selected
+
+A restriction says which rows an element covers. `RSZELTPROP` says what is then done to the value,
+and it was previously unread. Each element now reports currency translation, unit conversion,
+display hierarchy, local aggregation, total suppression, display state, sign inversion, constant
+selection, cumulative display and its own key date — plus `changes_the_number`, which names the
+settings that actually alter the figure so a caller does not have to work out which of a dozen
+properties are cosmetic. The query carries a matching caveat.
+
+This is the section to read when two people compare figures from one report and disagree. On the
+reference system: 852 elements translate currency, 547 aggregate locally (94 as a first value, 18 as
+a last value, 29 as an average of non-zero values — none of which is the sum of its rows), 234
+invert their sign on display, and 14 choose their display hierarchy from a variable.
+
+Three things measured rather than assumed:
+
+- **`STRMEM_LAGGR` is domain `RRLAGGR`**, whose codes are `'00'`–`'13'`, not the three-letter
+  exception-aggregation codes used elsewhere. `'01'` is summation and is deliberately *not* reported
+  as altering the value, because it is what a reader already assumes.
+- **A flag can be set with its value column empty.** 852 elements declare a currency-translation
+  target; 817 store one. The other 35 are reported as declaring a target the element does not
+  record, rather than as "a target read at runtime" — which would be wrong twice over.
+- **`HIENM` does not always hold a hierarchy name.** When the source flag says "reference to another
+  element" it holds a 25-character element UID, observed live on a query root. `ValueSource` now
+  carries `value_holds` so a UID is never rendered as an object a user could look up.
+
+### Fixed — the extract cache no longer masks a server upgrade
+
+The cache fingerprint was the capability-discovery timestamp alone. An upgrade that widens an extract
+— a new optional field on a cached model — kept validating against the old cached JSON, so the new
+field read as absent for the whole 24-hour TTL: a customer would see a feature they had just
+installed reporting nothing, with no error to explain it. The fingerprint now includes the server
+version, so an upgrade retires the cache. Costs one re-read; cannot mislead.
+
+Contract movement: `attribute`, `nav_attribute` and `element_prop` PLANNED → SUPPORTED (62 supported
+of 97 declared, 18 still PLANNED).
 
 ### Added — BW security: analysis authorisations
 

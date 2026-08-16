@@ -101,6 +101,124 @@ class Restriction(BaseModel):
     provenance: Provenance
 
 
+class ValueSource(BaseModel):
+    """How an element setting's value is specified (``RSZELTPROP`` ``*FLAG`` columns).
+
+    Two things matter here, and both were learnt from live data rather than assumed.
+
+    ``runtime_resolved`` - a variable-driven setting resolves per execution, so metadata can name
+    the mechanism but not the effective value. Reporting the mechanism as though it were the value
+    is the same mistake as presenting a customer-exit variable's lineage as complete.
+
+    ``value_holds`` - the paired value column does not always hold what its name suggests. When the
+    flag says "reference to another element", ``HIENM`` holds a 25-character element UID, not a
+    hierarchy name; observed on a live query whose root element stores exactly that. Rendering it as
+    a hierarchy name would put a UID in front of a user as though it were an object they could look
+    up.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    label: str | None = None
+    confidence: Literal["dictionary", "advisory"] = "dictionary"
+    runtime_resolved: bool = False
+    value_holds: Literal[
+        "literal",  # the value column holds the thing itself
+        "element_uid",  # it holds a reference to another query element
+        "variable_name",  # it holds a variable, resolved per execution
+        "infoobject",  # it holds an InfoObject whose value supplies the setting
+        "constant",
+        "unknown",
+    ] = "unknown"
+
+
+class CurrencyTranslation(BaseModel):
+    """Currency translation configured on a query element.
+
+    A translated figure is denominated in something other than the currency the records were stored
+    in, so it cannot be reconciled against the source data by inspection. ``translation_type``
+    (``CTTNM``) is where the exchange-rate type, rate date and source/target rules live - it is a
+    customising object, so the name is reported rather than its resolved behaviour.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_currency: str | None = None
+    target_source: ValueSource | None = None
+    translation_type: str | None = None
+    key_date: str | None = None
+    key_date_source: ValueSource | None = None
+
+
+class UnitConversion(BaseModel):
+    """Unit-of-measure conversion configured on a query element."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target_unit: str | None = None
+    unit_infoobject: str | None = None
+    target_source: ValueSource | None = None
+
+
+class DisplayHierarchy(BaseModel):
+    """The hierarchy a query element is displayed along, and how it was chosen.
+
+    A hierarchy chosen by a variable groups the data differently per execution, which changes both
+    the rows shown and the totals - so ``source.runtime_resolved`` is the field to read before
+    trusting a comparison between two runs of the same report.
+
+    ``hierarchy`` is the value as stored, which is not always a hierarchy name: read
+    ``source.value_holds`` first. When the source is a reference to another element the column holds
+    a 25-character element UID, observed live on a query root.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hierarchy: str | None = None
+    source: ValueSource | None = None
+    version: str | None = None
+    valid_to: str | None = None
+    start_level: int | None = None
+    active: bool = False
+
+
+class ElementProperties(BaseModel):
+    """``RSZELTPROP``: what happens to a query element's value after its rows are selected.
+
+    Restrictions say which rows an element covers. These settings say what is then done to the
+    number - translated to another currency, aggregated locally as a last value rather than a sum,
+    shown with its sign inverted, read against a different key date, or hidden. Two people comparing
+    figures from one report can both be reading it correctly and still disagree; several of the
+    reasons live here.
+
+    ``changes_the_number`` names the settings that actually alter the value, so a caller does not
+    have to work out which of a dozen properties are cosmetic.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    eltuid: str
+    currency_translation: CurrencyTranslation | None = None
+    unit_conversion: UnitConversion | None = None
+    display_hierarchy: DisplayHierarchy | None = None
+    # Local aggregation for a structure member (STRMEM_LAGGR). Overrides how this one element
+    # combines, independently of the key figure's own aggregation.
+    local_aggregation: AggregationRule | None = None
+    local_aggregation_direction: str | None = None
+    total_suppression: str | None = None
+    total_suppressed: bool = False
+    display: str | None = None
+    hidden: bool = False
+    sign_inverted: bool = False
+    constant_selection: bool = False
+    cumulative: bool = False
+    key_date: str | None = None
+    key_date_source: ValueSource | None = None
+    changes_the_number: list[str] = Field(default_factory=list)
+    provenance: Provenance
+
+
 class QueryElement(BaseModel):
     """One node of the query's element tree."""
 
@@ -117,6 +235,9 @@ class QueryElement(BaseModel):
     # is the normal case for a characteristic or a plain key-figure reference.
     standard_aggregation: AggregationRule | None = None
     exception_aggregation: ExceptionAggregation | None = None
+    # RSZELTPROP settings. Absent when the element has no row there, or when the table is
+    # unavailable on this release - in which case the query carries a caveat saying so.
+    properties: ElementProperties | None = None
     provenance: Provenance
 
 

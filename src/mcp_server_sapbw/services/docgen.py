@@ -30,6 +30,7 @@ from ..models.hana import HanaCrossingReport
 from ..models.lineage import LineageGraph
 from ..models.provenance import UnsupportedResult
 from ..models.providers import ObjectNotFound, Provider
+from ..models.queries import Query
 from ..repositories.base import Repository
 from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
@@ -139,6 +140,8 @@ def _render_description(description: Description | None) -> str:
 
 # How many attributes a provider page renders before eliding. A characteristic can carry 175.
 _MAX_ATTRIBUTES = 60
+# How many value-altering elements a query page lists before eliding.
+_MAX_ALTERED_ELEMENTS = 40
 
 
 def _render_attributes(provider: Provider) -> list[str]:
@@ -175,6 +178,33 @@ def _render_attributes(provider: Provider) -> list[str]:
         )
     if len(provider.attributes) > _MAX_ATTRIBUTES:
         lines.append(f"\n_Showing {_MAX_ATTRIBUTES} of {len(provider.attributes)} attributes._")
+    lines.append("")
+    return lines
+
+
+def _render_value_altering_elements(query: Query) -> list[str]:
+    """The elements that do something to their own value before it is displayed.
+
+    This is the section someone reads when two people disagree about a figure from one report. Only
+    settings that change the number appear; formatting choices stay out, because listing them here
+    would bury the ones that matter.
+    """
+    altered = [e for e in query.elements if e.properties and e.properties.changes_the_number]
+    if not altered:
+        return []
+    lines = [
+        "## Elements that change their own value",
+        "",
+        "The figure each of these shows is not the plain sum of the records behind it.",
+        "",
+        "| Element | Type | What happens to the value |",
+        "|---|---|---|",
+    ]
+    for element in altered[:_MAX_ALTERED_ELEMENTS]:
+        reasons = "; ".join(element.properties.changes_the_number) if element.properties else ""
+        lines.append(f"| `{element.name or element.eltuid}` | {element.element_type} | {reasons} |")
+    if len(altered) > _MAX_ALTERED_ELEMENTS:
+        lines.append(f"\n_Showing {_MAX_ALTERED_ELEMENTS} of {len(altered)} elements._")
     lines.append("")
     return lines
 
@@ -1213,6 +1243,7 @@ class DocGenerator(Repository):
                 f"- Elements: {len(query.elements)}, variables: {len(query.variables)}",
                 "",
             ]
+            lines += _render_value_altering_elements(query)
             for caveat in query.caveats:
                 self._gaps.add(f"query {label}", caveat)
         lineage = self._unwrap("queries", self._queries.get_query_lineage(compuid))

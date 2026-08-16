@@ -25,6 +25,7 @@ from fastmcp.tools.tool import ToolResult
 from fastmcp.utilities.types import Image
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import __version__
 from .connectors.base import ConnectorRegistry
 from .connectors.bi import FileBiConnector
 from .connectors.ecc import EccConnector
@@ -363,7 +364,12 @@ class ServerRuntime:
         if not self._profiles.get(system).cache_enabled:
             return None
         record = self.capability(system)
-        fingerprint = record.discovered_at.isoformat()
+        # The server version is part of the fingerprint, not just the discovery timestamp. An
+        # upgrade that widens an extract - a new optional field on a cached model - would otherwise
+        # keep validating against the old cached JSON, and the new field would read as absent for
+        # the whole TTL. The customer would see a feature they installed reporting nothing, with no
+        # error to explain it. Retiring the cache on upgrade costs one re-read and cannot mislead.
+        fingerprint = f"{__version__}|{record.discovered_at.isoformat()}"
         existing = self._caches.get(system)
         if existing is not None:
             if existing[0] == fingerprint:
