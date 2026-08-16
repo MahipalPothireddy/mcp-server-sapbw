@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field, model_validator
 
 #: Every kind of object this server can name. One closed vocabulary; anything untypable is
 #: ``unknown`` rather than a second spelling of it.
@@ -197,6 +197,32 @@ class BwObjectRef(BaseModel):
     #: Raw type code or subtype as BW stored it (TLOGO, CUBETYPE, ODSOTYPE, IOBJTP), kept so an
     #: undecoded value stays visible instead of being flattened into the canonical type.
     subtype: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_own_serialised_form(cls, data: object) -> object:
+        """Let a serialised reference validate back into one.
+
+        ``id`` is a computed field, so it is written on the way out but forbidden on the way in -
+        ``extra="forbid"`` makes the model unable to read its own JSON. Anything that persists or
+        transports a response hits this: the snapshot store, a cached graph, a resource payload.
+
+        A supplied ``id`` carries no information, since it is a function of the other two fields, so
+        it is dropped. It is not ignored blindly: an ``id`` that contradicts the type and name it
+        travelled with means the two were changed apart, and that is raised rather than quietly
+        resolved in favour of one of them.
+        """
+        if not isinstance(data, dict) or "id" not in data:
+            return data
+        supplied = data["id"]
+        rest = {k: v for k, v in data.items() if k != "id"}
+        derived = object_id(rest.get("object_type", ""), str(rest.get("name", "")))
+        if isinstance(supplied, str) and supplied and supplied != derived:
+            raise ValueError(
+                f"object reference id {supplied!r} contradicts its type and name (would be "
+                f"{derived!r}); id is derived and must not be edited independently"
+            )
+        return rest
 
     @computed_field  # type: ignore[prop-decorator]
     @property

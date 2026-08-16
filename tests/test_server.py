@@ -18,6 +18,7 @@ from pydantic import SecretStr
 from mcp_server_sapbw import server
 from mcp_server_sapbw.connectors.ecc import AdtResponse, EccConnector
 from mcp_server_sapbw.core.profiles import EccProfile
+from mcp_server_sapbw.core.snapshots import IN_MEMORY, SnapshotStore
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.ecc import ConnectorUnavailable
 from mcp_server_sapbw.models.provenance import UnsupportedResult
@@ -39,6 +40,7 @@ from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
 from mcp_server_sapbw.services.lineage import LineageService
 from mcp_server_sapbw.services.load_closure import LoadClosureService
 from mcp_server_sapbw.services.routine_register import RoutineRegisterService
+from mcp_server_sapbw.services.snapshot import SnapshotService
 
 _TABLES = {
     "chain_attr": "RSPCCHAINATTR",
@@ -111,6 +113,8 @@ class _Conn:
                 return []
             return [("E", "Sales orders", "Daily sales order line items")]  # describe text
         if "RSDODSO" in sql:
+            if "BEXFL" in sql:  # snapshot capture: ODSOBJECT, ODSOTYPE, INFOAREA, BEXFL
+                return [("SALES_DSO", "", "SALES", "X"), ("STAGE_DSO", "", "SALES", "")]
             if "ODSOTYPE" in sql:  # describe header
                 return [("", "SALES", "DEVUSER", "SD")]
             return [("SALES_DSO",)]  # search-by-name query (ODSOBJECT)
@@ -169,6 +173,12 @@ class _Conn:
     def _rstran(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
         # Synthetic flow: DS_A --TR1--> ADSO_T (TR1 has start routine CODE1).
         name = str(params[-1]) if params else ""
+        if "TRANID, SOURCETYPE, SOURCENAME" in sql:  # snapshot capture, 9 columns
+            # The DataSource endpoint carries its logical system the way BW stores it, so the
+            # tool-level test exercises the BDLS normalisation rather than a tidy name.
+            return [
+                ("TR1", "RSDS", "DS_A   BWCLNT100", "ADSO", "ADSO_T", "ACT", "C1", "", "", "", "")
+            ]
         # B9 analyzer query shapes -> empty here (analyzer data is covered in test_analyzers;
         # these contract tests only prove the tool -> analyzer -> MCP-client path and shape).
         if (
@@ -202,6 +212,7 @@ class _Conn:
 class FakeRuntime:
     def __init__(self) -> None:
         self._cap = _capability()
+        self._snapshot_store: SnapshotStore | None = None
 
     def list_systems(self) -> list[SystemStatus]:
         return [SystemStatus(name="qa", status="discovered", release="7.50", read_only_user=True)]
@@ -267,6 +278,21 @@ class FakeRuntime:
 
     def routine_register(self, system: str) -> RoutineRegisterService:
         return RoutineRegisterService(_Conn(), self._cap)
+
+    def snapshots(self, system: str) -> SnapshotService:
+        return SnapshotService(_Conn(), self._cap)
+
+    def snapshot_store(self, system: str) -> SnapshotStore | None:
+        """An in-memory store, fresh per fake runtime.
+
+        Not ``None``: returning nothing would exercise only the no-store branch, and the store is
+        where the round trip that carries a snapshot between two calls actually happens. In memory
+        rather than in a temporary file so the suite writes no customer-shaped metadata to disk and
+        nothing has to be cleaned up afterwards; on-disk behaviour is covered in test_snapshot.
+        """
+        if self._snapshot_store is None:
+            self._snapshot_store = SnapshotStore(IN_MEMORY)
+        return self._snapshot_store
 
     def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
         """No source system is configured in the fixture, mirroring a BW-only install."""
@@ -427,6 +453,96 @@ def test_hana_crossings_via_client() -> None:
     payload = result.structured_content
     body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
     assert body["total_count"] == 0  # empty fixture; the tool path works end to end
+
+
+# --- snapshots and environment comparison -------------------------------------------------
+
+
+def test_create_snapshot_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    result = asyncio.run(
+        _call("bw_create_snapshot", {"system": "qa", "families": ["providers", "transformations"]})
+    )
+    body = _report_body(result)
+    assert body["system"] == "qa"
+    assert body["snapshot_id"].startswith("qa-")
+    assert {o["ref"]["id"] for o in body["objects"]} >= {"dso:SALES_DSO", "transformation:TR1"}
+    assert body["scope"]["families"] == ["providers", "transformations"]
+    # The DataSource endpoint's logical system is stripped from the edge, not carried into it.
+    assert body["edges"][0]["src"] == "datasource:DS_A"
+
+
+def test_create_snapshot_rejects_an_unknown_family_by_name() -> None:
+    """A misspelled family must not silently produce a snapshot missing that family."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_create_snapshot", {"system": "qa", "families": ["dsos"]}))
+    )
+    assert body["code"] == "invalid_argument"
+    assert "unknown snapshot families" in body["message"]
+    assert "providers" in body["message"]  # names the valid set rather than just refusing
+
+
+def test_list_snapshots_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    asyncio.run(_call("bw_create_snapshot", {"system": "qa", "families": ["providers"]}))
+    body = _report_body(asyncio.run(_call("bw_list_snapshots", {"system": "qa"})))
+    assert body["snapshots"], "a stored snapshot did not come back from listing"
+    assert body["snapshots"][0]["object_count"] > 0
+    assert "objects" not in body["snapshots"][0]  # summaries only
+
+
+def test_list_snapshots_without_a_system_says_which_one_to_name() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(asyncio.run(_call("bw_list_snapshots", {})))
+    assert body["snapshots"] == []
+    assert any("per profile" in c for c in body["caveats"])
+
+
+def test_compare_snapshots_against_the_system_as_it_is_now() -> None:
+    """The 'what changed since then' path: one stored id, no second capture by the caller."""
+    server.set_runtime(FakeRuntime())
+    created = _report_body(
+        asyncio.run(_call("bw_create_snapshot", {"system": "qa", "families": ["providers"]}))
+    )
+    body = _report_body(
+        asyncio.run(_call("bw_compare_snapshots", {"system": "qa", "left": created["snapshot_id"]}))
+    )
+    assert body["counts"]["changed"] == 0
+    assert body["counts"]["unchanged"] > 0
+    assert body["families_compared"] == ["providers"]
+
+
+def test_compare_snapshots_reports_an_unknown_id_as_not_found() -> None:
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(_call("bw_compare_snapshots", {"system": "qa", "left": "qa-19700101T000000Z"}))
+    )
+    assert body["code"] == "object_not_found"
+
+
+def test_compare_systems_via_client() -> None:
+    """Two profiles, captured and diffed in one call, with the corrections applied stated."""
+    server.set_runtime(FakeRuntime())
+    body = _report_body(
+        asyncio.run(
+            _call(
+                "bw_compare_systems",
+                {"left_system": "qa", "right_system": "prd", "families": ["providers"]},
+            )
+        )
+    )
+    assert body["left"]["system"] == "qa" and body["right"]["system"] == "prd"
+    joined = " ".join(body["normalisations"])
+    assert "logical system" in joined and "fingerprint" in joined
+
+
+def test_cache_status_reports_snapshots_alongside_the_cache() -> None:
+    """A snapshot is the larger body of customer metadata at rest, so it has to be reported."""
+    runtime = FakeRuntime()
+    server.set_runtime(runtime)
+    body = _report_body(asyncio.run(_call("bw_cache_status", {"system": "qa"})))
+    assert "snapshots" in body and "snapshot_size_bytes" in body
 
 
 def test_registered_tool_names_are_valid() -> None:

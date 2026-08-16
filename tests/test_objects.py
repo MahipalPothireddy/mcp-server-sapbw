@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import typing
 
+import pytest
+from pydantic import ValidationError
+
 from mcp_server_sapbw.models.lineage import LineageNode, LineageNodeType
 from mcp_server_sapbw.models.objects import (
     PROVIDER_TYPES,
@@ -103,6 +106,29 @@ def test_ref_from_an_undocumented_tlogo_code_stays_visible() -> None:
 
 def test_id_is_serialised_so_a_client_sees_it() -> None:
     assert BwObjectRef(object_type="dso", name="A").model_dump()["id"] == "dso:A"
+
+
+def test_a_reference_can_read_its_own_json() -> None:
+    """`id` is computed, so it is written out but forbidden on the way in unless handled.
+
+    Anything that persists or transports a response depends on this: the snapshot store, a cached
+    graph, a resource payload.
+    """
+    ref = BwObjectRef(object_type="dso", name="SALES_DSO", subtype="ODSO")
+    assert BwObjectRef.model_validate_json(ref.model_dump_json()) == ref
+    assert BwObjectRef.model_validate(ref.model_dump()) == ref
+
+
+def test_a_reference_whose_id_contradicts_its_name_is_rejected() -> None:
+    """A supplied id is dropped, not trusted - but a contradiction means they were changed apart."""
+    with pytest.raises(ValidationError, match="contradicts its type and name"):
+        BwObjectRef.model_validate({"object_type": "dso", "name": "A", "id": "adso:A"})
+
+
+def test_a_misspelled_field_is_still_forbidden() -> None:
+    """Accepting `id` must not have opened the model to anything else."""
+    with pytest.raises(ValidationError):
+        BwObjectRef.model_validate({"object_type": "dso", "name": "A", "subtyp": "ODSO"})
 
 
 # --- the vocabularies stay aligned --------------------------------------------------------

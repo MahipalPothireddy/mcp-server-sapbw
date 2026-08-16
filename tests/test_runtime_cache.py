@@ -19,6 +19,7 @@ from pydantic import SecretStr
 
 from mcp_server_sapbw.core.profiles import Profile
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from mcp_server_sapbw.models.snapshot import Snapshot
 from mcp_server_sapbw.server import ServerRuntime
 
 SCHEMA = "TESTSCHEMA"
@@ -64,6 +65,9 @@ class _Resolver:
 
 
 class _Profiles:
+    def __init__(self, *, cache_enabled: bool = True) -> None:
+        self._cache_enabled = cache_enabled
+
     def get(self, name: str) -> Profile:
         return Profile(
             name=name,
@@ -73,6 +77,7 @@ class _Profiles:
             password=SecretStr("unused-in-this-test"),
             abap_schema=SCHEMA,
             read_only_user=False,
+            cache_enabled=self._cache_enabled,
         )
 
     def names(self) -> list[str]:
@@ -85,10 +90,10 @@ class _Profiles:
         return None
 
 
-def _runtime(tmp_path: Path) -> tuple[ServerRuntime, _Resolver]:
+def _runtime(tmp_path: Path, *, cache_enabled: bool = True) -> tuple[ServerRuntime, _Resolver]:
     resolver = _Resolver()
     runtime = ServerRuntime(
-        _Profiles(),  # type: ignore[arg-type]
+        _Profiles(cache_enabled=cache_enabled),  # type: ignore[arg-type]
         _Pool(),  # type: ignore[arg-type]
         resolver,  # type: ignore[arg-type]
         cache_dir=tmp_path / "cache",
@@ -181,3 +186,81 @@ def test_unwritable_cache_dir_degrades_instead_of_failing(tmp_path: Path) -> Non
     assert runtime._cache("qa") is None
     assert runtime.transformations("qa")._cache is None  # still usable
     assert runtime.refresh_cache("qa", "all").removed == 0
+
+
+# --- the snapshot store is the other thing at rest ----------------------------------------
+
+
+def test_snapshot_store_lives_beside_the_cache(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path)
+    store = runtime.snapshot_store("qa")
+    assert store is not None
+    assert store.path.parent == tmp_path / "cache"
+    assert store.path.name == "qa.snapshots.sqlite"
+
+
+def test_one_snapshot_store_per_profile(tmp_path: Path) -> None:
+    runtime, _ = _runtime(tmp_path)
+    assert runtime.snapshot_store("qa") is runtime.snapshot_store("qa")
+
+
+def test_a_capability_refresh_does_not_retire_a_snapshot(tmp_path: Path) -> None:
+    """The deliberate difference from the extract cache.
+
+    A cached extract must not outlive the release picture it was read under, so a refresh retires
+    it. A snapshot must: it is a record of how the system looked at a moment, and losing the
+    baseline on a refresh would remove the only thing that makes "what changed" answerable.
+    """
+    runtime, _ = _runtime(tmp_path)
+    before = runtime.snapshot_store("qa")
+    runtime.refresh_capabilities("qa")
+    assert runtime.snapshot_store("qa") is before
+
+
+def test_no_snapshot_store_when_the_profile_keeps_nothing_at_rest(tmp_path: Path) -> None:
+    """Same switch as the extract cache: a snapshot names every object in the system."""
+    runtime, _ = _runtime(tmp_path, cache_enabled=False)
+    assert runtime.snapshot_store("qa") is None
+    assert not list((tmp_path / "cache").glob("*.snapshots.sqlite"))
+
+
+def test_cache_status_does_not_create_the_snapshot_file(tmp_path: Path) -> None:
+    """A status report must not become the cause of what it reports."""
+    runtime, _ = _runtime(tmp_path)
+    status = runtime.cache_status("qa")
+    assert status.snapshots == 0
+    assert status.snapshot_location is None
+    assert not (tmp_path / "cache" / "qa.snapshots.sqlite").exists()
+
+
+def test_cache_status_reports_stored_snapshots(tmp_path: Path) -> None:
+    """The compliance answer has to cover both stores, not just the smaller one."""
+    runtime, _ = _runtime(tmp_path)
+    store = runtime.snapshot_store("qa")
+    assert store is not None
+    store.put(
+        Snapshot(
+            snapshot_id="qa-20260101T000000Z",
+            system="qa",
+            taken_at=datetime(2026, 1, 1, tzinfo=UTC),
+            bw_release="7.50",
+            abap_schema=SCHEMA,
+            server_version="0",
+        )
+    )
+    status = runtime.cache_status("qa")
+    assert status.snapshots == 1
+    assert status.snapshot_size_bytes > 0
+    assert status.snapshot_location == str(tmp_path / "cache")
+
+
+def test_an_unwritable_directory_yields_no_snapshot_store(tmp_path: Path) -> None:
+    blocker = tmp_path / "blocked"
+    blocker.write_text("not a directory", encoding="utf-8")
+    runtime = ServerRuntime(
+        _Profiles(),  # type: ignore[arg-type]
+        _Pool(),  # type: ignore[arg-type]
+        _Resolver(),  # type: ignore[arg-type]
+        cache_dir=blocker / "cache",
+    )
+    assert runtime.snapshot_store("qa") is None

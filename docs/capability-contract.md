@@ -140,10 +140,10 @@ by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 
 | Capability | Object | Validation | Notes |
 |---|---|---|---|
-| `abap_profile_auth` | `UST10S` | `not_validated` | See abap_user_profile. |
-| `abap_role_auth` | `AGR_1251` | `not_validated` | See abap_user_profile. |
-| `abap_user_profile` | `UST04` | `not_validated` | UST04/UST10S/AGR_USERS/AGR_1251 tie a BW user to their ABAP roles and profiles. The security tools report analysis-authorisation shape and assignment; the ABAP role side would show how a user comes to hold one. |
-| `abap_user_role` | `AGR_USERS` | `not_validated` | See abap_user_profile. |
+| `abap_profile_auth` | `UST10S` | `not_validated` | See abap_user_profile - client filter required. |
+| `abap_role_auth` | `AGR_1251` | `not_validated` | See abap_user_profile - client filter required. |
+| `abap_user_profile` | `UST04` | `not_validated` | UST04/UST10S/AGR_USERS/AGR_1251 tie a BW user to their ABAP roles and profiles. The security tools report analysis-authorisation shape and assignment; the ABAP role side would show how a user comes to hold one. REQUIRES A CLIENT: unlike every BW RS* table, these four are client-dependent with MANDT as the leading key field, so a reader must filter on the profile's client or it merges other clients' assignments into the answer. |
+| `abap_user_role` | `AGR_USERS` | `not_validated` | See abap_user_profile - client filter required. |
 | `comm_structure` | `RSKS` | `not_validated` | RSKS/RSKSFIELDNEW hold the 3.x communication structure between transfer rules and update rules. bw_list_update_rules reports the update rules; the structure between them is not yet resolved. |
 | `comm_structure_field` | `RSKSFIELDNEW` | `not_validated` | See comm_structure. |
 | `dtp_request` | `RSBKREQUEST` | `not_validated` | RSBKREQUEST holds per-DTP request history. Provider currency currently comes from RSSTATMANPART; this would add per-DTP durations and record counts. |

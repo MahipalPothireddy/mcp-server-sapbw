@@ -37,11 +37,12 @@ from .core.budget import (
 )
 from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
-from .core.connection import ReadOnlyConnectionPool
+from .core.connection import ReadOnlyConnection, ReadOnlyConnectionPool
 from .core.logging import configure as configure_logging
 from .core.logging import get_logger
 from .core.paths import cache_dir as default_cache_dir
 from .core.profiles import ProfileManager
+from .core.snapshots import SnapshotStore, snapshot_file
 from .models.capability import CapabilityRecord, CapabilityReport
 from .models.chains import (
     Chain,
@@ -57,6 +58,7 @@ from .models.errors import (
     ErrorCategory,
     ErrorCode,
     derive_failure_fields,
+    error,
     from_exception,
 )
 from .models.findings import ScenarioReport
@@ -73,6 +75,7 @@ from .models.security import (
     QueryAuthExposure,
     SecurityOverview,
 )
+from .models.snapshot import Snapshot, SnapshotDiff, SnapshotSummary
 from .models.sources import EnhancementInventory, SourceTopology
 from .models.threex import ThreeXFlowReport, TransferRule, UpdateRule
 from .models.transformations import (
@@ -100,6 +103,8 @@ from .services.exit_analysis import ExitAnalysisService
 from .services.lineage import LineageService
 from .services.load_closure import LoadClosureService
 from .services.routine_register import RoutineRegisterService
+from .services.snapshot import SnapshotService, families_for
+from .services.snapshot import compare as compare_snapshots
 
 _TOOL_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
@@ -169,6 +174,11 @@ class CacheStatus(BaseModel):
 
     ``entries_by_type`` uses the same object-type names as the ``bw_refresh_cache`` scope, so a
     reader can see what is retained and purge exactly that.
+
+    Snapshots are reported alongside the cache because they are the *other* thing at rest, and the
+    larger of the two by object count: a snapshot names every provider, transformation and chain in
+    the system. They differ from the cache in one way that matters to an operator: the cache expires
+    on a TTL, a snapshot never does, because a baseline that vanished would defeat its purpose.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -182,6 +192,10 @@ class CacheStatus(BaseModel):
     entries_by_type: dict[str, int] = Field(default_factory=dict)
     structural_ttl_seconds: int | None = None
     runtime_ttl_seconds: int | None = None
+    #: Stored snapshots for this profile, and their size. Retained until deleted, not by TTL.
+    snapshots: int = 0
+    snapshot_size_bytes: int = 0
+    snapshot_location: str | None = None
     note: str | None = None
 
 
@@ -212,6 +226,15 @@ class BudgetResult(BaseModel):
             self.code, self.category, self.retryable, self.remedy
         )
         return self
+
+
+class SnapshotListResult(BaseModel):
+    """Stored snapshots as summaries. Payloads are large, so listing never returns them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snapshots: list[SnapshotSummary] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
 
 
 class ChainListResult(BaseModel):
@@ -324,6 +347,8 @@ class Runtime(Protocol):
         self, system: str, query: str
     ) -> QueryAuthExposure | UnsupportedResult: ...
     def routine_register(self, system: str) -> RoutineRegisterService: ...
+    def snapshots(self, system: str) -> SnapshotService: ...
+    def snapshot_store(self, system: str) -> SnapshotStore | None: ...
     def exit_analysis(
         self, ecc_system: str | None
     ) -> ExitAnalysisService | ConnectorUnavailable: ...
@@ -349,18 +374,27 @@ class ServerRuntime:
         self._capabilities: dict[str, CapabilityRecord] = {}
         # system -> (capability fingerprint, open cache). Retired when the fingerprint changes.
         self._caches: dict[str, tuple[str, SqliteCache]] = {}
+        # system -> open snapshot store. Deliberately NOT keyed on the capability fingerprint: a
+        # snapshot is a record of what was true then, and a capability refresh must not retire it.
+        self._snapshot_stores: dict[str, SnapshotStore] = {}
 
     @classmethod
     def from_env(cls) -> "ServerRuntime":
         return cls(ProfileManager(), ReadOnlyConnectionPool(), CapabilityResolver())
 
-    def _connection(self, system: str) -> object:
+    def _connection(self, system: str) -> ReadOnlyConnection:
+        """The pooled read-only connection for a profile.
+
+        Typed concretely rather than as ``object``. It was the latter, which forced every one of the
+        nine call sites that pass it to a repository to carry a ``type: ignore`` - so the annotation
+        was costing nine suppressions to avoid one import.
+        """
         return self._pool.acquire(self._profiles.get(system))
 
     def capability(self, system: str, *, refresh: bool = False) -> CapabilityRecord:
         record = self._capabilities.get(system)
         if refresh or record is None or record.is_expired():
-            record = self._resolver.resolve(self._profiles.get(system), self._connection(system))  # type: ignore[arg-type]
+            record = self._resolver.resolve(self._profiles.get(system), self._connection(system))
             self._capabilities[system] = record
         return record
 
@@ -431,6 +465,13 @@ class ServerRuntime:
                 note="the cache could not be opened; the server is running uncached",
             )
         counts = cache.entry_counts()
+        # Only report the snapshot file if one already exists. Opening the store to answer a status
+        # question would create an empty database and make the report the cause of the thing it
+        # reports.
+        snapshot_path = snapshot_file(system, self._cache_dir)
+        snapshots = self._snapshot_stores.get(system)
+        if snapshots is None and snapshot_path.exists():
+            snapshots = self.snapshot_store(system)
         return CacheStatus(
             system=system,
             enabled=True,
@@ -441,11 +482,14 @@ class ServerRuntime:
             entries_by_type=counts,
             structural_ttl_seconds=cache.structural_ttl,
             runtime_ttl_seconds=cache.runtime_ttl,
+            snapshots=snapshots.count(system=system) if snapshots is not None else 0,
+            snapshot_size_bytes=snapshots.size_bytes() if snapshots is not None else 0,
+            snapshot_location=str(self._cache_dir) if snapshot_path.exists() else None,
         )
 
     def chains(self, system: str) -> ChainsRepository:
         return ChainsRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             self._cache(system),
         )
@@ -457,7 +501,7 @@ class ServerRuntime:
 
     def search(self, system: str) -> SearchRepository:
         return SearchRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             self._cache(system),
         )
@@ -479,7 +523,7 @@ class ServerRuntime:
 
     def hana(self, system: str) -> HanaRepository:
         return HanaRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             self._cache(system),
         )
@@ -554,6 +598,30 @@ class ServerRuntime:
             registry=self._registry(system),
         )
 
+    def snapshots(self, system: str) -> SnapshotService:
+        # No extract cache: a snapshot is a point-in-time reading, and serving one from a cache
+        # populated hours ago would date the very thing being measured.
+        return SnapshotService(self._connection(system), self.capability(system))
+
+    def snapshot_store(self, system: str) -> SnapshotStore | None:
+        """The per-profile snapshot store, or ``None`` when the profile keeps nothing at rest.
+
+        A snapshot names every provider, transformation and chain in a system, so it honours the
+        same `cache_enabled` switch as the extract cache. With it off, snapshots still work for
+        an immediate comparison; they just are not kept.
+        """
+        if not self._profiles.get(system).cache_enabled:
+            return None
+        existing = self._snapshot_stores.get(system)
+        if existing is not None:
+            return existing
+        try:
+            store = SnapshotStore(snapshot_file(system, self._cache_dir))
+        except (sqlite3.Error, OSError):
+            return None
+        self._snapshot_stores[system] = store
+        return store
+
     def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
         names = self._profiles.ecc_names()
         connector = self._ecc_connector(ecc_system)
@@ -577,21 +645,21 @@ class ServerRuntime:
 
     def health(self, system: str) -> HealthRepository:
         return HealthRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             self._cache(system),
         )
 
     def sources(self, system: str) -> SourcesRepository:
         return SourcesRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             self._cache(system),
         )
 
     def threex(self, system: str) -> ThreeXRepository:
         return ThreeXRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             self._cache(system),
         )
@@ -603,7 +671,7 @@ class ServerRuntime:
         cache file, and a stale answer to "who can see this" is worse than a slow one.
         """
         return SecurityRepository(
-            self._connection(system),  # type: ignore[arg-type]
+            self._connection(system),
             self.capability(system),
             None,
         )
@@ -662,6 +730,10 @@ class ServerRuntime:
             with suppress(Exception):
                 cache.close()
         self._caches.clear()
+        for store in list(self._snapshot_stores.values()):
+            with suppress(Exception):
+                store.close()
+        self._snapshot_stores.clear()
         with suppress(Exception):
             self._pool.close_all()
         _LOG.info("runtime closed: sessions and cache handles released")
@@ -809,6 +881,138 @@ def bw_capability_report(system: str) -> CapabilityReport:
     one of them is a gap in this server.
     """
     return build_report(runtime().capability(system))
+
+
+@_readonly_tool
+def bw_create_snapshot(
+    system: str, families: list[str] | None = None, keep: bool = True
+) -> Snapshot | BwError:
+    """Capture a system's structural metadata as fingerprints, for comparing later.
+
+    BW answers neither "what changed since last week" nor "what differs between QA and production":
+    a transport log says what moved, not what the result was, and says nothing about a change made
+    outside transport. A snapshot is the missing baseline.
+
+    It holds a fingerprint per object rather than a copy of the metadata, so a system's ~24,000
+    objects fit in a few hundred kilobytes and comparison becomes a set operation. **Only structural
+    facts are fingerprinted** - timestamps, last-changed-by, last-used dates and record counts are
+    never read, because including them would report every object as changed on every run.
+
+    `families` defaults to providers, transformations, chains, datasources and dtps - the
+    dataflow. Add `queries` and `infoobjects` when the question needs them; they are an order of
+    magnitude larger. A family this release cannot report is listed as unavailable, not empty,
+    because a later diff would read empty as deleted.
+
+    With ``keep`` the snapshot is stored under the per-user cache root for later comparison; a
+    profile with ``cache_enabled: false`` keeps nothing, and two snapshots can still be compared in
+    the same session.
+    """
+    try:
+        selected = families_for(families)
+    except ValueError as exc:
+        return error("invalid_argument", str(exc), system=system)
+    captured = runtime().snapshots(system).capture(system=system, families=selected)
+    if isinstance(captured, Snapshot) and keep:
+        store = runtime().snapshot_store(system)
+        if store is not None:
+            store.put(captured)
+        else:
+            captured.caveats.append(
+                "not stored: this profile keeps no metadata at rest (cache_enabled: false), so "
+                "there is nothing to compare against later. Capture both sides in one session, or "
+                "enable the store."
+            )
+    return cast("Snapshot | BwError", captured)
+
+
+@_readonly_tool
+def bw_list_snapshots(system: str | None = None, limit: int = 50) -> SnapshotListResult:
+    """Stored snapshots, newest first, as summaries rather than payloads."""
+    store = runtime().snapshot_store(system) if system else None
+    if system and store is None:
+        return SnapshotListResult(
+            snapshots=[],
+            caveats=[
+                f"profile {system!r} keeps no metadata at rest (cache_enabled: false), so no "
+                "snapshot has been stored for it."
+            ],
+        )
+    if store is None:
+        return SnapshotListResult(
+            snapshots=[],
+            caveats=["name a system: snapshots are stored per profile."],
+        )
+    return SnapshotListResult(snapshots=store.list(system=system, limit=max(1, min(limit, 500))))
+
+
+@_readonly_tool
+def bw_compare_snapshots(
+    system: str, left: str, right: str | None = None
+) -> SnapshotDiff | BwError:
+    """Diff two stored snapshots of the same system: what was added, removed or changed.
+
+    ``left`` is the baseline. Omit ``right`` to compare the baseline against a freshly captured
+    reading of the system as it is now - the "what changed since then" question.
+
+    Read ``comparable`` first. False means the two sides can report different things, so an absence
+    on one side is not evidence of a difference; the diff is still returned, restricted to what both
+    sides can see, and ``comparability`` says what was excluded and why. A ``changed`` object names
+    the individual facts that differ, with both values.
+    """
+    store = runtime().snapshot_store(system)
+    if store is None:
+        return error(
+            "connector_not_configured",
+            f"profile {system!r} keeps no metadata at rest, so no snapshot is stored for it",
+            system=system,
+        )
+    baseline = store.get(left)
+    if baseline is None:
+        return error("object_not_found", f"no stored snapshot {left!r}", system=system, id=left)
+    if right is None:
+        current = (
+            runtime().snapshots(system).capture(system=system, families=baseline.scope.families)
+        )
+        if not isinstance(current, Snapshot):
+            return cast("BwError", current)
+    else:
+        found = store.get(right)
+        if found is None:
+            return error(
+                "object_not_found", f"no stored snapshot {right!r}", system=system, id=right
+            )
+        current = found
+    return compare_snapshots(baseline, current)
+
+
+@_readonly_tool
+def bw_compare_systems(
+    left_system: str, right_system: str, families: list[str] | None = None
+) -> SnapshotDiff | BwError:
+    """Compare two systems as they are now: DEV against QA, QA against production.
+
+    Captures both sides and diffs them, so nothing has to be stored first. Three corrections are
+    applied before anything is called a difference, and all three are reported:
+
+    * **Capability parity.** A metadata table present on one system and absent on the other would
+      surface as thousands of removed objects. Families only one side can report are excluded.
+    * **Environment-specific names.** A DataSource endpoint carries its logical system, which BDLS
+      rewrites per environment - comparing raw would make every DataSource look replaced. The
+      logical system is kept as a *fact* instead, so a real difference shows as one changed fact.
+    * **Volatile facts.** Timestamps and counters are never fingerprinted, so a difference is
+      structural.
+    """
+    try:
+        selected = families_for(families)
+    except ValueError as exc:
+        return error("invalid_argument", str(exc), left=left_system, right=right_system)
+    left = runtime().snapshots(left_system).capture(system=left_system, families=selected)
+    if not isinstance(left, Snapshot):
+        return cast("BwError", left)
+    right = runtime().snapshots(right_system).capture(system=right_system, families=selected)
+    if not isinstance(right, Snapshot):
+        return cast("BwError", right)
+    return compare_snapshots(left, right)
 
 
 @_readonly_tool

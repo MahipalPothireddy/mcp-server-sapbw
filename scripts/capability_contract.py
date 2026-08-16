@@ -329,15 +329,24 @@ DECLARED_STATE: dict[str, tuple[str, str]] = {
         "column-level lineage inside a calc view is not implemented.",
     ),
     "hana_view_columns": ("PARTIAL", "See hana_columns."),
+    # These four are the ONLY declared tables that are genuinely client-dependent, and the
+    # requirement is recorded here because implementing them without it would silently merge
+    # several clients' role assignments into one answer. Measured on the reference system: MANDT is
+    # the leading KEY field of all four, and they hold rows for clients 000/001/066/100 - AGR_1251
+    # returns 182,996 rows across clients where only client 100's 83,858 are relevant. Every RS*
+    # table is client-independent; RSPCCHAINATTR carries a MANDT column but at position 17, not in
+    # the key, and every row holds blank.
     "abap_user_profile": (
         "PLANNED",
         "UST04/UST10S/AGR_USERS/AGR_1251 tie a BW user to their ABAP roles and profiles. The "
         "security tools report analysis-authorisation shape and assignment; the ABAP role side "
-        "would show how a user comes to hold one.",
+        "would show how a user comes to hold one. REQUIRES A CLIENT: unlike every BW RS* table, "
+        "these four are client-dependent with MANDT as the leading key field, so a reader must "
+        "filter on the profile's client or it merges other clients' assignments into the answer.",
     ),
-    "abap_profile_auth": ("PLANNED", "See abap_user_profile."),
-    "abap_user_role": ("PLANNED", "See abap_user_profile."),
-    "abap_role_auth": ("PLANNED", "See abap_user_profile."),
+    "abap_profile_auth": ("PLANNED", "See abap_user_profile - client filter required."),
+    "abap_user_role": ("PLANNED", "See abap_user_profile - client filter required."),
+    "abap_role_auth": ("PLANNED", "See abap_user_profile - client filter required."),
 }
 
 

@@ -12,7 +12,7 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **46 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **50 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -69,6 +69,9 @@ onboarding exercise, not a development one.
 - **Source-system topology** — which systems feed the warehouse, and which DataSources carry
   extractor enhancements; optionally the exit ABAP itself, read from the source system over ADT.
 - **Descriptions** — for every object, with explicit provenance (stored vs. generated).
+- **Snapshots & environment comparison** — what changed since last week, and what differs between
+  QA and production, with the BDLS rewrite and locally-rebuilt objects corrected for rather than
+  reported as thousands of differences.
 - **Risk analyzers** — the eight landscape-specific analyses (latency contracts, schedule risk,
   layer violations including circular dependencies of any length) plus decommission-candidate
   detection.
@@ -228,7 +231,53 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_system_profile` | `system` | Release, ABAP schema, object-model variants, log window, table presence/counts |
 | `bw_refresh_capabilities` | `system` | Re-run capability discovery, replacing the cached record |
 | `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
+| `bw_cache_status` | `system` | What extracted metadata and how many snapshots are on local disk, and where |
 | `bw_refresh_cache` | `system`, `scope="all"` | Invalidate cached extracts by scope |
+
+### Snapshots and environment comparison
+
+BW answers neither "what changed since last week" nor "what differs between QA and production". A
+transport log says what *moved*, not what the result was, and nothing at all about a change made
+outside transport.
+
+| Tool | Parameters | Purpose |
+|---|---|---|
+| `bw_create_snapshot` | `system`, `families?`, `keep=true` | Capture the system's structure as fingerprints, for comparing later |
+| `bw_list_snapshots` | `system?`, `limit=50` | Stored snapshots, newest first, as summaries |
+| `bw_compare_snapshots` | `system`, `left`, `right?` | Diff two stored snapshots — or a stored one against the system as it is now |
+| `bw_compare_systems` | `left_system`, `right_system`, `families?` | Capture both systems and diff them: DEV vs QA, QA vs production |
+
+A snapshot holds a **fingerprint per object, not a copy of the metadata**: a reference system's
+4,542 dataflow objects take 1.4 MB and 2 seconds, and comparison becomes a set operation.
+`families` defaults to providers, transformations, chains, DataSources and DTPs; `queries` and
+`infoobjects` are available and an order of magnitude larger.
+
+Four corrections are applied before anything is called a difference, and each is reported rather
+than assumed. All four were found by running the comparison against two real environments — every
+one of them, left unhandled, produces a diff that looks authoritative and carries no information:
+
+- **Volatile facts are never read.** Timestamps, last-changed-by, last-used dates and record counts
+  are not selected at all, so they cannot reach a fingerprint. Include them and every object is
+  "changed" on every run.
+- **Environment-specific names are separated from identities.** A DataSource endpoint is stored as
+  `<DATASOURCE><padding><LOGSYS>` and BDLS rewrites the suffix per environment; 988 of 1,451 DTPs
+  carry one. Split out, the logical system becomes a fact that can differ on its own instead of
+  making every DataSource and DTP look replaced.
+- **Objects re-created under a new technical id are matched on their endpoints.** Transformations
+  and DTPs are named by a generated id: between two real environments only 471 of ~1,270
+  transformation ids matched, while 779 of the 800 "added" were the same dataflow rebuilt by hand.
+  Those pairs are listed in `rekeyed`; `added` and `removed` stay the plain set difference.
+- **Capability parity is checked first.** A metadata table present on one system and absent on the
+  other would surface as thousands of removed objects. Families only one side can report are
+  excluded and named, and `comparable` is set to false.
+
+`changed_by_fact` is the field that makes a large diff readable: on the reference comparison it
+reported 852 `SRC_LOGSYS` + 814 `LOGSYS` + 2 `SRCTLOGO`, so 1,664 of 1,666 changed objects were BDLS
+doing its job and exactly two were real structural differences.
+
+Snapshots honour the same `cache_enabled` switch as the extract cache — a snapshot names every
+provider, transformation and chain in the system, so a profile that keeps nothing at rest gets no
+store, and `bw_compare_systems` (which captures both sides live) still works.
 
 ### Process chains
 

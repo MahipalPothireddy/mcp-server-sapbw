@@ -6,6 +6,79 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — snapshots and environment comparison
+
+Four tools (`bw_create_snapshot`, `bw_list_snapshots`, `bw_compare_snapshots`,
+`bw_compare_systems`) answering the two questions BW itself does not: *what changed since last
+week*, and *what differs between QA and production*. A transport log says what moved, not what the
+result was, and says nothing at all about a change made outside transport.
+
+A snapshot holds a **fingerprint per object, not a copy of the metadata**. On the reference system
+that is 4,542 dataflow objects in 1.4 MB, captured in under two seconds, and comparison becomes a set
+operation. Snapshots are kept in a SQLite store beside the extract cache but deliberately not
+governed by it: a cached extract must not outlive the release picture it was read under, so a
+capability refresh retires it, while a snapshot must survive one or the baseline that makes "what
+changed" answerable is gone. The `cache_enabled: false` switch is honoured — a profile that keeps
+nothing at rest gets no store, and `bw_compare_systems`, which captures both sides live, still works.
+`bw_cache_status` now reports snapshots alongside cached extracts, because a snapshot names every
+provider, transformation and chain in the system and is the larger body of metadata at rest.
+
+**Four corrections are applied before anything is called a difference.** Each was found by running
+the comparison against two real environments, and each one, left unhandled, produces a diff that
+looks authoritative and carries no information whatsoever:
+
+- **Volatile facts are never selected.** Timestamps, last-changed-by, last-used dates and record
+  counts are not read at all, rather than read and filtered — a column never selected cannot reach a
+  fingerprint. Include them and every object is "changed" on every run, which carries the same
+  information as reporting nothing.
+- **Environment-specific names are separated from identities.** A DataSource endpoint is stored as
+  `<DATASOURCE><padding><LOGSYS>` and BDLS rewrites the suffix per environment; 988 of 1,451 active
+  DTPs carry one. Left joined, every DataSource and DTP reads as replaced. Split out, the logical
+  system becomes a fact that can differ on its own — which is what a provider pointed at the wrong
+  source looks like.
+- **Objects re-created under a new technical id are matched on their endpoints.** Transformations and
+  DTPs are named by a generated id. Between two real environments only 471 of ~1,270 transformation
+  ids matched, and 779 of the 800 apparent additions were the same dataflow rebuilt by hand rather
+  than transported. Those pairs are reported in `rekeyed`, with `added` and `removed` left as the
+  plain set difference, because the pairing is an interpretation and the set difference is a fact.
+  Ambiguous cases claim nothing: eight source/target pairs on the reference system carry more than
+  one transformation, so there is no way to say which replaced which.
+- **Capability parity is checked first.** A metadata table present on one system and absent on the
+  other would surface as thousands of removed objects. Families only one side can report are excluded
+  and named, and `comparable` is set to false — an absence is then not evidence of a difference.
+
+`changed_by_fact` is what makes a large diff readable, and it is the field to read first. On the
+reference comparison it reported 852 `SRC_LOGSYS` + 814 `LOGSYS` + 2 `SRCTLOGO`: 1,664 of 1,666
+changed objects were BDLS doing its job, and exactly two were real structural differences. The
+per-object list carries the same information, but only after a reader counts 1,666 rows.
+
+### Fixed — an object reference could not read its own JSON
+
+`BwObjectRef` serialises a computed `id` but sets `extra="forbid"`, so any round trip through JSON
+failed validation on the field the model had just written. That silently broke everything that
+persists or transports a response — found because the snapshot store returned `None` for every
+snapshot it had just written. A supplied `id` is now dropped, since it is a function of the type and
+name; an `id` that *contradicts* them is rejected rather than quietly resolved in favour of one side.
+
+### Fixed — three metadata reads that the mission's table map got wrong
+
+All three were caught by running against BW 7.50 rather than by review, which is the case for
+validating table names at runtime rather than trusting a map:
+
+- `RSTRAN`'s expert-routine column is **`EXPERT`**, not `EXPERTROUTINE`; the latter is rejected as an
+  invalid column name. `GLBCODE`/`GLBCODE2` are now captured too — a global routine is as structural
+  as the other three.
+- The SQL dialect injects `OBJVERS = 'A'` for the `RSD`/`RSO`/`RSZ`/`RSTRAN` families only.
+  `RSPCCHAINATTR` and `RSBKDTP` are versioned but outside it: `RSBKDTP` holds 1,451 active rows
+  against 9,462 in total, and `RSPCCHAINATTR` 280 active chains against 1,463 rows. Read unfiltered,
+  every version of every object collapses onto one id.
+- `RSDCUBE` holds three object kinds behind one table, discriminated by `CUBETYPE` — measured: 74
+  InfoCubes, 67 MultiProviders, 2 virtual providers. Typing them all `infocube` mis-stated 69 of 143
+  objects and broke the canonical id they share with every other tool. Rows sharing a name are now
+  merged rather than overwriting each other as well, since `RSDS` is keyed on `(DATASOURCE, LOGSYS)`
+  and 3 of 949 DataSources are connected to two systems — enough to make two readings of one
+  unchanged system disagree.
+
 ### Changed — "built" and "proven" are now separate columns
 
 `SUPPORTED` was doing two jobs. It meant "a reader exists and a test covers it", but to a customer it
