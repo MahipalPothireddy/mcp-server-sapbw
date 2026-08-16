@@ -104,6 +104,53 @@ def test_absent_capabilities_are_named_in_a_caveat() -> None:
     assert any(absent in c for c in report.caveats)
 
 
+def test_usable_capabilities_are_counted_by_how_well_proven_they_are() -> None:
+    """'usable' says a reader exists and the object is present, not that the pair is proven."""
+    supported = _pick("SUPPORTED")
+    report = build_report(_record({supported: _present(supported, present=True)}))
+    assert sum(report.by_validation.values()) == report.totals["usable"]
+    row = next(r for r in report.capabilities if r.capability == supported)
+    assert row.verdict == "usable"
+    assert row.validation in {
+        "not_validated",
+        "unit_tested",
+        "integration_tested",
+        "customer_validated",
+    }
+
+
+def test_validation_counts_cover_only_the_usable_set() -> None:
+    """How well-proven a capability is only matters for the ones this system can actually use."""
+    absent = _pick("SUPPORTED")
+    report = build_report(_record({absent: _present(absent, present=False)}))
+    assert report.totals.get("absent_on_system") == 1
+    assert absent not in {r.capability for r in report.capabilities if r.verdict == "usable"}
+    assert sum(report.by_validation.values()) == report.totals.get("usable", 0)
+
+
+def test_report_says_when_usable_capabilities_are_unproven() -> None:
+    supported = _pick("SUPPORTED")
+    report = build_report(_record({supported: _present(supported, present=True)}))
+    unproven = report.by_validation.get("not_validated", 0) + report.by_validation.get(
+        "unit_tested", 0
+    )
+    if unproven:
+        assert any("not been verified against a real BW system" in c for c in report.caveats)
+
+
+def test_report_states_that_nothing_is_customer_validated_yet() -> None:
+    report = build_report(_record({}))
+    assert not report.by_validation.get("customer_validated")
+    assert any("customer's own system" in c for c in report.caveats)
+
+
+def test_an_integration_claim_carries_its_release() -> None:
+    report = build_report(_record({}))
+    for row in report.capabilities:
+        if row.validation == "integration_tested":
+            assert row.validated_on, f"{row.capability} claims integration testing with no release"
+
+
 def test_report_cites_the_contract_revision() -> None:
     report = build_report(_record({}))
     assert any("contract revision" in c for c in report.caveats)

@@ -176,7 +176,7 @@ class _Conn:
             or "STARTROUTINE <> ''" in sql
             or "SOURCETYPE = ?" in sql
             or "SOURCETYPE IN ('ODSO', 'ADSO')" in sql
-            # write-back loop scans (self-loop / two-cycle) and the unused-provider source scan
+            # circular-dependency scans (self-loop / multi-object) plus the unused-provider scan
             or "SOURCENAME = TARGETNAME" in sql
             or "SOURCENAME <> TARGETNAME" in sql
             or "GROUP BY" in sql

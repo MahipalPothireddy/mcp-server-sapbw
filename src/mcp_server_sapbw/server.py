@@ -1576,11 +1576,12 @@ def bw_check_schedule_risk(
 def bw_find_layer_violations(
     system: str, max_dso_depth: int = 3, limit: int = _DEFAULT_PAGE
 ) -> ScenarioReport | UnsupportedResult:
-    """Structural anti-patterns: CP->DSO, CP->InfoObject, deep DSO stacks, and write-back loops.
+    """Structural anti-patterns: CP->DSO, CP->InfoObject, deep DSO stacks, circular dependencies.
 
-    Write-back loops are the severe ones: a transformation whose source and target are the same
-    object, or two objects that each feed the other. Both make the loaded result depend on load
-    order, so a failed request cannot simply be re-run, and a cycle has no correct order at all.
+    Circular dependencies are the severe ones: a transformation whose source and target are the same
+    object, or a loop of any length where each object feeds the next. Both make the loaded result
+    depend on load order, so a failed request cannot simply be re-run, and a loop has no correct
+    order at all. Detected at any length, and each finding names every object involved.
     """
     limit, _ = _clamp_page(limit, 0)
     return (

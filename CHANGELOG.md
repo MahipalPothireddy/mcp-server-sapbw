@@ -6,7 +6,50 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-### Added — the object graph as a component, and write-back cycles of any length
+### Changed — "built" and "proven" are now separate columns
+
+`SUPPORTED` was doing two jobs. It meant "a reader exists and a test covers it", but to a customer it
+reads as "validated against supported BW versions" — and that second reading is what a buying
+decision rests on. Every capability now carries two axes:
+
+- **Implementation** — `implemented` / `partial` / `discovery_only` / `planned` / `unsupported` /
+  `deprecated`. Does the code exist, and how completely.
+- **Validation** — `not_validated` / `unit_tested` / `integration_tested` / `customer_validated`.
+  How far it has been proven, with the BW release recorded for any integration claim, because these
+  tables differ across releases.
+
+Validation is **measured, not asserted, and never inferred upward.** The two read signals that build
+the contract were previously unioned immediately; keeping them apart is what makes this possible,
+because the difference between them *is* the evidence — a static scan finds a reader, the runtime
+recorder finds a reader **that a test exercised**. An implemented capability no test touches reports
+`not_validated`. A test asserts that some do, because if every implemented capability reported as
+validated the column would be decoration.
+
+What this immediately exposed, and the reason the split was worth making:
+
+- **All 10 `PARTIAL` capabilities are `not_validated`.** Coherent, and previously invisible: "read,
+  but the surface built on it is incomplete" — and the incomplete surface has no test.
+- **Nothing is `customer_validated`.** Reported rather than omitted. It is the honest position of a
+  pre-1.0 build and closing it is an onboarding output, not a development one.
+- One stated exception, rather than a silent one: a *discovery pattern* is never read as a table, so
+  the read recorder cannot see it at all. Its feature **is** resolution, so it qualifies for an
+  integration claim when a live capability record returned and confirmed the resolved name. Leaving
+  those four `not_validated` would have reported a measurement limitation as an untested feature.
+
+`bw_capability_report` counts validation over the *usable* set only — how well-proven a capability is
+matters only for the ones your system can actually use — and says plainly when usable capabilities
+are unproven. On the reference BW 7.50 system: 78 usable, of which 53 integration-tested, 15
+unit-tested, 10 not validated, 0 customer-validated.
+
+### Changed — "write-back cycle" is now "circular dependency"
+
+The wording could read as though this server modifies BW. It does not — it issues `SELECT` only. The
+term was also ambiguous *inside* BW's own vocabulary, which is the stronger reason: "write-back" in BW
+already means planning data written back to a provider, a real and different feature. Finding titles,
+caveats, tool documentation and the README now say circular dependency; a test pins the wording so it
+cannot creep back into a customer-facing string.
+
+### Added — the object graph as a component, and circular dependencies of any length
 
 Every dependency question had its own traversal: the lineage service walked transformations, the
 layer analyzer built a separate adjacency map, the load closure walked chains, the field-lineage

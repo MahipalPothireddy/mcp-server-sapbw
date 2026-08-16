@@ -28,6 +28,40 @@ ContractState = Literal[
 ]
 IMPLEMENTED_STATES: frozenset[str] = frozenset({"SUPPORTED", "PARTIAL", "DISCOVERY_ONLY"})
 
+# Does the code exist, and how completely. Derived from ContractState, which stays because it is a
+# published schema; this is the axis to read when the question is "is it built".
+ImplementationStatus = Literal[
+    "implemented",
+    "partial",
+    "discovery_only",
+    "planned",
+    "unsupported",
+    "deprecated",
+]
+
+# How far it has been proven, weakest first. A separate axis because one word was doing two jobs:
+# `SUPPORTED` reads as "validated against supported BW versions" and only ever meant "a reader
+# exists". A buying decision rests on this column, not the other one.
+#
+#   not_validated       no test has touched it; a reader may still exist
+#   unit_tested         exercised by the offline suite against synthetic fixtures
+#   integration_tested  read through a feature against a real BW system, output inspected
+#   customer_validated  verified on a customer's own system, by that customer
+ValidationStatus = Literal[
+    "not_validated",
+    "unit_tested",
+    "integration_tested",
+    "customer_validated",
+]
+
+#: Validation ordering, so a caller can filter on "at least X" without enumerating.
+VALIDATION_RANK: dict[str, int] = {
+    "not_validated": 0,
+    "unit_tested": 1,
+    "integration_tested": 2,
+    "customer_validated": 3,
+}
+
 # The four ways a contract state and a system's table presence can combine. This is the
 # distinction that matters to someone deciding whether to trust an answer: an absent table and an
 # unimplemented reader both mean "no answer", but only one of them is fixable in this repo.
@@ -129,11 +163,23 @@ class ContractEntry(BaseModel):
     # Physical table, view, or discovery pattern this capability resolves to.
     object_name: str
     state: ContractState
+    #: Whether the code exists. Derived from ``state`` when a shipped contract predates this field.
+    implementation: ImplementationStatus | None = None
+    #: How far it has been proven. Measured, never inferred upward - a capability with a reader that
+    #: no test touched is ``not_validated``.
+    validation: ValidationStatus = "not_validated"
+    #: The BW release integration verification was performed against. A validation claim without a
+    #: release is not a claim, because these tables differ across releases.
+    validated_on: str | None = None
     reason: str = ""
 
     @property
     def implemented(self) -> bool:
         return self.state in IMPLEMENTED_STATES
+
+    @property
+    def validation_rank(self) -> int:
+        return VALIDATION_RANK.get(self.validation, 0)
 
 
 class CapabilitySupport(BaseModel):
@@ -144,6 +190,9 @@ class CapabilitySupport(BaseModel):
     capability: str = Field(min_length=1)
     object_name: str
     state: ContractState
+    implementation: ImplementationStatus | None = None
+    validation: ValidationStatus = "not_validated"
+    validated_on: str | None = None
     reason: str = ""
     # None when the capability is untracked by discovery (a declared name the resolver did not
     # probe on this release), which is reported rather than guessed at.
@@ -169,5 +218,9 @@ class CapabilityReport(BaseModel):
     totals: dict[str, int] = Field(default_factory=dict)
     # Counts by contract state, matching docs/capability-contract.md for this build.
     by_state: dict[str, int] = Field(default_factory=dict)
+    #: Counts by validation level, over the capabilities this system actually has. The number to
+    #: read before trusting a result: "usable" says a reader exists and the object is present, not
+    #: that anyone has proven the two work together on a release like yours.
+    by_validation: dict[str, int] = Field(default_factory=dict)
     capabilities: list[CapabilitySupport] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)

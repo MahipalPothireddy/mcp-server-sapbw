@@ -94,7 +94,7 @@ def test_layout_is_deterministic() -> None:
 
 
 def test_cycle_does_not_hang_layout() -> None:
-    """A write-back loop is legal in BW; layering must terminate anyway."""
+    """A circular dependency is legal in BW; layering must terminate anyway."""
     graph = LineageGraph(
         root_id="A",
         direction="both",

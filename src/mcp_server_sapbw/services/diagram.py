@@ -120,8 +120,8 @@ def _shorten(text: str, limit: int = _MAX_LABEL_CHARS) -> str:
 def _assign_layers(node_ids: list[str], edges: list[LineageEdge]) -> dict[str, int]:
     """Longest-path layering: a node sits one column right of its furthest predecessor.
 
-    Cycles are broken by processing in a stable order and capping iterations, so a write-back loop
-    (which BW does allow) cannot hang the layout.
+    Cycles are broken by processing in a stable order and capping iterations, so a circular
+    dependency (which BW does allow) cannot hang the layout.
     """
     incoming: dict[str, list[str]] = {nid: [] for nid in node_ids}
     for edge in edges:
@@ -285,7 +285,7 @@ def render_svg(layout: DiagramLayout) -> str:
         stroke = "#94a3b8" if advisory else "#475569"
         dash = ' stroke-dasharray="6 4"' if advisory else ""
         marker = "b" if advisory else "a"
-        if src.id == dst.id:  # self-loop: in-place derivation / write-back onto itself
+        if src.id == dst.id:  # self-loop: the object derives from itself
             cx, cy = src.x + _NODE_W, src.y + _NODE_H / 2
             path = f"M{cx},{cy - 10} C{cx + 44},{cy - 34} {cx + 44},{cy + 34} {cx},{cy + 10}"
             out.append(

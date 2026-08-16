@@ -1,6 +1,6 @@
 """The object graph, and the cycle it exists to find.
 
-The layer analyzer detected self-loops and two-object write-back loops, and said so in a caveat:
+The layer analyzer detected self-loops and two-object cycles, and said so in a caveat:
 longer cycles were not searched. A three-object loop has no correct load order either. The tests
 below pin that, plus the operations the traversals used to each reimplement.
 """
@@ -168,7 +168,7 @@ def test_a_cycle_does_not_hang_path_enumeration() -> None:
 # --- cycles: the gap this component closes ------------------------------------------------
 
 
-def test_a_three_object_write_back_loop_is_found() -> None:
+def test_a_three_object_circular_dependency_is_found() -> None:
     """A->B->C->A. The previous detector searched only self-loops and two-object cycles."""
     graph = _chain(
         (("dso", "A"), ("dso", "B")),

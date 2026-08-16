@@ -90,7 +90,7 @@ class ScriptedConnection:
             or "STARTROUTINE <> ''" in sql
             or "SOURCENAME = ?" in sql
             or "TARGETNAME = ?" in sql
-            # write-back loop scans (self-loop / two-cycle) and the unused-provider source scan
+            # circular-dependency scans (self-loop / multi-object) plus the unused-provider scan
             or "SOURCENAME = TARGETNAME" in sql
             or "SOURCENAME <> TARGETNAME" in sql
             or "GROUP BY" in sql

@@ -14,9 +14,34 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > implemented:
 > **46 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
-> What the server does with each metadata object it declares is published, per state, in
+> What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
 > `bw_capability_report` for the same thing crossed with what your own system actually has.
+
+## Built, versus proven
+
+These are different questions, and the second is the one a buying decision rests on. Every capability
+carries both:
+
+| | |
+|---|---|
+| **Implementation** | `implemented` · `partial` · `discovery_only` · `planned` · `unsupported` · `deprecated` |
+| **Validation** | `customer_validated` · `integration_tested` · `unit_tested` · `not_validated` |
+
+`integration_tested` means the capability was read through a real feature against a live BW system
+and the output inspected — and the release it was proven on is recorded, because these tables differ
+across releases. `unit_tested` means the offline suite exercised it against synthetic fixtures.
+`not_validated` means no test touched it; a reader may still exist.
+
+Validation is **measured, not asserted**: the SQL dialect records which logical tables the suite
+actually asks for, so `unit_tested` is observed. It is never inferred upward — an implemented
+capability that no test touches reports `not_validated`, and a test asserts that some do, because if
+every implemented capability reported as validated the column would be decoration.
+
+On the reference BW 7.50 system, of 78 capabilities usable there: **53 integration-tested, 15
+unit-tested only, 10 not validated, and 0 validated on a customer's own system.** That last number is
+reported rather than omitted — it is the honest position of a pre-1.0 build, and closing it is an
+onboarding exercise, not a development one.
 > Still planned: a BI connector for scenarios 9.7/9.8 (report schedules and dashboards live outside
 > BW, so those two analyses return a template naming the connector required). The ECC source-system
 > connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
@@ -45,7 +70,8 @@ own where-used lists), and can render a full markdown knowledge base on demand.
   extractor enhancements; optionally the exit ABAP itself, read from the source system over ADT.
 - **Descriptions** — for every object, with explicit provenance (stored vs. generated).
 - **Risk analyzers** — the eight landscape-specific analyses (latency contracts, schedule risk,
-  layer violations including write-back loops, and more) plus decommission-candidate detection.
+  layer violations including circular dependencies of any length) plus decommission-candidate
+  detection.
 - **Knowledge base** — a full markdown documentation set rendered on demand.
 
 ## When a call cannot answer
@@ -406,14 +432,18 @@ catch-all. That is a live configuration fault, and it is invisible unless both s
 |---|---|---|
 | `bw_check_load_latency` | `system`, `limit=25` | Scenario 9.1: full-update loads whose routines look up other objects (stale-data risk). Loads with no resolvable lookup have no contract to check and are counted in the caveats rather than reported as findings |
 | `bw_check_schedule_risk` | `system`, `limit` | Scenario 9.7: report schedules vs. feeding-chain p95 (needs a BI connector) |
-| `bw_find_layer_violations` | `system`, `max_dso_depth=3`, `limit` | CompositeProvider→DSO, CompositeProvider→InfoObject, deep DSO stacks, **write-back loops** |
+| `bw_find_layer_violations` | `system`, `max_dso_depth=3`, `limit` | CompositeProvider→DSO, CompositeProvider→InfoObject, deep DSO stacks, **circular dependencies** |
 | `bw_review_scenario` | `system`, `scenario`, `limit=50` | Run any analysis by id (`9.1`–`9.8`, `layer_violations`, `unused_providers`) |
 
-Write-back loops are the severe ones. A transformation whose source and target are the same object
-makes its own load non-repeatable: the output depends on what the target already held, so a failed
-request cannot simply be re-run. Two objects that each feed the other have no correct load order at
-all, which is why scheduling cannot fix it. Longer cycles (A→B→C→A) are not searched, and the report
-says so rather than implying the check was exhaustive.
+Circular dependencies are the severe ones. A transformation whose source and target are the same
+object makes its own load non-repeatable: the output depends on what the target already held, so a
+failed request cannot simply be re-run. A loop across two or more objects has no correct load order
+at all, which is why scheduling cannot fix it. Loops are detected **at any length** and each finding
+names every object involved; the only bound is the edge scan, and the report says so.
+
+(These are dependency cycles in the metadata. They are not "write-back", which in BW means planning
+data written back to a provider — a different feature. This server issues `SELECT` only and never
+writes to BW.)
 
 Scenario 9.1 compares each full-update load against the **observed cadence** of the objects its
 routines look up, so a stale-data risk is substantiated rather than assumed, and escalates only when

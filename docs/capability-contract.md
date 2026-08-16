@@ -7,139 +7,161 @@ Declaring a capability is cheap; reading it is not, so the two are recorded
 separately and a drift check fails the build when a capability is declared with
 neither a reader nor a stated reason.
 
-**78 of 97 declared capabilities are implemented** (`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).
+## Two questions, two columns
 
-| State | Meaning |
+**Does the code exist** and **has it been proven** are different questions, and a buying
+decision rests on the second. They used to share one word: `SUPPORTED` meant "a reader
+exists and a test covers it", but reads as "validated against supported BW versions".
+
+- **Implementation** - 78 of 97 capabilities are implemented.
+- **Validation** - 53 have been read through a real
+  feature against a live BW system, 15 are covered by the
+  offline suite only, 29 are unproven, and
+  **0 have been validated on a customer's own
+  system**.
+
+| Validation | Meaning |
 |---|---|
-| `SUPPORTED` | Read by the server and covered by tests |
-| `PARTIAL` | Read, but the surface built on it is incomplete - the gap is named |
-| `DISCOVERY_ONLY` | Not read as a table; used to detect an object-model variant |
-| `PLANNED` | Declared ahead of implementation, with the intended feature named |
-| `NOT_SUPPORTED` | Validation plumbing only; no feature will read it |
-| `DEPRECATED` | Superseded; kept so an older release still resolves |
+| `customer_validated` | Verified on a customer's system, by that customer |
+| `integration_tested` | Read through a feature against BW 7.50 (SAP_BW 750, HANA 2.0), output inspected |
+| `unit_tested` | Exercised by the offline suite against synthetic fixtures |
+| `not_validated` | No test has touched it. A reader may still exist |
 
-Presence of a table on *your* system is a separate question, answered per connection by
-`bw_system_profile`. This file records what the server would do with it if present.
+Validation is measured, not asserted: the SQL dialect records which logical tables the
+suite actually asks for, so `unit_tested` is observed. It is never inferred upward - a
+capability with a reader that no test touched reports `not_validated`.
+
+| State | Implementation | Meaning |
+|---|---|---|
+| `SUPPORTED` | `implemented` | Read by the server |
+| `PARTIAL` | `partial` | Read, but the surface built on it is incomplete - gap named |
+| `DISCOVERY_ONLY` | `discovery_only` | Not read as a table; detects an object-model variant |
+| `PLANNED` | `planned` | Declared ahead of implementation, intended feature named |
+| `NOT_SUPPORTED` | `unsupported` | Validation plumbing only; no feature will read it |
+| `DEPRECATED` | `deprecated` | Superseded; kept so an older release still resolves |
+
+Presence of a table on *your* system is a third question again, answered per connection
+by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 
 ## SUPPORTED (64)
 
-| Capability | Object | Notes |
-|---|---|---|
-| `adso_header` | `RSOADSO` | read by the server |
-| `adso_keyfields` | `RSOADSOKEYFIELDS` | read by the server |
-| `adso_text` | `RSOADSOT` | read by the server |
-| `attribute` | `RSDBCHATR` | read by the server |
-| `auth_hierarchy` | `RSECHIE` | read by the server |
-| `auth_text` | `RSECTXT` | read by the server |
-| `auth_user` | `RSECUSERAUTH` | read by the server |
-| `auth_values` | `RSECVAL` | read by the server |
-| `chain_attr` | `RSPCCHAINATTR` | read by the server |
-| `chain_edges` | `RSPCCHAIN` | read by the server |
-| `chain_text` | `RSPCCHAINT` | read by the server |
-| `characteristic` | `RSDCHA` | read by the server |
-| `composite_header` | `RSOHCPR` | read by the server |
-| `composite_text` | `RSOHCPRT` | read by the server |
-| `cs_tables` | `M_CS_TABLES` | read by the server |
-| `cube_field` | `RSDCUBEIOBJ` | read by the server |
-| `cube_header` | `RSDCUBE` | read by the server |
-| `cube_text` | `RSDCUBET` | read by the server |
-| `datasource` | `RSDS` | read by the server |
-| `datasource_field` | `RSDSSEGFD` | read by the server |
-| `dict_columns` | `DD03L` | read by the server |
-| `dso_field` | `RSDODSOIOBJ` | read by the server |
-| `dso_header` | `RSDODSO` | read by the server |
-| `dso_text` | `RSDODSOT` | read by the server |
-| `dtp` | `RSBKDTP` | read by the server |
-| `element_calc` | `RSZCALC` | read by the server |
-| `element_dir` | `RSZELTDIR` | read by the server |
-| `element_prop` | `RSZELTPROP` | read by the server |
-| `element_range` | `RSZRANGE` | read by the server |
-| `element_select` | `RSZSELECT` | read by the server |
-| `element_text` | `RSZELTTXT` | read by the server |
-| `element_xref` | `RSZELTXREF` | read by the server |
-| `extractor` | `ROOSOURCE` | read by the server |
-| `global_variable` | `RSZGLOBV` | read by the server |
-| `hana_views` | `VIEWS` | read by the server |
-| `infoobject` | `RSDIOBJ` | read by the server |
-| `infoobject_text` | `RSDIOBJT` | read by the server |
-| `infosource_map` | `RSISOSMAP` | read by the server |
-| `keyfigure` | `RSDKYF` | read by the server |
-| `log_chain` | `RSPCLOGCHAIN` | read by the server |
-| `multiprovider_part` | `RSDCUBEMULTI` | read by the server |
-| `nav_attribute` | `RSDATRNAV` | read by the server |
-| `object_dependencies` | `OBJECT_DEPENDENCIES` | read by the server |
-| `process_log` | `RSPCPROCESSLOG` | read by the server |
-| `query_dir` | `RSZCOMPDIR` | read by the server |
-| `query_provider` | `RSZCOMPIC` | read by the server |
-| `request_status` | `RSSTATMANPART` | read by the server |
-| `routine_source` | `RSAABAP` | read by the server |
-| `routine_source_3x` | `RSAROUT` | read by the server |
-| `routine_text_3x` | `RSAROUTT` | read by the server |
-| `source_system` | `RSBASIDOC` | read by the server |
-| `transfer_rule` | `RSTSRULES` | read by the server |
-| `transfer_structure` | `RSTS` | read by the server |
-| `transformation` | `RSTRAN` | read by the server |
-| `transformation_field` | `RSTRANFIELD` | read by the server |
-| `transformation_rule` | `RSTRANRULE` | read by the server |
-| `transformation_step_adso` | `RSTRANSTEPADSO` | read by the server |
-| `transformation_step_const` | `RSTRANSTEPCNST` | read by the server |
-| `transformation_step_dso` | `RSTRANSTEPODSO` | read by the server |
-| `transformation_step_master` | `RSTRANSTEPMASTER` | read by the server |
-| `transformation_step_rout` | `RSTRANSTEPROUT` | read by the server |
-| `transformation_text` | `RSTRAN%` | read by the server |
-| `update_rule` | `RSUPDINFO` | read by the server |
-| `update_rule_routine` | `RSUPDROUT` | read by the server |
+| Capability | Object | Validation | Notes |
+|---|---|---|---|
+| `adso_header` | `RSOADSO` | `integration_tested` | read by the server |
+| `adso_keyfields` | `RSOADSOKEYFIELDS` | `integration_tested` | read by the server |
+| `adso_text` | `RSOADSOT` | `integration_tested` | read by the server |
+| `attribute` | `RSDBCHATR` | `integration_tested` | read by the server |
+| `auth_hierarchy` | `RSECHIE` | `unit_tested` | read by the server |
+| `auth_text` | `RSECTXT` | `unit_tested` | read by the server |
+| `auth_user` | `RSECUSERAUTH` | `unit_tested` | read by the server |
+| `auth_values` | `RSECVAL` | `unit_tested` | read by the server |
+| `chain_attr` | `RSPCCHAINATTR` | `integration_tested` | read by the server |
+| `chain_edges` | `RSPCCHAIN` | `integration_tested` | read by the server |
+| `chain_text` | `RSPCCHAINT` | `integration_tested` | read by the server |
+| `characteristic` | `RSDCHA` | `integration_tested` | read by the server |
+| `composite_header` | `RSOHCPR` | `integration_tested` | read by the server |
+| `composite_text` | `RSOHCPRT` | `integration_tested` | read by the server |
+| `cs_tables` | `M_CS_TABLES` | `unit_tested` | read by the server |
+| `cube_field` | `RSDCUBEIOBJ` | `integration_tested` | read by the server |
+| `cube_header` | `RSDCUBE` | `integration_tested` | read by the server |
+| `cube_text` | `RSDCUBET` | `integration_tested` | read by the server |
+| `datasource` | `RSDS` | `integration_tested` | read by the server |
+| `datasource_field` | `RSDSSEGFD` | `unit_tested` | read by the server |
+| `dict_columns` | `DD03L` | `integration_tested` | read by the server |
+| `dso_field` | `RSDODSOIOBJ` | `integration_tested` | read by the server |
+| `dso_header` | `RSDODSO` | `integration_tested` | read by the server |
+| `dso_text` | `RSDODSOT` | `integration_tested` | read by the server |
+| `dtp` | `RSBKDTP` | `unit_tested` | read by the server |
+| `element_calc` | `RSZCALC` | `integration_tested` | read by the server |
+| `element_dir` | `RSZELTDIR` | `integration_tested` | read by the server |
+| `element_prop` | `RSZELTPROP` | `integration_tested` | read by the server |
+| `element_range` | `RSZRANGE` | `integration_tested` | read by the server |
+| `element_select` | `RSZSELECT` | `integration_tested` | read by the server |
+| `element_text` | `RSZELTTXT` | `integration_tested` | read by the server |
+| `element_xref` | `RSZELTXREF` | `integration_tested` | read by the server |
+| `extractor` | `ROOSOURCE` | `unit_tested` | read by the server |
+| `global_variable` | `RSZGLOBV` | `integration_tested` | read by the server |
+| `hana_views` | `VIEWS` | `integration_tested` | read by the server |
+| `infoobject` | `RSDIOBJ` | `integration_tested` | read by the server |
+| `infoobject_text` | `RSDIOBJT` | `integration_tested` | read by the server |
+| `infosource_map` | `RSISOSMAP` | `integration_tested` | read by the server |
+| `keyfigure` | `RSDKYF` | `integration_tested` | read by the server |
+| `log_chain` | `RSPCLOGCHAIN` | `integration_tested` | read by the server |
+| `multiprovider_part` | `RSDCUBEMULTI` | `integration_tested` | read by the server |
+| `nav_attribute` | `RSDATRNAV` | `integration_tested` | read by the server |
+| `object_dependencies` | `OBJECT_DEPENDENCIES` | `integration_tested` | read by the server |
+| `process_log` | `RSPCPROCESSLOG` | `integration_tested` | read by the server |
+| `query_dir` | `RSZCOMPDIR` | `integration_tested` | read by the server |
+| `query_provider` | `RSZCOMPIC` | `integration_tested` | read by the server |
+| `request_status` | `RSSTATMANPART` | `unit_tested` | read by the server |
+| `routine_source` | `RSAABAP` | `integration_tested` | read by the server |
+| `routine_source_3x` | `RSAROUT` | `integration_tested` | read by the server |
+| `routine_text_3x` | `RSAROUTT` | `integration_tested` | read by the server |
+| `source_system` | `RSBASIDOC` | `integration_tested` | read by the server |
+| `transfer_rule` | `RSTSRULES` | `integration_tested` | read by the server |
+| `transfer_structure` | `RSTS` | `integration_tested` | read by the server |
+| `transformation` | `RSTRAN` | `integration_tested` | read by the server |
+| `transformation_field` | `RSTRANFIELD` | `integration_tested` | read by the server |
+| `transformation_rule` | `RSTRANRULE` | `integration_tested` | read by the server |
+| `transformation_step_adso` | `RSTRANSTEPADSO` | `unit_tested` | read by the server |
+| `transformation_step_const` | `RSTRANSTEPCNST` | `unit_tested` | read by the server |
+| `transformation_step_dso` | `RSTRANSTEPODSO` | `unit_tested` | read by the server |
+| `transformation_step_master` | `RSTRANSTEPMASTER` | `unit_tested` | read by the server |
+| `transformation_step_rout` | `RSTRANSTEPROUT` | `unit_tested` | read by the server |
+| `transformation_text` | `RSTRAN%` | `unit_tested` | read by the server |
+| `update_rule` | `RSUPDINFO` | `integration_tested` | read by the server |
+| `update_rule_routine` | `RSUPDROUT` | `integration_tested` | read by the server |
 
 ## PARTIAL (10)
 
-| Capability | Object | Notes |
-|---|---|---|
-| `extractor_field` | `ROOSFIELD` | ROOSFIELD holds extractor field definitions. Enhancement detection uses RSDSSEGFD, which is the BW-side evidence; ROOSFIELD would confirm it from the replicated extractor. |
-| `hana_columns` | `COLUMNS` | SYS.COLUMNS is used for calc-view column resolution through the view-column read; direct column-level lineage inside a calc view is not implemented. |
-| `hana_view_columns` | `VIEW_COLUMNS` | See hana_columns. |
-| `transfer_structure_field` | `RSTSFIELD` | RSTSFIELD is reached through the transfer-rule read rather than directly; the field list is therefore only as complete as the rules that reference it. |
-| `transformation_rule_step` | `RSTRANRULESTEP` | RSTRANRULESTEP sequences rule steps. The steps are read through the typed step tables; the ordering is not yet surfaced. |
-| `transformation_seg` | `RSTRANSEG` | RSTRANSEG describes transformation segments. Field mappings are read per rule, so the segment grouping is not needed for the current output but would matter for a multi-segment transformation. |
-| `update_rule_key` | `RSUPDKEY` | RSUPDKEY/RSUPDDAT hold 3.x update-rule key and key-figure detail. bw_list_update_rules reports the rules; this field-level detail is not surfaced. |
-| `update_rule_keyfigure` | `RSUPDDAT` | See update_rule_key. |
-| `variant` | `RSPCVARIANT` | RSPCVARIANT/RSPCVARIANTT hold process-variant parameters. Chain steps resolve their targets through RSPCCHAIN, which is the reliable path; variant parameters would add the per-process detail. |
-| `variant_text` | `RSPCVARIANTT` | See variant. |
+| Capability | Object | Validation | Notes |
+|---|---|---|---|
+| `extractor_field` | `ROOSFIELD` | `not_validated` | ROOSFIELD holds extractor field definitions. Enhancement detection uses RSDSSEGFD, which is the BW-side evidence; ROOSFIELD would confirm it from the replicated extractor. |
+| `hana_columns` | `COLUMNS` | `not_validated` | SYS.COLUMNS is used for calc-view column resolution through the view-column read; direct column-level lineage inside a calc view is not implemented. |
+| `hana_view_columns` | `VIEW_COLUMNS` | `not_validated` | See hana_columns. |
+| `transfer_structure_field` | `RSTSFIELD` | `not_validated` | RSTSFIELD is reached through the transfer-rule read rather than directly; the field list is therefore only as complete as the rules that reference it. |
+| `transformation_rule_step` | `RSTRANRULESTEP` | `not_validated` | RSTRANRULESTEP sequences rule steps. The steps are read through the typed step tables; the ordering is not yet surfaced. |
+| `transformation_seg` | `RSTRANSEG` | `not_validated` | RSTRANSEG describes transformation segments. Field mappings are read per rule, so the segment grouping is not needed for the current output but would matter for a multi-segment transformation. |
+| `update_rule_key` | `RSUPDKEY` | `not_validated` | RSUPDKEY/RSUPDDAT hold 3.x update-rule key and key-figure detail. bw_list_update_rules reports the rules; this field-level detail is not surfaced. |
+| `update_rule_keyfigure` | `RSUPDDAT` | `not_validated` | See update_rule_key. |
+| `variant` | `RSPCVARIANT` | `not_validated` | RSPCVARIANT/RSPCVARIANTT hold process-variant parameters. Chain steps resolve their targets through RSPCCHAIN, which is the reliable path; variant parameters would add the per-process detail. |
+| `variant_text` | `RSPCVARIANTT` | `not_validated` | See variant. |
 
 ## DISCOVERY_ONLY (4)
 
-| Capability | Object | Notes |
-|---|---|---|
-| `adso` | `RSOADSO%` | Pattern RSOADSO% establishes whether this release has Advanced DSOs at all. The tables it finds are declared as adso_header/adso_text/adso_keyfields, which are read. |
-| `analysis_auth` | `RSEC%` | Pattern RSEC% establishes whether analysis authorisations are present. The tables it finds are declared as auth_values/auth_user/auth_hierarchy/auth_text, which are read. |
-| `composite_provider` | `RSOHCPR%` | Pattern RSOHCPR% establishes whether CompositeProviders exist. The tables it finds are declared as composite_header/composite_text, which are read. |
-| `query_stats` | `RSDDSTAT%` | Pattern RSDDSTAT% establishes which BW statistics variant a release carries; the names differ across 7.4/7.5/BW4. Query usage is read from RSZCOMPDIR.LASTUSED instead, which is present on every release, so no statistics table is read directly. |
+| Capability | Object | Validation | Notes |
+|---|---|---|---|
+| `adso` | `RSOADSO%` | `integration_tested` | Pattern RSOADSO% establishes whether this release has Advanced DSOs at all. The tables it finds are declared as adso_header/adso_text/adso_keyfields, which are read. |
+| `analysis_auth` | `RSEC%` | `integration_tested` | Pattern RSEC% establishes whether analysis authorisations are present. The tables it finds are declared as auth_values/auth_user/auth_hierarchy/auth_text, which are read. |
+| `composite_provider` | `RSOHCPR%` | `integration_tested` | Pattern RSOHCPR% establishes whether CompositeProviders exist. The tables it finds are declared as composite_header/composite_text, which are read. |
+| `query_stats` | `RSDDSTAT%` | `integration_tested` | Pattern RSDDSTAT% establishes which BW statistics variant a release carries; the names differ across 7.4/7.5/BW4. Query usage is read from RSZCOMPDIR.LASTUSED instead, which is present on every release, so no statistics table is read directly. |
 
 ## PLANNED (15)
 
-| Capability | Object | Notes |
-|---|---|---|
-| `abap_profile_auth` | `UST10S` | See abap_user_profile. |
-| `abap_role_auth` | `AGR_1251` | See abap_user_profile. |
-| `abap_user_profile` | `UST04` | UST04/UST10S/AGR_USERS/AGR_1251 tie a BW user to their ABAP roles and profiles. The security tools report analysis-authorisation shape and assignment; the ABAP role side would show how a user comes to hold one. |
-| `abap_user_role` | `AGR_USERS` | See abap_user_profile. |
-| `comm_structure` | `RSKS` | RSKS/RSKSFIELDNEW hold the 3.x communication structure between transfer rules and update rules. bw_list_update_rules reports the update rules; the structure between them is not yet resolved. |
-| `comm_structure_field` | `RSKSFIELDNEW` | See comm_structure. |
-| `dtp_request` | `RSBKREQUEST` | RSBKREQUEST holds per-DTP request history. Provider currency currently comes from RSSTATMANPART; this would add per-DTP durations and record counts. |
-| `infopackage` | `RSLDPIO` | RSLDPIO/RSLDPSEL describe InfoPackages, the 3.x-era load step ahead of the transfer structure. Needed to complete a 3.x flow's upstream hop. |
-| `infopackage_selection` | `RSLDPSEL` | See infopackage. |
-| `infosource_header` | `RSIS` | RSIS/RSIST/RSISOSMAP describe InfoSources. Partly covered: the 3.x flow tools resolve the transfer-structure path, but the InfoSource object itself is not describable. |
-| `infosource_text` | `RSIST` | See infosource_header. |
-| `job_header` | `TBTCO` | TBTCO/TBTCP/TBTCS carry job periodicity. Chain cadence is currently measured from observed run history, which is the more honest signal; the declared schedule would let the two be compared, and a divergence is itself a finding. |
-| `job_schedule` | `TBTCS` | See job_header. |
-| `job_steps` | `TBTCP` | See job_header. |
-| `report_dir` | `RSRREPDIR` | RSRREPDIR holds query generation status, which distinguishes a query that exists from one that is executable. |
+| Capability | Object | Validation | Notes |
+|---|---|---|---|
+| `abap_profile_auth` | `UST10S` | `not_validated` | See abap_user_profile. |
+| `abap_role_auth` | `AGR_1251` | `not_validated` | See abap_user_profile. |
+| `abap_user_profile` | `UST04` | `not_validated` | UST04/UST10S/AGR_USERS/AGR_1251 tie a BW user to their ABAP roles and profiles. The security tools report analysis-authorisation shape and assignment; the ABAP role side would show how a user comes to hold one. |
+| `abap_user_role` | `AGR_USERS` | `not_validated` | See abap_user_profile. |
+| `comm_structure` | `RSKS` | `not_validated` | RSKS/RSKSFIELDNEW hold the 3.x communication structure between transfer rules and update rules. bw_list_update_rules reports the update rules; the structure between them is not yet resolved. |
+| `comm_structure_field` | `RSKSFIELDNEW` | `not_validated` | See comm_structure. |
+| `dtp_request` | `RSBKREQUEST` | `not_validated` | RSBKREQUEST holds per-DTP request history. Provider currency currently comes from RSSTATMANPART; this would add per-DTP durations and record counts. |
+| `infopackage` | `RSLDPIO` | `not_validated` | RSLDPIO/RSLDPSEL describe InfoPackages, the 3.x-era load step ahead of the transfer structure. Needed to complete a 3.x flow's upstream hop. |
+| `infopackage_selection` | `RSLDPSEL` | `not_validated` | See infopackage. |
+| `infosource_header` | `RSIS` | `not_validated` | RSIS/RSIST/RSISOSMAP describe InfoSources. Partly covered: the 3.x flow tools resolve the transfer-structure path, but the InfoSource object itself is not describable. |
+| `infosource_text` | `RSIST` | `not_validated` | See infosource_header. |
+| `job_header` | `TBTCO` | `not_validated` | TBTCO/TBTCP/TBTCS carry job periodicity. Chain cadence is currently measured from observed run history, which is the more honest signal; the declared schedule would let the two be compared, and a divergence is itself a finding. |
+| `job_schedule` | `TBTCS` | `not_validated` | See job_header. |
+| `job_steps` | `TBTCP` | `not_validated` | See job_header. |
+| `report_dir` | `RSRREPDIR` | `not_validated` | RSRREPDIR holds query generation status, which distinguishes a query that exists from one that is executable. |
 
 ## NOT_SUPPORTED (4)
 
-| Capability | Object | Notes |
-|---|---|---|
-| `dict_dataelement_text` | `DD04T` | DD04T holds data-element texts. Superseded for every current purpose by the domain-value decoding in services/aggregation.py, which reads DD07L/DD07T directly. |
-| `dict_tables` | `DD02L` | DD02L is used by the resolver's own existence probe, which issues its SQL directly rather than through the dialect. No feature reads it. |
-| `dict_tables_text` | `DD02T` | DD02T carries table descriptions. Object descriptions come from the BW text tables, which are the ones users recognise, so the dictionary texts are not surfaced. |
-| `log_messages` | `RSPCLOGS` | RSPCLOGS was declared as holding per-step chain messages. Verified against the dictionary: it has four columns (TYPE, VARIANTE, INSTANCE, LOGHANDLE) and no message at all - it is a pointer into the Application Log. Reading the messages needs BALHDR/BALMSG or BAL_LOG_MSG_READ, neither of which this server declares, so the honest state is that this table alone cannot answer the question it was declared for. |
+| Capability | Object | Validation | Notes |
+|---|---|---|---|
+| `dict_dataelement_text` | `DD04T` | `not_validated` | DD04T holds data-element texts. Superseded for every current purpose by the domain-value decoding in services/aggregation.py, which reads DD07L/DD07T directly. |
+| `dict_tables` | `DD02L` | `not_validated` | DD02L is used by the resolver's own existence probe, which issues its SQL directly rather than through the dialect. No feature reads it. |
+| `dict_tables_text` | `DD02T` | `not_validated` | DD02T carries table descriptions. Object descriptions come from the BW text tables, which are the ones users recognise, so the dictionary texts are not surfaced. |
+| `log_messages` | `RSPCLOGS` | `not_validated` | RSPCLOGS was declared as holding per-step chain messages. Verified against the dictionary: it has four columns (TYPE, VARIANTE, INSTANCE, LOGHANDLE) and no message at all - it is a pointer into the Application Log. Reading the messages needs BALHDR/BALMSG or BAL_LOG_MSG_READ, neither of which this server declares, so the honest state is that this table alone cannot answer the question it was declared for. |
 

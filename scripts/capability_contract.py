@@ -38,6 +38,7 @@ import json
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
 
@@ -68,6 +69,124 @@ STATES = (
 )
 # States that are a positive statement about what the server does, as opposed to work outstanding.
 _IMPLEMENTED_STATES = ("SUPPORTED", "PARTIAL", "DISCOVERY_ONLY")
+
+# --- two axes, because one word was doing two jobs -------------------------------------------
+#
+# "SUPPORTED" reads to a customer as "validated against supported BW versions". It only ever meant
+# "a reader exists and a test covers it". Those are different claims and a buying decision rests on
+# the second one, so they are now separate columns.
+#
+# Implementation: does the code exist, and how completely.
+IMPLEMENTATION_STATUSES = (
+    "implemented",
+    "partial",
+    "discovery_only",
+    "planned",
+    "unsupported",
+    "deprecated",
+)
+IMPLEMENTATION_OF_STATE: dict[str, str] = {
+    "SUPPORTED": "implemented",
+    "PARTIAL": "partial",
+    "DISCOVERY_ONLY": "discovery_only",
+    "PLANNED": "planned",
+    "NOT_SUPPORTED": "unsupported",
+    "DEPRECATED": "deprecated",
+}
+
+# Validation: how far the code has been proven, weakest first. A ladder, so a caller can filter on
+# "at least unit_tested" without enumerating.
+VALIDATION_STATUSES = ("not_validated", "unit_tested", "integration_tested", "customer_validated")
+
+#: The BW release the integration verification below was performed against. A validation claim
+#: without a release is not a claim, because these tables differ across releases.
+LIVE_VERIFIED_RELEASE = "BW 7.50 (SAP_BW 750, HANA 2.0)"
+
+#: Capabilities exercised against a live BW system, with the result inspected.
+#:
+#: This is a **maintained claim of record**, not an inference, and the bar is deliberately high:
+#: existence-probing a table during capability discovery does not qualify, because probing that a
+#: table exists is not the same as reading it through a feature and checking what came back. Every
+#: entry here corresponds to a tool or repository method run against the reference system with its
+#: output examined. Anything not listed reports ``unit_tested`` at best.
+#:
+#: One stated exception, at the top of the list: a *discovery pattern* is never read as a table, so
+#: "read through a feature" cannot apply to it. Its feature **is** resolution - deciding which
+#: object-model variant a release carries - so it qualifies when the resolved name was returned by a
+#: live capability record and checked. The read recorder cannot see these at all, because the
+#: resolver issues its own SQL rather than going through the dialect; leaving them unvalidated would
+#: report a measurement limitation as an untested feature.
+LIVE_VERIFIED: frozenset[str] = frozenset(
+    {
+        # discovery patterns, verified through live capability resolution (see the note above):
+        # RSOADSO% -> RSOADSO, RSOHCPR% -> RSOHCPR, RSDDSTAT% -> RSDDSTAT, RSEC% -> RSECHIE
+        "adso",
+        "composite_provider",
+        "query_stats",
+        "analysis_auth",
+        # chains and scheduling
+        "chain_edges",
+        "chain_attr",
+        "chain_text",
+        "log_chain",
+        "process_log",
+        # providers, texts and master data
+        "dso_header",
+        "dso_field",
+        "dso_text",
+        "adso_header",
+        "adso_text",
+        "adso_keyfields",
+        "cube_header",
+        "cube_field",
+        "cube_text",
+        "multiprovider_part",
+        "composite_header",
+        "composite_text",
+        "infoobject",
+        "infoobject_text",
+        "characteristic",
+        "keyfigure",
+        "attribute",
+        "nav_attribute",
+        # transformations and routines
+        "transformation",
+        "transformation_field",
+        "transformation_rule",
+        "routine_source",
+        # BEx queries
+        "query_dir",
+        "query_provider",
+        "element_dir",
+        "element_xref",
+        "element_text",
+        "element_select",
+        "element_range",
+        "element_calc",
+        "global_variable",
+        "element_prop",
+        # HANA boundary
+        "object_dependencies",
+        "hana_views",
+        # BW 3.x dataflow
+        "transfer_structure",
+        "transfer_rule",
+        "update_rule",
+        "update_rule_routine",
+        "routine_source_3x",
+        "routine_text_3x",
+        "infosource_map",
+        # sources and the dictionary
+        "datasource",
+        "source_system",
+        "dict_columns",
+    }
+)
+
+#: Verified on a customer's own system, by that customer. Empty, and saying so is the point: a
+#: customer reading this contract can see exactly how much of it has been proven outside this
+#: project. Populating it is an onboarding output, not a development one.
+CUSTOMER_VALIDATED: frozenset[str] = frozenset()
 
 # Intent for every table no reader touches. Written once, deliberately, and asserted by --check.
 # The reason is the useful part: it tells the next reader whether this is work or a decision.
@@ -259,13 +378,34 @@ def _measure(observed_path: Path) -> set[str]:
     return _observed_readers(observed_path)
 
 
-def build() -> tuple[dict[str, tuple[str, str]], list[str]]:
-    """Return ``{logical: (state, reason)}`` and the list of undeclared drift."""
+@dataclass(frozen=True)
+class Entry:
+    """One capability's full contract row."""
+
+    state: str  # the six-value ContractState, kept because it is a published schema
+    reason: str
+    implementation: (
+        str  # implemented / partial / discovery_only / planned / unsupported / deprecated
+    )
+    validation: str  # not_validated / unit_tested / integration_tested / customer_validated
+    validated_on: str | None = None  # the release integration testing was done against
+
+
+def build() -> tuple[dict[str, Entry], list[str]]:
+    """Return the contract keyed by logical name, plus the list of undeclared drift.
+
+    The two read signals are kept apart here rather than unioned, because the difference between
+    them *is* the unit-test evidence: a capability the static scan finds has a reader, and a
+    capability the recorder saw during the suite has a reader **that a test exercised**. Unioning
+    them first, as an earlier version did, threw that distinction away.
+    """
     declared = _declared()
     observed_path = _ROOT / "output" / "capability-reads.json"
-    readers = _static_readers() | _measure(observed_path)
+    exercised = _measure(observed_path)  # touched while the tests ran
+    static = _static_readers()  # has a reader in the source
+    readers = static | exercised
 
-    contract: dict[str, tuple[str, str]] = {}
+    contract: dict[str, Entry] = {}
     drift: list[str] = []
     for logical in sorted(declared):
         if logical in readers:
@@ -277,14 +417,53 @@ def build() -> tuple[dict[str, tuple[str, str]], list[str]]:
                     f"{logical}: declared {state} but the server reads it - update DECLARED_STATE"
                 )
                 state = "SUPPORTED"
-            contract[logical] = (state, reason)
+            contract[logical] = Entry(
+                state=state,
+                reason=reason,
+                implementation=IMPLEMENTATION_OF_STATE[state],
+                validation=_validation_of(logical, exercised),
+                validated_on=LIVE_VERIFIED_RELEASE if logical in LIVE_VERIFIED else None,
+            )
             continue
         if logical in DECLARED_STATE:
-            contract[logical] = DECLARED_STATE[logical]
+            state, reason = DECLARED_STATE[logical]
+            contract[logical] = Entry(
+                state=state,
+                reason=reason,
+                implementation=IMPLEMENTATION_OF_STATE[state],
+                # No reader, so the recorder cannot have seen it: an empty exercised set makes
+                # `unit_tested` structurally unreachable here rather than merely unlikely. A live
+                # claim can still apply - a discovery pattern is verified by resolution, not a read.
+                validation=_validation_of(logical, set()),
+                validated_on=LIVE_VERIFIED_RELEASE if logical in LIVE_VERIFIED else None,
+            )
             continue
         drift.append(f"{logical}: declared as a capability, never read, and no state declared")
-        contract[logical] = ("PLANNED", "UNDECLARED - no reader and no stated intent")
+        contract[logical] = Entry(
+            state="PLANNED",
+            reason="UNDECLARED - no reader and no stated intent",
+            implementation="planned",
+            validation="not_validated",
+        )
     return contract, drift
+
+
+def _validation_of(logical: str, exercised: set[str]) -> str:
+    """The highest validation level this capability has actually reached.
+
+    Deliberately never inferred upward. A capability with a reader that no test touched is
+    ``not_validated``, not ``unit_tested`` - the recorder measures which tables the suite actually
+    asked for, so this is observed rather than assumed. ``customer_validated`` is reserved for
+    verification on a customer's own system by that customer, which nothing has yet reached; that
+    empty column is the most useful thing in it.
+    """
+    if logical in CUSTOMER_VALIDATED:
+        return "customer_validated"
+    if logical in LIVE_VERIFIED:
+        return "integration_tested"
+    if logical in exercised:
+        return "unit_tested"
+    return "not_validated"
 
 
 CONTRACT_PATH = _ROOT / "docs" / "capability-contract.md"
@@ -293,7 +472,7 @@ CONTRACT_PATH = _ROOT / "docs" / "capability-contract.md"
 DATA_PATH = _ROOT / "src" / "mcp_server_sapbw" / "data" / "capability_contract.json"
 
 
-def _render_data(contract: dict[str, tuple[str, str]], declared: dict[str, str]) -> str:
+def _render_data(contract: dict[str, Entry], declared: dict[str, str]) -> str:
     """The machine-readable twin of the markdown artifact.
 
     Revision is the package version plus a digest of the contract content, not a wall-clock
@@ -303,8 +482,11 @@ def _render_data(contract: dict[str, tuple[str, str]], declared: dict[str, str])
         {
             "capability": name,
             "object_name": declared.get(name, ""),
-            "state": contract[name][0],
-            "reason": contract[name][1],
+            "state": contract[name].state,
+            "implementation": contract[name].implementation,
+            "validation": contract[name].validation,
+            "validated_on": contract[name].validated_on,
+            "reason": contract[name].reason,
         }
         for name in sorted(contract)
     ]
@@ -318,9 +500,13 @@ def _render_data(contract: dict[str, tuple[str, str]], declared: dict[str, str])
     return json.dumps(payload, indent=2) + "\n"
 
 
-def _render(contract: dict[str, tuple[str, str]], declared: dict[str, str]) -> str:
+def _render(contract: dict[str, Entry], declared: dict[str, str]) -> str:
     """The committed artifact. Reviewable in a diff, and the test asserts it stays complete."""
-    implemented = sum(1 for s, _ in contract.values() if s in _IMPLEMENTED_STATES)
+    implemented = sum(1 for e in contract.values() if e.state in _IMPLEMENTED_STATES)
+    by_validation = {
+        level: sum(1 for e in contract.values() if e.validation == level)
+        for level in VALIDATION_STATUSES
+    }
     lines = [
         "# Capability contract",
         "",
@@ -331,35 +517,61 @@ def _render(contract: dict[str, tuple[str, str]], declared: dict[str, str]) -> s
         "separately and a drift check fails the build when a capability is declared with",
         "neither a reader nor a stated reason.",
         "",
-        f"**{implemented} of {len(contract)} declared capabilities are implemented** "
-        f"(`SUPPORTED`, `PARTIAL` or `DISCOVERY_ONLY`).",
+        "## Two questions, two columns",
         "",
-        "| State | Meaning |",
+        "**Does the code exist** and **has it been proven** are different questions, and a buying",
+        'decision rests on the second. They used to share one word: `SUPPORTED` meant "a reader',
+        'exists and a test covers it", but reads as "validated against supported BW versions".',
+        "",
+        f"- **Implementation** - {implemented} of {len(contract)} capabilities are implemented.",
+        f"- **Validation** - {by_validation['integration_tested']} have been read through a real",
+        f"  feature against a live BW system, {by_validation['unit_tested']} are covered by the",
+        f"  offline suite only, {by_validation['not_validated']} are unproven, and",
+        f"  **{by_validation['customer_validated']} have been validated on a customer's own",
+        "  system**.",
+        "",
+        "| Validation | Meaning |",
         "|---|---|",
-        "| `SUPPORTED` | Read by the server and covered by tests |",
-        "| `PARTIAL` | Read, but the surface built on it is incomplete - the gap is named |",
-        "| `DISCOVERY_ONLY` | Not read as a table; used to detect an object-model variant |",
-        "| `PLANNED` | Declared ahead of implementation, with the intended feature named |",
-        "| `NOT_SUPPORTED` | Validation plumbing only; no feature will read it |",
-        "| `DEPRECATED` | Superseded; kept so an older release still resolves |",
+        "| `customer_validated` | Verified on a customer's system, by that customer |",
+        f"| `integration_tested` | Read through a feature against {LIVE_VERIFIED_RELEASE}, output "
+        "inspected |",
+        "| `unit_tested` | Exercised by the offline suite against synthetic fixtures |",
+        "| `not_validated` | No test has touched it. A reader may still exist |",
         "",
-        "Presence of a table on *your* system is a separate question, answered per connection by",
-        "`bw_system_profile`. This file records what the server would do with it if present.",
+        "Validation is measured, not asserted: the SQL dialect records which logical tables the",
+        "suite actually asks for, so `unit_tested` is observed. It is never inferred upward - a",
+        "capability with a reader that no test touched reports `not_validated`.",
+        "",
+        "| State | Implementation | Meaning |",
+        "|---|---|---|",
+        "| `SUPPORTED` | `implemented` | Read by the server |",
+        "| `PARTIAL` | `partial` | Read, but the surface built on it is incomplete - gap named |",
+        "| `DISCOVERY_ONLY` | `discovery_only` | Not read as a table; detects an object-model "
+        "variant |",
+        "| `PLANNED` | `planned` | Declared ahead of implementation, intended feature named |",
+        "| `NOT_SUPPORTED` | `unsupported` | Validation plumbing only; no feature will read it |",
+        "| `DEPRECATED` | `deprecated` | Superseded; kept so an older release still resolves |",
+        "",
+        "Presence of a table on *your* system is a third question again, answered per connection",
+        "by `bw_system_profile` and crossed with this contract by `bw_capability_report`.",
         "",
     ]
     for state in STATES:
-        names = sorted(n for n, (s, _r) in contract.items() if s == state)
+        names = sorted(n for n, e in contract.items() if e.state == state)
         if not names:
             continue
         lines += [
             f"## {state} ({len(names)})",
             "",
-            "| Capability | Object | Notes |",
-            "|---|---|---|",
+            "| Capability | Object | Validation | Notes |",
+            "|---|---|---|---|",
         ]
         for name in names:
-            reason = contract[name][1].replace("|", "\\|")
-            lines.append(f"| `{name}` | `{declared.get(name, '?')}` | {reason} |")
+            entry = contract[name]
+            reason = entry.reason.replace("|", "\\|")
+            lines.append(
+                f"| `{name}` | `{declared.get(name, '?')}` | `{entry.validation}` | {reason} |"
+            )
         lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -388,8 +600,8 @@ def main() -> int:
                 return 1
 
     by_state: dict[str, list[str]] = {}
-    for logical, (state, _reason) in contract.items():
-        by_state.setdefault(state, []).append(logical)
+    for logical, entry in contract.items():
+        by_state.setdefault(entry.state, []).append(logical)
 
     print(f"Capability contract - {len(contract)} declared capabilities\n")
     for state in STATES:
@@ -398,8 +610,14 @@ def main() -> int:
             continue
         print(f"{state} ({len(names)})")
         for name in names:
-            print(f"    {name}")
+            print(f"    {name}  [{contract[name].validation}]")
         print()
+
+    print("Validation (measured, never inferred upward):")
+    for level in reversed(VALIDATION_STATUSES):
+        count = sum(1 for e in contract.values() if e.validation == level)
+        print(f"    {level:20s} {count}")
+    print()
 
     if drift:
         print(f"DRIFT ({len(drift)}):")

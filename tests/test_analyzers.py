@@ -100,10 +100,10 @@ _DSO_EDGES = [
 _INBOUND = {
     "MERGE_DSO": [("TR_M1", "ORD_DSO"), ("TR_M2", "BILL_DSO"), ("TR_M3", "SHIP_DSO")],
 }
-# Write-back shapes. SELF_DSO is written from itself; A_DSO and B_DSO each feed the other.
+# Circular-dependency shapes. SELF_DSO is written from itself; A_DSO and B_DSO each feed the other.
 # TRANID, SOURCENAME, TARGETNAME, TARGETTYPE
 _SELF_LOOPS = [("TR_SELF", "SELF_DSO", "SELF_DSO", "ODSO")]
-# Every source <> target edge, which is what the write-back cycle scan reads.
+# Every source <> target edge, which is what the circular-dependency scan reads.
 # TRANID, SOURCENAME, SOURCETYPE, TARGETNAME, TARGETTYPE - both endpoint types, because typing one
 # side only gives an object two graph keys and no cycle is ever found.
 _ALL_EDGES = [
@@ -168,9 +168,9 @@ class ScriptedConnection:
             # Guard: an aggregate select is only valid with a GROUP BY (HANA rejects it otherwise);
             # returning [] when it is missing makes the offline test catch that regression.
             return _MERGED_GROUP if "GROUP BY" in sql else []
-        if "SOURCENAME = TARGETNAME" in sql:  # write-back self-loops
+        if "SOURCENAME = TARGETNAME" in sql:  # self-loops (an object that feeds itself)
             return _SELF_LOOPS
-        if "SOURCENAME <> TARGETNAME" in sql:  # write-back cycle scan (all edges)
+        if "SOURCENAME <> TARGETNAME" in sql:  # circular-dependency scan (all edges)
             return _ALL_EDGES
         if "STARTROUTINE <> ''" in sql:  # 9.1 routine-bearing transformations into DSOs
             return [("TR_FULL", "FULL_DSO"), ("TR_MANY", "FULL_DSO"), ("TR_NONE", "FULL_DSO")]
@@ -467,7 +467,7 @@ def test_source_system_outage_degrades_to_bw_only_evidence() -> None:
     assert _finding_for(report, "DS_ENH").metrics["customer_field_count"] == 5
 
 
-# --- write-back loops in the layer-violation analyzer -----------------------------------------
+# --- circular dependencies in the layer-violation analyzer ---------------------------------
 
 
 def _violations() -> Any:
@@ -528,8 +528,30 @@ def test_cycle_scope_is_declared() -> None:
     assert "Longer cycles" not in caveats
 
 
+def test_findings_never_call_a_cycle_a_write_back() -> None:
+    """Customer-facing wording, pinned.
+
+    In BW, "write-back" already means planning data written back to a provider - a real and
+    different feature. Using it for a dependency cycle is ambiguous inside BW's own vocabulary, and
+    to anyone outside it reads as though this server modifies the system. It issues SELECT only.
+    """
+    report = _violations()
+    surface = " ".join(
+        [
+            *(f.title for f in report.findings),
+            *(f.detail for f in report.findings),
+            *(f.recommendation for f in report.findings),
+            *report.caveats,
+            report.title,
+        ]
+    ).lower()
+    assert "write-back" not in surface
+    assert "write back" not in surface
+    assert "circular dependency" in surface
+
+
 def test_existing_layer_violations_still_reported() -> None:
-    """Adding write-back detection must not displace the CP->DSO / deep-stack findings."""
+    """Adding cycle detection must not displace the CP->DSO / deep-stack findings."""
     report = _violations()
     titles = {f.title for f in report.findings}
     assert any("CompositeProvider -> DSO" in t for t in titles)

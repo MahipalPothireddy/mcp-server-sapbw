@@ -63,6 +63,9 @@ def build_report(record: CapabilityRecord) -> CapabilityReport:
                 capability=name,
                 object_name=entry.object_name,
                 state=entry.state,
+                implementation=entry.implementation,
+                validation=entry.validation,
+                validated_on=entry.validated_on,
                 reason=entry.reason,
                 present=present,
                 resolved_name=None if status is None else status.resolved_name,
@@ -73,9 +76,14 @@ def build_report(record: CapabilityRecord) -> CapabilityReport:
 
     totals: dict[str, int] = {}
     by_state: dict[str, int] = {}
+    by_validation: dict[str, int] = {}
     for row in rows:
         totals[row.verdict] = totals.get(row.verdict, 0) + 1
         by_state[row.state] = by_state.get(row.state, 0) + 1
+        # Counted over the usable set only: how well-proven a capability is only matters for the
+        # ones this system can actually use.
+        if row.verdict == "usable":
+            by_validation[row.validation] = by_validation.get(row.validation, 0) + 1
 
     untracked = sum(1 for row in rows if row.present is None)
     if untracked:
@@ -99,11 +107,28 @@ def build_report(record: CapabilityRecord) -> CapabilityReport:
             "time; presence and row estimates come from this system's discovery record."
         )
 
+    unproven = by_validation.get("not_validated", 0) + by_validation.get("unit_tested", 0)
+    if unproven:
+        caveats.append(
+            f"{unproven} of the usable capabilities have not been verified against a real BW "
+            "system - they are covered by the offline suite only, or by nothing. 'usable' means a "
+            "reader exists and the object is present here; it does not mean the two have been "
+            "proven to work together on a release like yours. Read the per-capability `validation` "
+            "field before relying on one."
+        )
+    if not by_validation.get("customer_validated"):
+        caveats.append(
+            "No capability has been validated on a customer's own system yet. That is stated "
+            "rather than omitted: it is the honest position of a pre-1.0 build, and it is the gap "
+            "an onboarding exercise closes."
+        )
+
     return CapabilityReport(
         system=record.system,
         bw_release=record.bw_release,
         totals=totals,
         by_state=by_state,
+        by_validation=by_validation,
         capabilities=rows,
         caveats=caveats,
     )

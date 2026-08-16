@@ -60,7 +60,8 @@ SCENARIO_TITLES: dict[str, str] = {
     "9.7": "Downstream report schedules vs. feeding-chain completion",
     "9.8": "Dashboards reading calc views directly (bypassing BW)",
     "layer_violations": (
-        "Structural layer violations (CP->DSO, CP->InfoObject, deep DSO stacks, write-back loops)"
+        "Structural layer violations (CP->DSO, CP->InfoObject, deep DSO stacks, "
+        "circular dependencies)"
     ),
     "unused_providers": "Providers with no maintained consumer (decommission candidates)",
 }
@@ -1524,17 +1525,22 @@ class Analyzers(Repository):
             truncated=len(findings) >= limit,
             caveats=[
                 f"Deep-stack threshold is {max_dso_depth} DSO->DSO hops; adjust via max_dso_depth.",
-                "Write-back cycles are detected at any length, not just pairs: each finding names "
-                "every object in the loop. Self-loops are reported separately. The only bound is "
-                f"the edge scan, capped at {_SCAN_CAP} rows - a cycle whose edges fall outside "
-                "that scan would be missed.",
+                "Circular dependencies are detected at any length, not just pairs: each finding "
+                "names every object in the loop. An object that feeds itself is reported "
+                "separately. The only bound is the edge scan, capped at "
+                f"{_SCAN_CAP} rows - a cycle whose edges fall outside that scan would be missed.",
             ],
         )
 
-    # --- write-back loops ------------------------------------------------------------------
+    # --- circular dependencies -------------------------------------------------------------
+    #
+    # Deliberately not called "write-back": in BW that term already means planning data written back
+    # to a provider, which is a different and legitimate feature. Using it for a dependency cycle is
+    # ambiguous inside BW's own vocabulary, and to anyone outside it reads as though this server
+    # modifies the system. It does not - it issues SELECT only.
 
     def _self_loop_violations(self, limit: int) -> list[Finding]:
-        """A transformation whose source and target are the same object: a read-write-back loop.
+        """A transformation whose source and target are the same object: it reads what it writes.
 
         The load reads the object it writes, so the result depends on how much of the target was
         already populated when the DTP ran. Re-running it does not reproduce the same data, which is
@@ -1556,7 +1562,7 @@ class Analyzers(Repository):
                 Finding(
                     scenario="layer_violation",
                     severity="high",
-                    title="Write-back loop: transformation reads and writes the same object",
+                    title="Circular dependency: a transformation reads and writes the same object",
                     affected_objects=[name],
                     evidence=[
                         self.provenance("transformation", {"TRANID": str(tranid), "OBJVERS": "A"})
@@ -1630,9 +1636,9 @@ class Analyzers(Repository):
                     scenario="layer_violation",
                     severity="high",
                     title=(
-                        "Write-back cycle: two objects each feed the other"
+                        "Circular dependency: two objects each feed the other"
                         if len(names) == _PAIR
-                        else f"Write-back cycle across {len(names)} objects"
+                        else f"Circular dependency across {len(names)} objects"
                     ),
                     affected_objects=names,
                     evidence=[

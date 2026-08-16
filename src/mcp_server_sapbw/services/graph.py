@@ -9,7 +9,9 @@ carried this caveat:
     Write-back detection covers self-loops and two-object cycles. Longer cycles (A->B->C->A) are
     not searched.
 
-A three-object write-back loop has no correct load order either, and it was invisible.
+A three-object circular dependency has no correct load order either, and it was invisible. (The
+finding is no longer called "write-back": in BW that term already means planning data written back
+to a provider, so it was ambiguous inside BW's own vocabulary as well as outside it.)
 
 :class:`ObjectGraph` holds nodes keyed by canonical id (``models.objects.BwObjectRef.id``) and
 answers the dependency questions once: neighbours, reachability, paths, and cycles.
@@ -53,11 +55,11 @@ class GraphEdge:
 
 @dataclass
 class Cycle:
-    """A set of objects that each depend on the others, transitively.
+    """A circular dependency: objects that each depend on the others, transitively.
 
-    ``members`` of size one is a self-loop: an object whose transformation reads and writes it. Size
-    two or more is a strongly connected component - every member is reachable from every other, so
-    there is no load order that produces a defined result, and re-running a failed request cannot
+    ``members`` of size one is a self-loop: an object whose transformation reads and writes it.
+    Size two or more is a strongly connected component - every member is reachable from every
+    other, so no load order produces a defined result and re-running a failed request cannot
     fix it.
     """
 
