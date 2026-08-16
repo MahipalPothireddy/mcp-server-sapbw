@@ -53,6 +53,7 @@ from .core.snapshots import SnapshotStore, snapshot_file
 from .core.support import support_matrix
 from .models.access import AccessReport
 from .models.analysis import Analysis
+from .models.assessment import LandscapeAssessment
 from .models.capability import CapabilityRecord, CapabilityReport
 from .models.chains import (
     Chain,
@@ -86,6 +87,7 @@ from .models.security import (
     QueryAuthExposure,
     SecurityOverview,
 )
+from .models.semantics import SemanticMap
 from .models.snapshot import Snapshot, SnapshotDiff, SnapshotSummary
 from .models.sources import EnhancementInventory, SourceTopology
 from .models.support import SupportMatrix
@@ -104,11 +106,13 @@ from .repositories.providers import ProvidersRepository
 from .repositories.queries import QueriesRepository
 from .repositories.search import SearchRepository
 from .repositories.security import SecurityRepository
+from .repositories.semantics import SemanticsRepository
 from .repositories.sources import SourcesRepository
 from .repositories.threex import ThreeXRepository
 from .repositories.transformations import TransformationsRepository
 from .services.analysis import AnalysisReaders, AnalysisService
 from .services.analyzers import Analyzers
+from .services.assessment import AssessmentService
 from .services.capability_report import build_report
 from .services.diagram import build_layout, png_available, render_png, render_svg
 from .services.docgen import DocGenerator, DocGenResult
@@ -382,6 +386,8 @@ class Runtime(Protocol):
     def queries(self, system: str) -> QueriesRepository: ...
     def hana(self, system: str) -> HanaRepository: ...
     def analyzers(self, system: str) -> Analyzers: ...
+    def assessment(self, system: str) -> AssessmentService: ...
+    def semantics(self, system: str) -> SemanticsRepository: ...
     def docgen(self, system: str) -> DocGenerator: ...
     def load_closure(self, system: str) -> LoadClosureService: ...
     def health(self, system: str) -> HealthRepository: ...
@@ -681,6 +687,14 @@ class ServerRuntime:
             self.capability(system),
             self._cache(system),
             registry=self._registry(system),
+        )
+
+    def assessment(self, system: str) -> AssessmentService:
+        return AssessmentService(self.analyzers(system), self.capability(system), system)
+
+    def semantics(self, system: str) -> SemanticsRepository:
+        return SemanticsRepository(
+            self._connection(system), self.capability(system), self._cache(system)
         )
 
     def docgen(self, system: str) -> DocGenerator:
@@ -2195,6 +2209,72 @@ def bw_get_routine_register(
         .routine_register(system)
         .build(limit=limit, offset=offset, parse_budget=parse_budget)
     )
+
+
+@_readonly_tool
+def bw_list_business_areas(
+    system: str, limit: int = _DEFAULT_PAGE, offset: int = 0
+) -> SemanticMap | UnsupportedResult:
+    """BW's own business grouping, resolved: which InfoArea each provider belongs to.
+
+    The semantic layer BW already has. Every provider header carries an ``INFOAREA``, and that code
+    was reaching callers unresolved - ``AREA_04`` with no name and no position in the hierarchy,
+    because the tables holding those (``RSDAREA``, ``RSDAREAT``) were not read at all. This resolves
+    the code to a name and a root-to-leaf ``path``, so "which parts of the landscape serve Sales?"
+    is answerable without knowing the site's area codes.
+
+    **Assignment is declared, never inferred.** It comes from BW's ``INFOAREA`` field and nothing
+    else. No area is guessed from a naming convention: a convention is a site habit rather than a
+    fact, and a wrong functional attribution sends a change review to the wrong team - worse than
+    admitting an object is unassigned. Objects with no InfoArea are therefore *counted* as
+    ``unassigned_providers`` rather than pattern-matched into an area, and that count is a finding
+    in its own right.
+
+    Three distinctions the reply keeps apart, because each has a different cause:
+
+    * ``empty_areas`` - BW names the area but nothing is assigned to it. Usually an organising node.
+    * ``unresolved_areas`` - a provider references an area the hierarchy does not contain, so it
+      could not be placed. A missing name is not a missing assignment.
+    * ``unassigned_providers`` - the provider itself carries no area.
+
+    An InfoArea is a *modelling* grouping, so it reflects how the landscape was built rather than an
+    authoritative business owner. Read it as the strongest declared signal available, not as
+    governance.
+    """
+    limit, offset = _clamp_page(limit, offset)
+    return runtime().semantics(system).business_areas(limit=limit, offset=offset)
+
+
+@_readonly_tool
+def bw_assess_landscape(system: str, limit_per_scenario: int = 25) -> LandscapeAssessment:
+    """All the risk analyses in one call: a score, and the coverage that qualifies it.
+
+    The executive view. Nine analyses run, their findings roll up by severity, and the result
+    carries a 0-100 score with a published formula and a letter grade.
+
+    **Read ``coverage`` before you read ``score``.** Three of the analyses need metadata a release
+    may not carry or a system outside BW, and any of them may examine no candidates because none
+    exist. Every one of those cases contributes zero findings, so a naive sum would *raise* the
+    score - it would peak on the landscape nobody managed to look at. The score is computed over
+    the ``assessed`` scenarios only, every other scenario reports why it contributed nothing, and
+    ``provisional`` is true whenever coverage is short of complete. When coverage is partial the
+    score is an **upper bound**: problems the missing analyses would have found are not deducted.
+
+    ``score`` is ``None`` when nothing could be assessed - never zero, because zero and "we could
+    not look" are opposite readings and a default would be indistinguishable from a clean result.
+
+    Each scenario's status says which case it is: ``assessed``, ``nothing_to_assess`` (ran, no
+    candidates - an absence of subjects, not a pass), ``unsupported`` (this release lacks the
+    metadata), ``connector_required`` (the answer is completed outside BW), or ``failed``.
+
+    Decomposable by design. ``SEVERITY_WEIGHTS`` are published in ``score_basis``, each scenario
+    reports its own ``deduction``, and ``top_findings`` are carried whole with their evidence - so a
+    disputed grade can be recomputed and traced to the metadata rows behind it. There is
+    deliberately no confidence percentage: the score says how the landscape looks, coverage says how
+    much of it was seen, and blending those into one number would hide which is driving it.
+    """
+    limit_per_scenario, _ = _clamp_page(limit_per_scenario, 0)
+    return runtime().assessment(system).assess(limit_per_scenario=limit_per_scenario)
 
 
 @_readonly_tool

@@ -120,6 +120,16 @@ _PER_SYSTEM_BOUNDS: dict[str, CostBound] = {
         on_hit="the manifest lists what was written; resume=true continues a cut-off run",
     ),
     "bw_get_routine_register": REGISTER,
+    "bw_assess_landscape": CostBound(
+        bound="9 analyses, each capped by limit_per_scenario (default 25)",
+        constant="services.assessment.ASSESSED_SCENARIOS",
+        on_hit="each scenario reports truncated, and the assessment calls its counts lower bounds",
+    ),
+    "bw_list_business_areas": CostBound(
+        bound="one grouped COUNT per provider family",
+        constant="repositories.semantics._PROVIDER_SOURCES",
+        on_hit="no row cap is needed: the read aggregates in the database, not in the reply",
+    ),
     "bw_get_extractor_exit_code": CostBound(
         bound="400 satellite program fetches (configurable)",
         constant="EccProfile.max_satellite_fetches",
@@ -186,6 +196,8 @@ _PER_GRAPH = (
     "bw_troubleshoot_missing_data",
 )
 _PER_SYSTEM = (
+    "bw_assess_landscape",
+    "bw_list_business_areas",
     "bw_get_routine_register",
     "bw_find_unused_providers",
     "bw_find_layer_violations",
@@ -270,9 +282,14 @@ _NOTES: dict[str, list[str]] = {
 }
 
 
+#: Tools that page their reply without being ``per_page`` overall - the database work scales with
+#: the landscape even though the reply does not, so both bounds apply and both are worth stating.
+_ALSO_PAGINATED = frozenset({"bw_list_business_areas"})
+
+
 def _bounds_for(tool: str, growth: GrowthClass) -> list[CostBound]:
     bounds: list[CostBound] = []
-    if growth == "per_page":
+    if growth == "per_page" or tool in _ALSO_PAGINATED:
         bounds.append(PAGE)
     if growth == "per_graph_node":
         bounds.append(GRAPH)
@@ -298,6 +315,16 @@ def _bounds_for(tool: str, growth: GrowthClass) -> list[CostBound]:
 # --- payload measurement ------------------------------------------------------------------
 
 
+#: Tools whose payload cannot be measured here because it *is* what this script writes.
+#:
+#: ``bw_performance_profile`` reads the shipped profile, so measuring it records a size that depends
+#: on the file being written - and the next run measures the new file and gets a different number.
+#: Regeneration could not converge, and ``--check`` failed immediately after a rebuild (it did).
+#: Reported as ``not_measured`` with the reason, rather than pinned to a value that is wrong by
+#: construction.
+_SELF_REFERENTIAL = frozenset({"bw_performance_profile"})
+
+
 def _measure_payloads() -> dict[str, int]:
     """Serialised reply size per tool, against the synthetic fixtures.
 
@@ -315,7 +342,7 @@ def _measure_payloads() -> dict[str, int]:
 
     sizes: dict[str, int] = {}
     for tool, args in sorted(_ARGS.items()):
-        if tool in _NEEDS_OUTPUT_DIR:
+        if tool in _NEEDS_OUTPUT_DIR or tool in _SELF_REFERENTIAL:
             continue
         server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
         size = asyncio.run(one(tool, args))
@@ -369,6 +396,12 @@ def build() -> PerformanceProfile:
         caveats.append(
             f"{len(unmeasured)} tool(s) could not be measured against the fixtures "
             f"({', '.join(unmeasured)}), so their payload is unknown rather than small."
+        )
+    if _SELF_REFERENTIAL:
+        caveats.append(
+            f"{', '.join(sorted(_SELF_REFERENTIAL))} read this profile, so measuring their payload "
+            "would depend on the file this run writes and regeneration could not converge. Left "
+            "unmeasured deliberately rather than pinned to a value that is wrong by construction."
         )
 
     return PerformanceProfile(

@@ -12,7 +12,7 @@ own where-used lists), and can render a full markdown knowledge base on demand.
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **58 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **60 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -261,7 +261,7 @@ Denial and absence are now recorded separately, and `bw_access_report` names the
 `bw_support_matrix` is keyed by **tool**, because that is the unit the question is asked in. Its
 `requires` field bridges to the capability contract and is **measured**, by attributing each metadata
 read to the tool that caused it while the offline suite runs — so it cannot drift the way a
-hand-written mapping across 58 tools would. It is a lower bound: everything listed really is read,
+hand-written mapping across 60 tools would. It is a lower bound: everything listed really is read,
 and a code path no test reaches contributes nothing.
 
 There is deliberately no `supported` verdict. Every value says where the claim comes from:
@@ -269,7 +269,7 @@ There is deliberately no `supported` verdict. Every value says where the claim c
 not everything verified there), `unverified` (**nobody has run it against that release — not a
 prediction**), `needs_connector`, `unknown`.
 
-Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 41 tools `verified`, 15 `expected`, 2
+Only **BW 7.50** has been verified (SAP_BW 750, HANA 2.0): 43 tools `verified`, 15 `expected`, 2
 connector-gated. Every other release reports `unverified` for every tool. That is an absence of
 evidence stated rather than filled in — which metadata objects a release carries is exactly what the
 capability resolver discovers at connect time, and predicting it from a version number would be
@@ -397,6 +397,7 @@ not today, so a restored copy is not read as dormant.
 |---|---|---|
 | `bw_search_objects` | `system`, `pattern`, `object_types?`, `match_descriptions=true`, `limit`, `offset` | Fuzzy search by technical name or description across object types (see [Name filters](#name-filters)) |
 | `bw_describe_object` | `system`, `name` | Universal deep-dive: type, fields, key, parts, description (stored vs. generated) |
+| `bw_list_business_areas` | `system`, `limit`, `offset` | BW's own InfoArea grouping, resolved to names and a hierarchy path |
 
 #### Name filters
 
@@ -599,6 +600,7 @@ catch-all. That is a live configuration fault, and it is invisible unless both s
 | `bw_check_schedule_risk` | `system`, `limit` | Scenario 9.7: report schedules vs. feeding-chain p95 (needs a BI connector) |
 | `bw_find_layer_violations` | `system`, `max_dso_depth=3`, `limit` | CompositeProvider→DSO, CompositeProvider→InfoObject, deep DSO stacks, **circular dependencies** |
 | `bw_review_scenario` | `system`, `scenario`, `limit=50` | Run any analysis by id (`9.1`–`9.8`, `layer_violations`, `unused_providers`) |
+| `bw_assess_landscape` | `system`, `limit_per_scenario=25` | **All nine analyses in one call**: a score, and the coverage that qualifies it |
 
 Circular dependencies are the severe ones. A transformation whose source and target are the same
 object makes its own load non-repeatable: the output depends on what the target already held, so a
@@ -615,6 +617,46 @@ routines look up, so a stale-data risk is substantiated rather than assumed, and
 the cadence contract is actually violated. Scenario 9.6 reports the appended fields as
 metadata-confirmed evidence; with an `ecc_systems` profile configured it also reports which tables
 the exit branch reads and escalates to high severity on a per-record `SELECT`.
+
+#### The rolled-up score, and why it carries coverage
+
+`bw_assess_landscape` runs all nine analyses and returns a 0–100 score with a letter grade. The
+number is the easy part; the bookkeeping around it is what makes it usable.
+
+Three of the analyses need metadata a release may not carry or a system outside BW, and any of them
+may examine no candidates because none exist. Each of those contributes zero findings — so a naive
+sum **raises** the score. It would peak on the landscape nobody managed to look at. So:
+
+- the score is computed over the `assessed` scenarios **only**;
+- every other scenario reports *why* it contributed nothing — `unsupported`, `connector_required`,
+  `nothing_to_assess` (ran, no candidates: an absence of subjects, not a pass), or `failed`;
+- `provisional` is true whenever coverage is short of complete, and a partial score is stated to be
+  an **upper bound** — problems the missing analyses would have found are not deducted;
+- `score` is `None`, never zero, when nothing could be assessed. Zero and "we could not look" are
+  opposite readings, and a default would be indistinguishable from a clean bill of health.
+
+Decomposable by design: the severity weights are published in `score_basis`, each scenario reports
+its own `deduction`, and `top_findings` are carried whole with their evidence — so a disputed grade
+can be recomputed and traced to the metadata rows behind it. There is deliberately no confidence
+percentage: the score says how the landscape looks, coverage says how much of it was seen, and one
+number blending both would hide which is driving it.
+
+### Business areas
+
+`bw_list_business_areas` resolves BW's own semantic grouping. Every provider header carries an
+`INFOAREA`, and that code was reaching callers unresolved — `AREA_04`, with no name and no place in the
+hierarchy, because the tables holding those (`RSDAREA`, `RSDAREAT`) were not read at all. Now an area
+resolves to a name and a root-to-leaf `path`, so "which parts of the landscape serve Sales?" is
+answerable without knowing the site's area codes.
+
+**Declared, never inferred.** Assignment comes from BW's `INFOAREA` field and nothing else. No area
+is guessed from a naming convention: a convention is a site habit rather than a fact, and a wrong
+functional attribution sends a change review to the wrong team — worse than admitting the object is
+unassigned. Three cases are kept apart because each has a different cause: `unassigned_providers`
+(the object carries no area), `unresolved_areas` (a provider references an area the hierarchy does
+not contain — a missing name is not a missing assignment), and `empty_areas` (BW names it but nothing
+is in it). An InfoArea is a *modelling* grouping, so read it as the strongest declared signal
+available, not as governance.
 
 ### Documentation
 
@@ -680,7 +722,7 @@ the answer to "does this get worse on a system our size":
 | `per_page` | 12 | One page of rows; cost set by `limit`, with `total_count` behind it. |
 | `per_object` | 17 | Proportional to the one object named, not to how many exist. |
 | `per_graph_node` | 7 | Follows the connected subgraph — a hub costs far more than a leaf at equal depth. |
-| `per_system` | 13 | **Scans a whole class of objects.** Plan for these; each names the cap that stops it. |
+| `per_system` | 15 | **Scans a whole class of objects.** Plan for these; each names the cap that stops it. |
 
 Two facts are kept apart rather than blended into a score. `fixture_payload_bytes` is **measured**
 against the synthetic fixtures, so CI can check it, but it is a floor: the fixtures hold about one

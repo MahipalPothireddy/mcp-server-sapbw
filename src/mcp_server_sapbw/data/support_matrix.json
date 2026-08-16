@@ -5,7 +5,7 @@
     "Only BW 7.50 has been verified (SAP_BW 750, HANA 2.0). Every other release reports 'unverified' for every tool. That is an absence of evidence, stated rather than filled in: which metadata objects a release carries is what the capability resolver discovers at connect time, and predicting it from a version number here would be guesswork wearing the clothes of a support statement.",
     "On an unverified release, the capabilities resolved by pattern rather than by a known name are the ones that decide the answer: adso, analysis_auth, composite_provider, extractor, extractor_field, query_stats, transformation_text. Connect and run bw_capability_report to settle them in one call."
   ],
-  "contract_revision": "0.1.0+3d787eee",
+  "contract_revision": "0.1.0+469688a7",
   "releases": [
     {
       "evidence": "not_verified",
@@ -177,6 +177,31 @@
         "transformation_step_rout"
       ],
       "tool": "bw_assess_change_impact",
+      "validation": "unit_tested"
+    },
+    {
+      "implementation": "implemented",
+      "measurement": "measured",
+      "needs_connector": null,
+      "note": "",
+      "releases": {
+        "BW 7.40": "unverified",
+        "BW 7.50": "expected",
+        "BW/4HANA 2.0": "unverified"
+      },
+      "requires": [
+        "chain_attr",
+        "chain_text",
+        "dso_header",
+        "dtp",
+        "element_text",
+        "hana_views",
+        "log_chain",
+        "query_dir",
+        "query_provider",
+        "transformation"
+      ],
+      "tool": "bw_assess_landscape",
       "validation": "unit_tested"
     },
     {
@@ -756,6 +781,20 @@
       "validation": "not_validated"
     },
     {
+      "implementation": null,
+      "measurement": "measured",
+      "needs_connector": null,
+      "note": "Measured to read no BW metadata.",
+      "releases": {
+        "BW 7.40": "unverified",
+        "BW 7.50": "verified",
+        "BW/4HANA 2.0": "unverified"
+      },
+      "requires": [],
+      "tool": "bw_list_business_areas",
+      "validation": "not_validated"
+    },
+    {
       "implementation": "implemented",
       "measurement": "measured",
       "needs_connector": null,
@@ -1078,16 +1117,16 @@
   "totals": {
     "BW 7.40": {
       "needs_connector": 2,
-      "unverified": 56
+      "unverified": 58
     },
     "BW 7.50": {
-      "expected": 15,
+      "expected": 16,
       "needs_connector": 2,
-      "verified": 41
+      "verified": 42
     },
     "BW/4HANA 2.0": {
       "needs_connector": 2,
-      "unverified": 56
+      "unverified": 58
     }
   }
 }

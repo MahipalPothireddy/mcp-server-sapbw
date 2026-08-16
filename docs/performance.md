@@ -14,7 +14,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `per_page` | 12 | Returns one page of rows. Cost is set by `limit`, not by system size; `total_count` says how much is behind it. |
 | `per_object` | 17 | Proportional to the one object named - its fields, rules, elements or run history - not to how many such objects exist. |
 | `per_graph_node` | 7 | Walks the dependency graph outward from one object, so cost follows the connected subgraph. A hub object is far more expensive than a leaf at the same depth. |
-| `per_system` | 13 | Scans a whole class of objects rather than one. These are the calls to plan for on a large system, and each names the cap that stops it running away. |
+| `per_system` | 15 | Scans a whole class of objects rather than one. These are the calls to plan for on a large system, and each names the cap that stops it running away. |
 
 `per_system` is the row to read before a large run. Those calls scan a class of objects rather than one object, and each names the cap that stops it.
 
@@ -22,14 +22,15 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 
 | Tool | Growth | Fixture payload | Shaped | Bounds |
 |---|---|--:|:-:|---|
-| `bw_access_report` | `constant` | 10,002 B | — | 5000 statements / 300s per call |
+| `bw_access_report` | `constant` | 10,063 B | — | 5000 statements / 300s per call |
 | `bw_analyze_object` | `per_graph_node` | 7,357 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_process_chain` | `per_object` | 2,949 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_query` | `per_object` | 6,493 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_routine` | `per_object` | 1,118 B | — | 5000 statements / 300s per call |
 | `bw_assess_change_impact` | `per_graph_node` | 8,000 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_assess_landscape` | `per_system` | 5,282 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
-| `bw_capability_report` | `constant` | 34,603 B | — | 5000 statements / 300s per call |
+| `bw_capability_report` | `constant` | 35,161 B | — | 5000 statements / 300s per call |
 | `bw_check_load_latency` | `per_system` | 585 B | — | 250 routine parses; 5000 statements / 300s per call |
 | `bw_check_schedule_risk` | `per_system` | 358 B | — | 5000 statements / 300s per call |
 | `bw_compare_snapshots` | `per_system` | 380 B | — | 5000 statements / 300s per call |
@@ -61,6 +62,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_impact_analysis` | `per_graph_node` | 860 B | yes | 400 graph nodes, depth 12; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_list_3x_flows` | `per_page` | 445 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_analysis_auths` | `per_page` | 407 B | — | 500 rows per page; 5000 statements / 300s per call |
+| `bw_list_business_areas` | `per_system` | 403 B | — | 500 rows per page; one grouped COUNT per provider family; 5000 statements / 300s per call |
 | `bw_list_calc_views` | `per_page` | 510 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_chains` | `per_page` | 354 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_extractor_enhancements` | `per_page` | 417 B | — | 500 rows per page; 5000 statements / 300s per call |
@@ -69,14 +71,14 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_list_systems` | `constant` | 187 B | — | 5000 statements / 300s per call |
 | `bw_list_transformations` | `per_page` | 340 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_update_rules` | `per_page` | 407 B | — | 500 rows per page; 5000 statements / 300s per call |
-| `bw_performance_profile` | `constant` | 41,855 B | — | 5000 statements / 300s per call |
+| `bw_performance_profile` | `constant` | not measured | — | 5000 statements / 300s per call |
 | `bw_refresh_cache` | `constant` | 58 B | — | 5000 statements / 300s per call |
 | `bw_refresh_capabilities` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
 | `bw_render_lineage` | `per_graph_node` | not measured | — | 400 graph nodes, depth 12; depth clamped to 8; 5000 statements / 300s per call |
 | `bw_review_scenario` | `per_system` | 366 B | — | 5000 statements / 300s per call |
 | `bw_search_objects` | `per_page` | 657 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_security_overview` | `per_system` | 407 B | — | 50,000 RSECVAL rows scanned; 5000 statements / 300s per call |
-| `bw_support_matrix` | `constant` | 21,516 B | — | 5000 statements / 300s per call |
+| `bw_support_matrix` | `constant` | 22,217 B | — | 5000 statements / 300s per call |
 | `bw_system_profile` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
 | `bw_trace_to_source` | `per_graph_node` | 1,742 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
 | `bw_troubleshoot_missing_data` | `per_graph_node` | 6,884 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
@@ -94,4 +96,5 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 - growth is declared from the code and cites the constant that bounds it. It is not extrapolated from the fixture measurement - a one-object fixture cannot demonstrate what four thousand objects do.
 - statement counts are not measured. Budget charging lives in ReadOnlyConnection and the offline fixtures substitute their own connection, so no statement count is observable offline. Reported as not_measured rather than as zero.
 - observed latencies come from one reference system on one day, at one data volume. They are evidence that a call completes, not a service level.
-- 2 tool(s) could not be measured against the fixtures (bw_generate_docs, bw_render_lineage), so their payload is unknown rather than small.
+- 3 tool(s) could not be measured against the fixtures (bw_generate_docs, bw_performance_profile, bw_render_lineage), so their payload is unknown rather than small.
+- bw_performance_profile read this profile, so measuring their payload would depend on the file this run writes and regeneration could not converge. Left unmeasured deliberately rather than pinned to a value that is wrong by construction.

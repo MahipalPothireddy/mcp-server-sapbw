@@ -97,6 +97,11 @@ ABAP_TABLES: dict[str, str] = {
     "composite_text": "RSOHCPRT",  # HANA-shape: DESCRIPTION/QUICK_INFO keyed by COLNAME
     "infoobject": "RSDIOBJ",
     "infoobject_text": "RSDIOBJT",
+    # InfoArea hierarchy and its texts. Every provider header already carries an INFOAREA code, and
+    # without these it stays exactly that: BW's own business grouping, read and unresolved. RSDAREA
+    # holds the parent link (PARENT_AREA), so an area resolves to a path rather than a flat label.
+    "info_area": "RSDAREA",
+    "info_area_text": "RSDAREAT",
     "characteristic": "RSDCHA",
     "keyfigure": "RSDKYF",
     "attribute": "RSDBCHATR",

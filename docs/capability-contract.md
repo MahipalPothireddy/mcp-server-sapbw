@@ -13,9 +13,9 @@ neither a reader nor a stated reason.
 decision rests on the second. They used to share one word: `SUPPORTED` meant "a reader
 exists and a test covers it", but reads as "validated against supported BW versions".
 
-- **Implementation** - 78 of 97 capabilities are implemented.
+- **Implementation** - 80 of 99 capabilities are implemented.
 - **Validation** - 53 have been read through a real
-  feature against a live BW system, 15 are covered by the
+  feature against a live BW system, 17 are covered by the
   offline suite only, 29 are unproven, and
   **0 have been validated on a customer's own
   system**.
@@ -43,7 +43,7 @@ capability with a reader that no test touched reports `not_validated`.
 Presence of a table on *your* system is a third question again, answered per connection
 by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 
-## SUPPORTED (64)
+## SUPPORTED (66)
 
 | Capability | Object | Validation | Notes |
 |---|---|---|---|
@@ -82,6 +82,8 @@ by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 | `extractor` | `ROOSOURCE` | `unit_tested` | read by the server |
 | `global_variable` | `RSZGLOBV` | `integration_tested` | read by the server |
 | `hana_views` | `VIEWS` | `integration_tested` | read by the server |
+| `info_area` | `RSDAREA` | `unit_tested` | read by the server |
+| `info_area_text` | `RSDAREAT` | `unit_tested` | read by the server |
 | `infoobject` | `RSDIOBJ` | `integration_tested` | read by the server |
 | `infoobject_text` | `RSDIOBJT` | `integration_tested` | read by the server |
 | `infosource_map` | `RSISOSMAP` | `integration_tested` | read by the server |

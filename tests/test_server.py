@@ -35,12 +35,14 @@ from mcp_server_sapbw.repositories.providers import ProvidersRepository
 from mcp_server_sapbw.repositories.queries import QueriesRepository
 from mcp_server_sapbw.repositories.search import SearchRepository
 from mcp_server_sapbw.repositories.security import SecurityRepository
+from mcp_server_sapbw.repositories.semantics import SemanticsRepository
 from mcp_server_sapbw.repositories.sources import SourcesRepository
 from mcp_server_sapbw.repositories.threex import ThreeXRepository
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
 from mcp_server_sapbw.server import CacheStatus, RefreshResult, SystemStatus
 from mcp_server_sapbw.services.analysis import AnalysisReaders, AnalysisService
 from mcp_server_sapbw.services.analyzers import Analyzers
+from mcp_server_sapbw.services.assessment import AssessmentService
 from mcp_server_sapbw.services.docgen import DocGenerator
 from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
 from mcp_server_sapbw.services.lineage import LineageService
@@ -255,6 +257,12 @@ class FakeRuntime:
     def access_report(self, system: str) -> AccessReport:
         """Built from the real manifest against the fixture record, so the wiring is exercised."""
         return build_access_report(self._cap, declared_mode="technical_read", matrix=None)
+
+    def assessment(self, system: str) -> AssessmentService:
+        return AssessmentService(self.analyzers(system), self._cap, system)
+
+    def semantics(self, system: str) -> SemanticsRepository:
+        return SemanticsRepository(_Conn(), self._cap)
 
     def refresh_capabilities(self, system: str) -> CapabilityRecord:
         return self._cap

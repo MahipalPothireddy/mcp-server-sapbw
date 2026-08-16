@@ -29,9 +29,9 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 
 | Release | verified | expected | unverified | needs_connector | unknown |
 |---|---|---|---|---|---|
-| `BW 7.40` | 0 | 0 | 56 | 2 | 0 |
-| `BW 7.50` | 41 | 15 | 0 | 2 | 0 |
-| `BW/4HANA 2.0` | 0 | 0 | 56 | 2 | 0 |
+| `BW 7.40` | 0 | 0 | 58 | 2 | 0 |
+| `BW 7.50` | 42 | 16 | 0 | 2 | 0 |
+| `BW/4HANA 2.0` | 0 | 0 | 58 | 2 | 0 |
 
 ## Per tool
 
@@ -45,6 +45,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_analyze_query` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider` |
 | `bw_analyze_routine` | `unverified` | `expected` | `unverified` | `unit_tested` | `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_assess_change_impact` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `object_dependencies`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
+| `bw_assess_landscape` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_text`, `dso_header`, `dtp`, `element_text`, `hana_views`, `log_chain`, `query_dir`, `query_provider`, `transformation` |
 | `bw_cache_status` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_capability_report` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_check_load_latency` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `transformation` |
@@ -78,6 +79,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_impact_analysis` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_list_3x_flows` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_list_analysis_auths` | `unverified` | `verified` | `unverified` | `not_validated` | - |
+| `bw_list_business_areas` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_list_calc_views` | `unverified` | `verified` | `unverified` | `integration_tested` | `hana_views`, `object_dependencies` |
 | `bw_list_chains` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_text`, `log_chain` |
 | `bw_list_extractor_enhancements` | `unverified` | `verified` | `unverified` | `not_validated` | - |

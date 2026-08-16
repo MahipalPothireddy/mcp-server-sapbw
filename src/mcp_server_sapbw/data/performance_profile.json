@@ -12,7 +12,7 @@
       "tool": "bw_access_report",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
-      "fixture_payload_bytes": 10002,
+      "fixture_payload_bytes": 10063,
       "payload_measurement": "measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
@@ -159,6 +159,29 @@
       "notes": []
     },
     {
+      "tool": "bw_assess_landscape",
+      "growth": "per_system",
+      "growth_basis": "Scans a whole class of objects rather than one. These are the calls to plan for on a large system, and each names the cap that stops it running away.",
+      "fixture_payload_bytes": 5282,
+      "payload_measurement": "measured",
+      "fixture_statements": null,
+      "statements_measurement": "not_measured",
+      "bounds": [
+        {
+          "bound": "9 analyses, each capped by limit_per_scenario (default 25)",
+          "constant": "services.assessment.ASSESSED_SCENARIOS",
+          "on_hit": "each scenario reports truncated, and the assessment calls its counts lower bounds"
+        },
+        {
+          "bound": "5000 statements / 300s per call",
+          "constant": "core.budget.DEFAULT_MAX_QUERIES / DEFAULT_MAX_SECONDS",
+          "on_hit": "BudgetResult naming what was spent and where it stopped"
+        }
+      ],
+      "shaped": false,
+      "notes": []
+    },
+    {
       "tool": "bw_cache_status",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
@@ -180,7 +203,7 @@
       "tool": "bw_capability_report",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
-      "fixture_payload_bytes": 34603,
+      "fixture_payload_bytes": 35161,
       "payload_measurement": "measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
@@ -824,6 +847,34 @@
       "notes": []
     },
     {
+      "tool": "bw_list_business_areas",
+      "growth": "per_system",
+      "growth_basis": "Scans a whole class of objects rather than one. These are the calls to plan for on a large system, and each names the cap that stops it running away.",
+      "fixture_payload_bytes": 403,
+      "payload_measurement": "measured",
+      "fixture_statements": null,
+      "statements_measurement": "not_measured",
+      "bounds": [
+        {
+          "bound": "500 rows per page",
+          "constant": "server._MAX_PAGE",
+          "on_hit": "total_count reports the full size; page with limit/offset"
+        },
+        {
+          "bound": "one grouped COUNT per provider family",
+          "constant": "repositories.semantics._PROVIDER_SOURCES",
+          "on_hit": "no row cap is needed: the read aggregates in the database, not in the reply"
+        },
+        {
+          "bound": "5000 statements / 300s per call",
+          "constant": "core.budget.DEFAULT_MAX_QUERIES / DEFAULT_MAX_SECONDS",
+          "on_hit": "BudgetResult naming what was spent and where it stopped"
+        }
+      ],
+      "shaped": false,
+      "notes": []
+    },
+    {
       "tool": "bw_list_calc_views",
       "growth": "per_page",
       "growth_basis": "Returns one page of rows. Cost is set by `limit`, not by system size; `total_count` says how much is behind it.",
@@ -1006,8 +1057,8 @@
       "tool": "bw_performance_profile",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
-      "fixture_payload_bytes": 41855,
-      "payload_measurement": "measured",
+      "fixture_payload_bytes": null,
+      "payload_measurement": "not_measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
       "bounds": [
@@ -1154,7 +1205,7 @@
       "tool": "bw_support_matrix",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
-      "fixture_payload_bytes": 21516,
+      "fixture_payload_bytes": 22217,
       "payload_measurement": "measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
@@ -1247,7 +1298,7 @@
     "constant": 9,
     "per_graph_node": 7,
     "per_object": 17,
-    "per_system": 13,
+    "per_system": 15,
     "per_page": 12
   },
   "observed": {
@@ -1261,6 +1312,7 @@
     "growth is declared from the code and cites the constant that bounds it. It is not extrapolated from the fixture measurement - a one-object fixture cannot demonstrate what four thousand objects do.",
     "statement counts are not measured. Budget charging lives in ReadOnlyConnection and the offline fixtures substitute their own connection, so no statement count is observable offline. Reported as not_measured rather than as zero.",
     "observed latencies come from one reference system on one day, at one data volume. They are evidence that a call completes, not a service level.",
-    "2 tool(s) could not be measured against the fixtures (bw_generate_docs, bw_render_lineage), so their payload is unknown rather than small."
+    "3 tool(s) could not be measured against the fixtures (bw_generate_docs, bw_performance_profile, bw_render_lineage), so their payload is unknown rather than small.",
+    "bw_performance_profile read this profile, so measuring their payload would depend on the file this run writes and regeneration could not converge. Left unmeasured deliberately rather than pinned to a value that is wrong by construction."
   ]
 }
