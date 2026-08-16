@@ -18,14 +18,20 @@ merged one:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
-from ..core.budget import BudgetExceeded
+from ..core.budget import BudgetExceeded, current_budget
+from ..core.validation import validation_for_tool
 from ..models.analysis import (
+    RELATIONSHIP_SECTION,
     Analysis,
+    AnalysisBudget,
     AnalysisConfidence,
+    AnalysisExecution,
+    AnalysisFinding,
     AnalysisKind,
     AnalysisLimitation,
     AnalysisStep,
@@ -34,8 +40,9 @@ from ..models.analysis import (
     RelatedObject,
     Relationship,
     SectionStatus,
+    SkippedSection,
 )
-from ..models.capability import CapabilityRecord
+from ..models.capability import CapabilityRecord, ValidationStatus
 from ..models.chains import Chain, ChainRuntimes, LoadClosure
 from ..models.ecc import ConnectorUnavailable
 from ..models.evidence import Evidence, EvidenceSummary, summarise
@@ -65,6 +72,19 @@ _Failure = UnsupportedResult | ConnectorUnavailable | ObjectNotFound
 #: on is always a BW read - a connector is never the subject - so the tool's own return union does
 #: not have to advertise a shape it can never produce.
 _AnchorFailure = UnsupportedResult | ObjectNotFound
+
+#: Objects named on one mechanical finding before it is capped. The count is the signal; naming a
+#: thousand objects on a single finding would bury it.
+_FINDING_OBJECTS = 20
+
+#: Fallback wording per skip status, used when the step recorded no detail of its own. Every skip
+#: has to say why, so this makes an unexplained one impossible rather than merely unlikely.
+_SKIP_REASONS: dict[str, str] = {
+    "unsupported": "this release does not carry the metadata the section reads",
+    "connector_required": "the answer is completed by a system outside BW",
+    "skipped_budget": "the per-call budget was spent before this section ran",
+    "failed": "the section's read broke",
+}
 
 #: How many consumer queries and calc-view crossings to resolve for one subject. A compound tool
 #: already spends several reads; an unbounded consumer scan would turn one question into a full
@@ -135,6 +155,18 @@ class _Run:
     summary: list[str] = field(default_factory=list)
     evidence: list[Evidence] = field(default_factory=list)
     budget_exhausted: bool = False
+    #: Wall clock and budget spend at the moment the run started, so both are a delta over *this*
+    #: analysis rather than whatever the session had already accumulated.
+    started_at: float = field(default_factory=time.monotonic)
+    queries_at_start: int | None = None
+    #: The tool whose registration is running, for the validation lookup. Set by the service.
+    tool_name: str = ""
+    #: The subject's name, for readable finding statements. Set in :meth:`build`.
+    subject_label: str = ""
+
+    def __post_init__(self) -> None:
+        budget = current_budget()
+        self.queries_at_start = budget.queries if budget is not None else None
 
     # --- section running ------------------------------------------------------------------
 
@@ -454,6 +486,128 @@ class _Run:
             reasons=reasons,
         )
 
+    # --- the contracted envelope fields, all derived from what already ran ------------------
+
+    def execution(self) -> AnalysisExecution:
+        """What ran, what it cost, how long it took. Every value measured here, none declared."""
+        budget = current_budget()
+        spent: int | None = None
+        if budget is not None and self.queries_at_start is not None:
+            spent = max(budget.queries - self.queries_at_start, 0)
+        tools: dict[str, None] = {}
+        for row in self.steps:
+            tools[row.tool] = None
+        return AnalysisExecution(
+            tools_used=sorted(tools),
+            step_count=len(self.steps),
+            sections_answered=sum(1 for s in self.steps if s.status in ("complete", "empty")),
+            queries_executed=spent,
+            duration_ms=int((time.monotonic() - self.started_at) * 1000),
+        )
+
+    def budget_report(self) -> AnalysisBudget:
+        """The allowance and the spend, reported on success as well as on exhaustion."""
+        budget = current_budget()
+        if budget is None:
+            return AnalysisBudget(
+                measured=False,
+                truncated=self.budget_exhausted or self._any_truncated(),
+            )
+        snapshot = budget.snapshot()
+        used = (
+            max(budget.queries - self.queries_at_start, 0)
+            if self.queries_at_start is not None
+            else int(snapshot["queries"])
+        )
+        return AnalysisBudget(
+            query_limit=int(snapshot["max_queries"]) or None,
+            queries_used=used,
+            time_limit_ms=int(float(snapshot["max_seconds"]) * 1000) or None,
+            time_used_ms=int((time.monotonic() - self.started_at) * 1000),
+            truncated=self.budget_exhausted or self._any_truncated(),
+            measured=True,
+        )
+
+    def _any_truncated(self) -> bool:
+        """True when a section's own cap stopped it short, not only the per-call budget."""
+        return any(item.reason == "truncated" for item in self.limitations)
+
+    def skipped(self) -> list[SkippedSection]:
+        """Sections that owed an answer and did not deliver one. See :class:`SkippedSection`."""
+        owed = {"unsupported", "connector_required", "skipped_budget", "failed"}
+        return [
+            SkippedSection(
+                section=row.section,
+                tool=row.tool,
+                status=row.status,  # type: ignore[arg-type]  # narrowed by `owed`
+                reason=row.detail or _SKIP_REASONS[row.status],
+            )
+            for row in self.steps
+            if row.status in owed
+        ]
+
+    def distinct_evidence(self) -> list[Evidence]:
+        """One entry per (basis, method), so the list says how without repeating itself."""
+        best: dict[tuple[str, str], Evidence] = {}
+        for item in self.evidence:
+            best.setdefault((item.basis, item.method), item)
+        return list(best.values())
+
+    def findings(self) -> list[AnalysisFinding]:
+        """The structured form of the summary: mechanical, derived, never authored per analysis.
+
+        Two sources, both already justified by the envelope: the normalised relationship lists, and
+        every section that reported a countable contribution. Nothing is inferred beyond what the
+        section that produced it already established.
+        """
+        found: list[AnalysisFinding] = []
+        for label, items in (("feed", self.dependencies), ("depend on", self.consumers)):
+            if not items:
+                continue
+            advisory = [i for i in items if i.advisory]
+            weakest = min(
+                (i.evidence for i in items if i.evidence is not None),
+                key=lambda e: e.rank,
+                default=None,
+            )
+            declared = len(items) - len(advisory)
+            detail = (
+                f"{len(items)} object(s) {label} {self.subject_label}"
+                f" ({declared} declared, {len(advisory)} derived)"
+                if advisory
+                else f"{len(items)} object(s) {label} {self.subject_label}, all declared"
+            )
+            found.append(
+                AnalysisFinding(
+                    statement=detail,
+                    section=RELATIONSHIP_SECTION,
+                    basis=("inferred" if advisory else (weakest.basis if weakest else "observed")),
+                    completeness="lower_bound" if advisory else "complete",
+                    objects=[i.id for i in items][:_FINDING_OBJECTS],
+                    evidence=weakest,
+                )
+            )
+
+        for row in self.steps:
+            if row.record_count is None or row.status not in ("complete", "empty"):
+                continue
+            statement = (
+                f"{row.section}: no records found"
+                if row.record_count == 0
+                else f"{row.section}: {row.record_count} record(s)"
+            )
+            found.append(
+                AnalysisFinding(
+                    statement=statement,
+                    section=row.section,
+                    # A count read straight from metadata rows is observed; a section that read no
+                    # table computed it, so it is derived.
+                    basis="observed" if row.source_tables else "derived",
+                    completeness="lower_bound" if self.budget_exhausted else "complete",
+                )
+            )
+        return found
+
     def build(
         self,
         *,
@@ -464,6 +618,14 @@ class _Run:
         next_actions: Sequence[NextAction] = (),
         **payloads: Any,
     ) -> Analysis:
+        self.subject_label = subject_name
+        status: ValidationStatus = "not_validated"
+        basis = (
+            "the tool that produced this answer was not recorded, so how far its readers have been "
+            "proven could not be established."
+        )
+        if self.tool_name:
+            status, basis = validation_for_tool(self.tool_name)
         return Analysis(
             kind=kind,
             system=self.readers.system,
@@ -474,9 +636,16 @@ class _Run:
             dependencies=self.dependencies,
             consumers=self.consumers,
             risks=self.risks,
+            findings=self.findings(),
+            evidence=self.distinct_evidence(),
             limitations=self.limitations,
             next_actions=list(next_actions),
             steps=self.steps,
+            execution=self.execution(),
+            budget=self.budget_report(),
+            sections_skipped=self.skipped(),
+            validation_status=status,
+            validation_basis=basis,
             confidence=self.confidence(),
             stopped_on_budget=self.budget_exhausted,
             **payloads,
@@ -516,7 +685,7 @@ class AnalysisService:
         self, name: str, *, depth: int = 2
     ) -> Analysis | ObjectNotFound | UnsupportedResult:
         """What this object is, what feeds it, what depends on it, and whether it is healthy."""
-        run = _Run(self._r)
+        run = _Run(self._r, tool_name="bw_analyze_object")
         definition = run.anchor(
             "definition",
             "bw_describe_object",
@@ -572,7 +741,7 @@ class AnalysisService:
 
     def analyze_query(self, query: str) -> Analysis | ObjectNotFound | UnsupportedResult:
         """What this report reads, who sees different numbers, and when its data is current."""
-        run = _Run(self._r)
+        run = _Run(self._r, tool_name="bw_analyze_query")
         definition = run.anchor(
             "definition",
             "bw_get_query",
@@ -620,7 +789,7 @@ class AnalysisService:
         self, chain_id: str, *, days: int = 90
     ) -> Analysis | ObjectNotFound | UnsupportedResult:
         """What this chain does, what it loads, how reliably it runs, and where it is fragile."""
-        run = _Run(self._r)
+        run = _Run(self._r, tool_name="bw_analyze_process_chain")
         chain = run.anchor(
             "structure",
             "bw_get_chain",
@@ -674,7 +843,7 @@ class AnalysisService:
         self, name: str, *, depth: int = 3
     ) -> Analysis | ObjectNotFound | UnsupportedResult:
         """Everything a change to this object reaches, and what to verify before transporting it."""
-        run = _Run(self._r)
+        run = _Run(self._r, tool_name="bw_assess_change_impact")
         # Described first and outside `step`, because a change subject need not be a provider - it
         # may be a transformation or a chain - and failing to describe it must not end the analysis.
         described = self._r.providers.describe(name)
@@ -755,7 +924,7 @@ class AnalysisService:
         delivered it ran (chain history), and only then look at the logic. Most wrong-data incidents
         are answered by the second or third question, and reading routines first wastes the call.
         """
-        run = _Run(self._r)
+        run = _Run(self._r, tool_name="bw_troubleshoot_missing_data")
         # Resolved outside `step` because the answer decides which sequence of sections to run: a
         # query is diagnosed through its providers, a provider through its own upstream.
         as_query = self._r.queries.get_query(target)

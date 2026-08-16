@@ -24,9 +24,15 @@ import pytest
 from fastmcp import Client
 
 from mcp_server_sapbw import server
-from mcp_server_sapbw.core.budget import BudgetExceeded
-from mcp_server_sapbw.models.analysis import Analysis, AnalysisLimitation, RelatedObject
+from mcp_server_sapbw.core.budget import BudgetExceeded, query_budget
+from mcp_server_sapbw.models.analysis import (
+    RELATIONSHIP_SECTION,
+    Analysis,
+    AnalysisLimitation,
+    RelatedObject,
+)
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from mcp_server_sapbw.models.evidence import Evidence, evidence_for
 from mcp_server_sapbw.models.objects import BwObjectRef
 from mcp_server_sapbw.models.providers import ObjectNotFound
 from mcp_server_sapbw.repositories.chains import ChainsRepository
@@ -530,3 +536,239 @@ def test_constituent_caveats_are_carried_up_not_dropped() -> None:
     """The classic composition bug: parts state their limits, the whole does not."""
     analysis = _analysis(present=set(_TABLES) - {"cs_tables"})
     assert analysis.limitations, "a degraded run reported no limitation at all"
+
+
+# --- the contracted envelope fields --------------------------------------------------------
+#
+# Six fields were specified for the compound contract and none existed: findings, evidence,
+# execution, budget, sections_skipped, validation_status. The information mostly existed but under
+# other names, and three things were genuinely absent - query count, duration, and budget spend on a
+# call that *succeeded*. These pin all six down, including the distinctions that make them honest:
+# a skipped section is not an empty one, an unmeasured count is not zero, and a validation status
+# with no stated basis is not checkable.
+
+
+def test_every_contracted_envelope_field_is_present() -> None:
+    """The additive contract. Existing published fields must survive alongside the new ones."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+
+    for field in (
+        "summary",
+        "findings",
+        "evidence",
+        "dependencies",
+        "consumers",
+        "risks",
+        "limitations",
+        "next_actions",
+        "execution",
+        "budget",
+        "sections_skipped",
+        "validation_status",
+    ):
+        assert hasattr(report, field), f"contracted field {field} is missing"
+
+    # Backward compatibility: nothing that was published before may have been renamed away.
+    for legacy in ("kind", "system", "subject_name", "title", "steps", "confidence", "risks"):
+        assert hasattr(report, legacy), f"published field {legacy} was removed"
+
+
+def test_findings_are_traceable_to_a_step_or_the_declared_relationship_view() -> None:
+    """A finding whose section names nothing cannot be reproduced, so it is a dead end.
+
+    Two legitimate sources: a step that ran, or the reserved relationship label. A relationship
+    finding is assembled from several sections, so naming any one of them would be false.
+    """
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    allowed = {row.section for row in report.steps} | {RELATIONSHIP_SECTION}
+
+    assert report.findings
+    for finding in report.findings:
+        assert finding.section in allowed, f"{finding.section!r} names neither a step nor the view"
+        assert finding.statement.strip()
+        assert finding.basis in {"observed", "derived", "inferred", "unknown"}
+
+
+def test_a_derived_relationship_makes_its_finding_inferred_and_a_lower_bound() -> None:
+    """The headline distinction: routine-parsed consumers must never read as a complete set.
+
+    Driven through `_Run` directly because no fixture in this module produces an advisory edge via
+    the service - `_FLOW_FRAGMENTS` is all declared, and another test asserts exactly that. Faking
+    one through the fixture would test the fixture rather than the derivation rule.
+    """
+    run = _Run(_service()._r, tool_name="bw_analyze_object")
+    run.subject_label = "SALES_DSO"
+    run.relate(
+        run.consumers,
+        BwObjectRef(object_type="dso", name="OTHER_DSO"),
+        "consumer_routine",
+        advisory=True,
+        evidence=evidence_for("lineage_edge", "advisory"),
+    )
+    run.relate(run.consumers, BwObjectRef(object_type="dso", name="PLAIN_DSO"), "downstream")
+
+    finding = next(f for f in run.findings() if "depend on" in f.statement)
+    assert finding.basis == "inferred"
+    assert finding.completeness == "lower_bound"
+    assert "1 declared, 1 derived" in finding.statement
+    assert finding.section == RELATIONSHIP_SECTION
+
+
+def test_an_all_declared_relationship_set_is_observed_and_complete() -> None:
+    """The other side of the same rule: a declared set must not be devalued to a lower bound."""
+    run = _Run(_service()._r, tool_name="bw_analyze_object")
+    run.subject_label = "SALES_DSO"
+    run.relate(run.dependencies, BwObjectRef(object_type="dso", name="STAGE_DSO"), "upstream")
+
+    finding = next(f for f in run.findings() if "feed" in f.statement)
+    assert finding.completeness == "complete"
+    assert "all declared" in finding.statement
+    assert finding.basis == "observed"
+
+
+def test_evidence_is_deduplicated_and_ordered_weakest_first() -> None:
+    """The inferred entries are what a reader has to weigh; burying them defeats the purpose."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    assert report.evidence
+
+    keys = [(e.basis, e.method) for e in report.evidence]
+    assert len(keys) == len(set(keys)), "evidence repeats a (basis, method) pair"
+    ranks = [e.rank for e in report.evidence]
+    assert ranks == sorted(ranks, reverse=True), "evidence is not weakest-first"
+
+
+def test_evidence_reuses_the_one_trust_model() -> None:
+    """No second vocabulary: every entry is the shared Evidence, with a method kept verbatim."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    for item in report.evidence:
+        assert isinstance(item, Evidence)
+        assert item.method.strip()
+        assert item.detail, "an evidence entry with no detail cannot answer 'how do you know'"
+
+
+def test_execution_names_only_tools_that_exist_and_measures_duration() -> None:
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+
+    assert report.execution.step_count == len(report.steps)
+    assert report.execution.tools_used == sorted({row.tool for row in report.steps})
+    assert all(name.startswith("bw_") for name in report.execution.tools_used)
+    assert report.execution.duration_ms >= 0
+    assert report.execution.sections_answered <= report.execution.step_count
+
+
+def test_queries_executed_is_none_rather_than_zero_when_nothing_counted() -> None:
+    """Zero statements and "nobody was counting" are opposite readings, so they stay apart.
+
+    The offline fixtures substitute their own connection and never charge the budget, so with no
+    budget scope installed the count must be absent rather than reported as 0.
+    """
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    assert report.execution.queries_executed is None
+    assert report.budget.measured is False
+    assert report.budget.query_limit is None
+    assert report.budget.queries_used is None
+
+
+def test_budget_is_reported_on_a_successful_call_not_only_on_exhaustion() -> None:
+    """The defect this closes: spend was visible only when the budget ran out."""
+    with query_budget(max_queries=500, max_seconds=30) as budget:
+        report = _analysis(fragments=_FLOW_FRAGMENTS)
+        assert budget is not None
+
+    assert report.budget.measured is True
+    assert report.budget.query_limit == 500
+    assert report.budget.time_limit_ms == 30_000
+    assert report.budget.queries_used is not None
+    assert report.budget.truncated is False
+    assert report.budget.time_used_ms is not None
+    assert report.execution.queries_executed is not None
+
+
+def test_budget_spend_is_a_delta_over_this_analysis_not_the_whole_session() -> None:
+    """A budget shared with earlier work must not attribute that work to this analysis."""
+    with query_budget(max_queries=500, max_seconds=30) as budget:
+        for _ in range(7):
+            budget.charge()  # work that happened before the analysis started
+        report = _analysis(fragments=_FLOW_FRAGMENTS)
+
+    assert report.budget.queries_used is not None
+    assert report.budget.queries_used < budget.queries, (
+        "the analysis claimed statements charged before it began"
+    )
+
+
+def test_budget_exhaustion_is_reported_as_truncated() -> None:
+    report = _analysis(fragments=_FLOW_FRAGMENTS, budget_after=3)
+    assert report.stopped_on_budget is True
+    assert report.budget.truncated is True
+    assert any(s.status == "skipped_budget" for s in report.sections_skipped)
+
+
+def test_sections_skipped_excludes_a_section_that_ran_and_found_nothing() -> None:
+    """An empty answer is an answer. Listing it as skipped would invent a gap."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    skipped = {s.section for s in report.sections_skipped}
+    empty = {row.section for row in report.steps if row.status == "empty"}
+    not_applicable = {row.section for row in report.steps if row.status == "not_applicable"}
+
+    assert not (skipped & empty), "a section that found nothing was reported as skipped"
+    assert not (skipped & not_applicable), "a section that did not apply was reported as skipped"
+
+
+def test_every_skipped_section_states_a_reason_and_names_its_tool() -> None:
+    report = _analysis(present={"dso_header", "dso_text", "dso_field"})
+    assert report.sections_skipped, "fixture no longer produces a skipped section"
+    for skip in report.sections_skipped:
+        assert skip.reason.strip(), f"{skip.section} was skipped without a reason"
+        assert skip.tool.startswith("bw_")
+        assert skip.status in {"unsupported", "connector_required", "skipped_budget", "failed"}
+
+
+def test_sections_skipped_agrees_with_the_audit_trail() -> None:
+    """Two views of the same fact must not disagree, or a caller cannot trust either."""
+    report = _analysis(present={"dso_header", "dso_text", "dso_field"})
+    owed = {"unsupported", "connector_required", "skipped_budget", "failed"}
+    from_steps = sorted((row.section, row.status) for row in report.steps if row.status in owed)
+    from_field = sorted((s.section, s.status) for s in report.sections_skipped)
+    assert from_steps == from_field
+
+
+def test_validation_status_is_the_weakest_link_and_states_which_capability() -> None:
+    """One unproven reader must not be hidden by four proven ones."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+
+    assert report.validation_status in {
+        "not_validated",
+        "unit_tested",
+        "integration_tested",
+        "real_bw_validated",
+        "customer_validated",
+    }
+    assert report.validation_basis.strip(), "a status with no stated basis is not checkable"
+
+
+def test_nothing_claims_real_bw_validation_from_the_offline_build() -> None:
+    """That rung is emitted by the validation matrix, never by the contract the suite produces."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    assert report.validation_status not in {"real_bw_validated", "customer_validated"}
+
+
+def test_confidence_still_carries_no_percentage() -> None:
+    """The standing rule survives the new fields."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    dumped = report.confidence.model_dump()
+    assert "percent" not in str(dumped).lower()
+    assert report.confidence.level in {"high", "medium", "low"}
+
+
+def test_the_envelope_round_trips_through_json() -> None:
+    """Every new field has to survive serialisation, which is how a client actually receives it."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    restored = Analysis.model_validate_json(report.model_dump_json())
+
+    assert restored.validation_status == report.validation_status
+    assert len(restored.findings) == len(report.findings)
+    assert len(restored.evidence) == len(report.evidence)
+    assert restored.execution.tools_used == report.execution.tools_used
+    assert restored.budget.measured == report.budget.measured
+    assert len(restored.sections_skipped) == len(report.sections_skipped)

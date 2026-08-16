@@ -61,20 +61,34 @@ ImplementationStatus = Literal[
 #   not_validated       no test has touched it; a reader may still exist
 #   unit_tested         exercised by the offline suite against synthetic fixtures
 #   integration_tested  read through a feature against a real BW system, output inspected
+#   real_bw_validated   a recorded scenario ran against a real BW system and its answer was checked
+#                       against human-verified ground truth, not merely observed to return
 #   customer_validated  verified on a customer's own system, by that customer
+#
+# ``real_bw_validated`` has a different *source* from the others, which is why it sits between them
+# rather than replacing ``integration_tested``. The first three are emitted by
+# ``scripts/capability_contract.py`` from what the test suite measurably touched. This one comes
+# by the validation matrix: a scenario with an expected answer, an actual answer, and a correctness
+# verdict. "The call returned without error against a live system" is integration testing; "the
+# answer was right" is this. The contract generator therefore never produces this value, and nothing
+# claims it until a recorded scenario does.
 ValidationStatus = Literal[
     "not_validated",
     "unit_tested",
     "integration_tested",
+    "real_bw_validated",
     "customer_validated",
 ]
 
-#: Validation ordering, so a caller can filter on "at least X" without enumerating.
+#: Validation ordering, so a caller can filter on "at least X" without enumerating. Only the
+#: *ordering* is meaningful - callers compare ranks, they do not depend on the absolute numbers, so
+#: inserting a rung is safe.
 VALIDATION_RANK: dict[str, int] = {
     "not_validated": 0,
     "unit_tested": 1,
     "integration_tested": 2,
-    "customer_validated": 3,
+    "real_bw_validated": 3,
+    "customer_validated": 4,
 }
 
 # The four ways a contract state and a system's table presence can combine. This is the

@@ -32,8 +32,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .capability import ValidationStatus
 from .chains import Chain, ChainRuntimes, LoadClosure
-from .evidence import Evidence, EvidenceSummary
+from .evidence import Evidence, EvidenceBasis, EvidenceCompleteness, EvidenceSummary
 from .findings import Finding, severity_rank
 from .health import ProviderHealth
 from .lineage import ImpactAnalysis, LineageGraph, TraceToSource
@@ -190,6 +191,102 @@ class AnalysisConfidence(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+#: Reserved ``AnalysisFinding.section`` for a finding derived from the normalised relationship view
+#: rather than from one reader. Not a step name, and deliberately not disguised as one.
+RELATIONSHIP_SECTION = "relationships"
+
+
+class AnalysisFinding(BaseModel):
+    """One thing the analysis established, with how it knows.
+
+    Distinct from :class:`~.findings.Finding` in ``risks``, and deliberately so: a risk is a
+    *judgement* that something is wrong, a finding is a *statement of fact* the analysis is prepared
+    to defend. ``summary`` carries the same material as prose, which is what a person reads; this is
+    the same material attributed, which is what a program reads and what answers "how do you know".
+
+    **This is a mechanical digest, not authored insight.** Each entry is derived from a section that
+    ran or from the normalised relationship lists, so it cannot claim more than the envelope already
+    justifies. Nothing here is hand-written per analysis.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    statement: str
+    #: Where it came from: either an :class:`AnalysisStep` ``section`` - so a doubted finding leads
+    #: straight to the tool that reproduces it - or the reserved value
+    #: :data:`RELATIONSHIP_SECTION` for a finding derived from the normalised ``dependencies`` /
+    #: ``consumers`` lists. Those are assembled from several sections, so naming any one of them
+    #: would point at a step that did not establish them.
+    section: str
+    basis: EvidenceBasis
+    completeness: EvidenceCompleteness = "complete"
+    #: Objects the statement is about, capped so a wide finding does not dominate the reply.
+    objects: list[str] = Field(default_factory=list)
+    #: The weakest evidence behind it, where the section supplied any.
+    evidence: Evidence | None = None
+
+
+class SkippedSection(BaseModel):
+    """A section that produced no answer, and which of the four reasons applies.
+
+    ``empty`` and ``not_applicable`` are deliberately **not** listed here. A section that ran and
+    found nothing has answered; a section that does not apply to this subject was never owed. Only
+    the four cases where an answer was owed and not delivered are skips, because that is the set a
+    caller can act on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    section: str
+    tool: str
+    status: Literal["unsupported", "connector_required", "skipped_budget", "failed"]
+    reason: str
+
+
+class AnalysisExecution(BaseModel):
+    """What the analysis actually did, measured rather than declared.
+
+    ``steps`` is **not** repeated here. It is a published top-level field, and copying it would
+    double the largest part of the envelope for no new information; ``step_count`` and
+    ``tools_used`` summarise it, and the list itself stays where callers already read it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: Granular tools invoked, de-duplicated and ordered. Every one is a registered tool name, so
+    #: any section can be re-run on its own.
+    tools_used: list[str] = Field(default_factory=list)
+    step_count: int = 0
+    sections_answered: int = 0
+    #: Statements charged to the per-call budget while this analysis ran. ``None`` means no budget
+    #: was active to count against - never 0, because "issued no queries" is a different statement
+    #: from "nobody was counting". Note that the offline fixtures substitute their own connection
+    #: and do not charge, so this reads 0 there and is only meaningful against a real system.
+    queries_executed: int | None = None
+    duration_ms: int = 0
+
+
+class AnalysisBudget(BaseModel):
+    """The allowance this call ran inside, and what it spent.
+
+    Reported on success as well as on exhaustion. Previously the spend was visible only when the
+    budget ran out, so an analysis that used 4,900 of 5,000 statements looked exactly like one that
+    used three - the difference between "this scales" and "this falls over on the next system twice
+    the size", invisible until it became a partial answer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    query_limit: int | None = None
+    queries_used: int | None = None
+    time_limit_ms: int | None = None
+    time_used_ms: int | None = None
+    #: True when a bound stopped the analysis short - the budget, or a section's own row cap.
+    truncated: bool = False
+    #: False when no budget was active, so the other fields are absent rather than zero.
+    measured: bool = False
+
+
 class Analysis(BaseModel):
     """A composed answer to one analyst question, in the shape every compound tool returns.
 
@@ -238,8 +335,32 @@ class Analysis(BaseModel):
     limitations: list[AnalysisLimitation] = Field(default_factory=list)
     next_actions: list[NextAction] = Field(default_factory=list)
 
+    # --- what was established, attributed -------------------------------------------------
+    #: The structured form of ``summary``: each statement with the section that established it and
+    #: the basis it rests on. A mechanical digest of what the sections and relationship lists
+    #: already justify, so it never claims more than the envelope supports.
+    findings: list[AnalysisFinding] = Field(default_factory=list)
+    #: Distinct evidence behind this answer, de-duplicated by (basis, method). The counts live on
+    #: ``confidence.evidence``; this is the list, so "how does it know this" is answerable without
+    #: walking every nested payload. Weakest basis first.
+    evidence: list[Evidence] = Field(default_factory=list)
+
     # --- the audit trail ------------------------------------------------------------------
     steps: list[AnalysisStep] = Field(default_factory=list)
+    #: What ran, what it cost, and how long it took. Measured, not declared.
+    execution: AnalysisExecution = Field(default_factory=AnalysisExecution)
+    #: The allowance and the spend, reported whether or not it ran out.
+    budget: AnalysisBudget = Field(default_factory=AnalysisBudget)
+    #: Sections that owed an answer and did not deliver one, with which of the four reasons applies.
+    #: Never includes a section that ran and found nothing.
+    sections_skipped: list[SkippedSection] = Field(default_factory=list)
+    #: How far the capabilities behind *this* answer have been proven - the weakest across
+    #: everything the tool reads, so one unproven reader is not hidden by four proven ones. Read
+    #: ``validation_basis`` for which capability set it.
+    validation_status: ValidationStatus = "not_validated"
+    #: How ``validation_status`` was reached, and which capability is the weakest link. A bare
+    #: status is not checkable; this is what makes it so.
+    validation_basis: str = ""
     confidence: AnalysisConfidence
     #: True when the per-call budget ran out mid-composition. The sections already gathered are
     #: still returned - four of five is a better answer than none - and the rest are recorded
@@ -257,6 +378,9 @@ class Analysis(BaseModel):
         self.risks.sort(key=lambda f: severity_rank(f.severity), reverse=True)
         self.dependencies = _dedupe(self.dependencies)
         self.consumers = _dedupe(self.consumers)
+        # Weakest evidence first: the inferred entries are what a reader has to weigh, and burying
+        # them under the observed ones is how a lower bound gets read as a complete set.
+        self.evidence.sort(key=lambda e: (-e.rank, e.method))
         return self
 
     @property
