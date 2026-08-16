@@ -166,7 +166,7 @@ DetailLevel = Literal["auto", "summary", "full"]
 # its own config: most clients derive each tool's visible name by prefixing that key, and the result
 # must stay a valid identifier under 64 characters, so a short key such as "sapbw" is recommended in
 # the README rather than this display name.
-SERVER_NAME = "SAP BW technical-discovery MCP"
+SERVER_NAME = "SAP BW Intelligence Engine"
 
 mcp: FastMCP = FastMCP(name=SERVER_NAME, mask_error_details=True)
 
