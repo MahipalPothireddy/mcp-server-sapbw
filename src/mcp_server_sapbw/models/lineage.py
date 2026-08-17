@@ -83,6 +83,29 @@ LineageEdgeKind = Literal[
 LineageDirection = Literal["upstream", "downstream", "both"]
 UpdateMode = Literal["full", "delta", "init"]
 
+# Why a graph is - or is not - a complete reading of the metadata.
+#
+# ``truncated`` said only *that* expansion stopped, and it was set in exactly one place (the node
+# cap), so a walk that stopped for any other reason reported ``truncated=False`` and read as a
+# complete answer. A bounded discovery that looks complete is worse than one that admits its bound:
+# the caller cannot tell "this object has two consumers" from "we stopped after two".
+#
+# ``semantic_limit``     a stated cap on resolved objects stopped discovery
+# ``query_budget``       the per-call statement allowance would not cover another read
+# ``time_budget``        the per-call wall-clock allowance would not cover another read
+# ``node_limit``         the graph-wide node cap stopped expansion (the historical bool)
+# ``error_degraded``     a branch failed and the graph is what survived
+# ``unsupported_branch`` this release lacks the metadata one branch needs
+LineageCompleteness = Literal[
+    "complete",
+    "semantic_limit",
+    "query_budget",
+    "time_budget",
+    "node_limit",
+    "error_degraded",
+    "unsupported_branch",
+]
+
 
 class SourceSystemRef(BaseModel):
     """Slot on a DataSource boundary node for source-system detail (identifiers only)."""
@@ -189,6 +212,10 @@ class LineageGraph(BaseModel):
     node_count: int = 0
     edge_count: int = 0
     truncated: bool = False  # a depth or node cap stopped expansion
+    #: Why the graph stopped, where ``truncated`` only said *that* it did. Kept beside the bool
+    #: rather than replacing it so existing clients keep working; the two are reconciled below and
+    #: therefore cannot disagree.
+    completeness: LineageCompleteness = "complete"
     evidence_summary: EvidenceSummary | None = None
     caveats: list[str] = Field(default_factory=list)
 
@@ -196,6 +223,20 @@ class LineageGraph(BaseModel):
     def _summarise_evidence(self) -> LineageGraph:
         if self.evidence_summary is None and self.edges:
             self.evidence_summary = summarise([e.evidence for e in self.edges if e.evidence])
+        return self
+
+    @model_validator(mode="after")
+    def _reconcile_completeness(self) -> LineageGraph:
+        """Neither field may claim completeness the other denies.
+
+        A caller that only reads ``truncated`` must still be told the graph is bounded, and a caller
+        that only reads ``completeness`` must not see ``complete`` on a graph built by older code
+        that set the bool alone.
+        """
+        if self.completeness != "complete":
+            self.truncated = True
+        elif self.truncated:
+            self.completeness = "node_limit"
         return self
 
 

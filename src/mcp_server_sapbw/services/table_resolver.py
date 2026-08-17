@@ -273,8 +273,17 @@ def calc_view_patterns(provider: str) -> list[str]:
 
 
 def is_hierarchy_view(view_name: str) -> bool:
-    """True for generated hierarchy runtime views, which are not provider views."""
-    return CALC_VIEW_HIER_MARKER in (view_name or "").lower()
+    """True for generated hierarchy runtime views, which are not provider views.
+
+    The marker is matched as a path *segment*, because BW generates both ``.../hier/...`` and names
+    whose final segment is ``hier``. Only the embedded form was recognised, so a view ending in
+    ``/hier`` resolved to a "provider" literally named ``hier`` and reached callers as a
+    CompositeProvider consumer. Matching the segment - rather than the bare substring - also leaves
+    a genuinely named provider such as ``/HIERARCHY_X`` alone.
+    """
+    lowered = (view_name or "").lower()
+    segment = CALC_VIEW_HIER_MARKER.rstrip("/")
+    return CALC_VIEW_HIER_MARKER in lowered or lowered.endswith(segment)
 
 
 def provider_from_calc_view(view_name: str) -> str | None:

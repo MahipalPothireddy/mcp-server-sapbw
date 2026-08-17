@@ -19,9 +19,11 @@ from __future__ import annotations
 from collections import deque
 from typing import Any, cast
 
+from ..core.budget import current_budget
 from ..models.evidence import summarise
 from ..models.lineage import (
     ImpactAnalysis,
+    LineageCompleteness,
     LineageDirection,
     LineageEdge,
     LineageGraph,
@@ -36,7 +38,12 @@ from ..models.providers import Provider
 from ..repositories.base import Repository
 from ..repositories.providers import ProvidersRepository
 from ..repositories.transformations import TransformationsRepository
-from .table_resolver import candidate_tables, provider_from_calc_view
+from .table_resolver import (
+    CALC_VIEW_HIER_MARKER,
+    CALC_VIEW_PACKAGE,
+    candidate_tables,
+    provider_from_calc_view,
+)
 
 
 # RSTLOGO type code -> lineage node type. Decoded through the canonical table in models.objects
@@ -63,7 +70,33 @@ _UPDMODE_MAP: dict[str, UpdateMode] = {"F": "full", "D": "delta", "I": "init"}
 # active table is never a *direct* dependency of it (verified live). Bounded by the table filter.
 _CALC_SCHEMA = "_SYS_BIC"
 _TRANSITIVE_DEPENDENCY = 2
+
+# How many *distinct resolved consuming providers* one node may contribute. This is a semantic cap,
+# and the distinction is the whole of defect D7: it used to bound raw dependency rows instead.
+# One provider's tables carry thousands of generated dependent views - measured on a QA system,
+# 8,692 rows for one provider, of which 7,040 were hierarchy runtime views that can never be a
+# provider - so an unordered cap over raw rows sampled roughly 0.2 usable providers per execution
+# against a true answer of 35, and drew a different arbitrary subset every time it ran.
 _MAX_COMPOSITE_CONSUMERS = 50
+# Rows per deterministic page. Comfortably larger than the pruned population measured on a real
+# system (36 rows for the widest provider seen), so the common case stays a single statement.
+_CONSUMER_PAGE_ROWS = 500
+# Hard bound on paging, so discovery is bounded by construction rather than by the query budget.
+_MAX_CONSUMER_PAGES = 20
+# Headroom left for the rest of the walk before another page is started. Discovery reports that it
+# stopped instead of consuming the last of the allowance and failing the whole call.
+_BUDGET_QUERY_HEADROOM = 5
+_BUDGET_TIME_HEADROOM = 5.0
+
+# Most-to-least severe. A walk that hit several bounds reports the one that most limits the answer.
+_COMPLETENESS_PRECEDENCE: tuple[LineageCompleteness, ...] = (
+    "error_degraded",
+    "time_budget",
+    "query_budget",
+    "node_limit",
+    "semantic_limit",
+    "unsupported_branch",
+)
 
 _MAX_NODES = 400
 _MAX_DEPTH = 12
@@ -74,6 +107,37 @@ _ROUTINE_CAVEAT = (
     "routine-derived edges are advisory (heuristic lower bound): dynamic SQL, function-module and "
     "class-method calls are not followed"
 )
+
+# What each bound means for the answer. A caller reading only the graph needs to know which part of
+# it to distrust, not merely that something stopped.
+_COMPLETENESS_CAVEATS: dict[LineageCompleteness, str] = {
+    "complete": "",
+    "semantic_limit": (
+        f"at least one node reached the {_MAX_COMPOSITE_CONSUMERS}-consumer discovery cap, so this "
+        "graph is a bounded reading: further CompositeProvider consumers may exist. The subset "
+        "returned is deterministic (ordered), not sampled."
+    ),
+    "query_budget": (
+        "the per-call statement allowance ran low, so consumer discovery stopped early and further "
+        "relationships may exist. Narrow the request or raise SAPBW_MAX_QUERIES_PER_CALL."
+    ),
+    "time_budget": (
+        "the per-call time allowance ran low, so consumer discovery stopped early and further "
+        "relationships may exist. Narrow the request or raise SAPBW_MAX_SECONDS_PER_CALL."
+    ),
+    "node_limit": (
+        f"expansion stopped at the {_MAX_NODES}-node cap, so objects beyond it are absent. Lower "
+        "the depth for a complete reading of a smaller neighbourhood."
+    ),
+    "error_degraded": (
+        "at least one expansion failed and this graph is what survived, so absence of an edge here "
+        "is not evidence that it does not exist."
+    ),
+    "unsupported_branch": (
+        "this release lacks the metadata one expansion branch needs, so that class of relationship "
+        "is missing entirely rather than absent."
+    ),
+}
 
 
 def _evidence_caveats(edges: list[LineageEdge]) -> list[str]:
@@ -117,7 +181,13 @@ class LineageService(Repository):
         # here would be circular. Typed Any because the concrete class cannot be named yet.
         self._queries: Any = None
         # Per-instance memos over read-only metadata; see _expand for why these matter.
-        self._expand_memo: dict[tuple[str, LineageDirection, bool], list[_Hop]] = {}
+        # The memo carries each expansion's incompleteness reasons alongside its hops, so a memo hit
+        # cannot silently drop the fact that the cached expansion was itself bounded.
+        self._expand_memo: dict[
+            tuple[str, LineageDirection, bool], tuple[list[_Hop], frozenset[LineageCompleteness]]
+        ] = {}
+        #: Reasons discovery was bounded during the walk in progress. Reset per BFS.
+        self._walk_incomplete: set[LineageCompleteness] = set()
         self._node_type_memo: dict[str, LineageNodeType] = {}
         self._consumers_memo: dict[str, list[tuple[str, LineageNodeType, str]]] = {}
         self._trace_memo: dict[tuple[str, int], TraceToSource] = {}
@@ -131,8 +201,8 @@ class LineageService(Repository):
         if unsupported is not None:
             return unsupported
         depth = max(1, min(depth, _MAX_DEPTH))
-        nodes, edges, truncated = self._bfs(name, direction, depth, include_routine=True)
-        return self._graph(name, direction, depth, nodes, edges, truncated=truncated)
+        nodes, edges, completeness = self._bfs(name, direction, depth, include_routine=True)
+        return self._graph(name, direction, depth, nodes, edges, completeness=completeness)
 
     def trace_to_source(self, name: str, *, depth: int = 8) -> TraceToSource | UnsupportedResult:
         """Walk upstream to the DataSource boundary. Memoised, like :meth:`_expand`.
@@ -153,12 +223,12 @@ class LineageService(Repository):
         return traced
 
     def _trace_uncached(self, name: str, depth: int) -> TraceToSource:
-        nodes, edges, truncated = self._bfs(name, "upstream", depth, include_routine=True)
-        graph = self._graph(name, "upstream", depth, nodes, edges, truncated=truncated)
+        nodes, edges, completeness = self._bfs(name, "upstream", depth, include_routine=True)
+        graph = self._graph(name, "upstream", depth, nodes, edges, completeness=completeness)
         datasources = [n.name for n in nodes.values() if n.object_type == "datasource"]
         caveats = [_ROUTINE_CAVEAT]
-        if truncated:
-            caveats.append(f"trace stopped at depth {depth} or the {_MAX_NODES}-node cap")
+        if completeness != "complete":
+            caveats.append(_COMPLETENESS_CAVEATS[completeness])
         if not datasources:
             caveats.append("no DataSource boundary reached within the depth limit")
         return TraceToSource(
@@ -174,7 +244,7 @@ class LineageService(Repository):
         if unsupported is not None:
             return unsupported
         depth = max(1, min(depth, _MAX_DEPTH))
-        nodes, edges, truncated = self._bfs(name, "downstream", depth, include_routine=False)
+        nodes, edges, completeness = self._bfs(name, "downstream", depth, include_routine=False)
 
         # Reverse routine detection: objects whose routines READ the root (invisible to where-used).
         consumers = self._routine_consumers_of(name)
@@ -201,14 +271,14 @@ class LineageService(Repository):
                 )
             )
 
-        graph = self._graph(name, "downstream", depth, nodes, edges, truncated=truncated)
+        graph = self._graph(name, "downstream", depth, nodes, edges, completeness=completeness)
         affected = [n for n in nodes.values() if n.name != name]
         by_type: dict[str, int] = {}
         for node in affected:
             by_type[node.object_type] = by_type.get(node.object_type, 0) + 1
         caveats = [_ROUTINE_CAVEAT]
-        if truncated:
-            caveats.append(f"downstream expansion stopped at depth {depth} or the node cap")
+        if completeness != "complete":
+            caveats.append(_COMPLETENESS_CAVEATS[completeness])
         return ImpactAnalysis(
             root_id=name,
             graph=graph,
@@ -222,7 +292,7 @@ class LineageService(Repository):
 
     def _bfs(
         self, root: str, direction: LineageDirection, depth: int, *, include_routine: bool
-    ) -> tuple[dict[str, LineageNode], list[LineageEdge], bool]:
+    ) -> tuple[dict[str, LineageNode], list[LineageEdge], LineageCompleteness]:
         nodes: dict[str, LineageNode] = {}
         edges: list[LineageEdge] = []
         edge_keys: set[tuple[str, str, str]] = set()
@@ -231,7 +301,9 @@ class LineageService(Repository):
         )
         visited: set[str] = set()
         queue: deque[tuple[str, int]] = deque([(root, 0)])
-        truncated = False
+        # Bounds hit by individual expansions during *this* walk, not a previous one.
+        self._walk_incomplete = set()
+        hit_node_cap = False
 
         while queue:
             current, level = queue.popleft()
@@ -245,13 +317,23 @@ class LineageService(Repository):
                     edge_keys.add(key)
                     edges.append(hop.edge)
                 if len(nodes) >= _MAX_NODES:
-                    truncated = True
+                    hit_node_cap = True
                     break
                 if hop.name not in visited:
                     queue.append((hop.name, level + 1))
-            if truncated:
+            if hit_node_cap:
                 break
-        return nodes, edges, truncated
+        return nodes, edges, self._completeness(node_cap=hit_node_cap)
+
+    def _completeness(self, *, node_cap: bool) -> LineageCompleteness:
+        """The single most limiting bound this walk hit, or ``complete``."""
+        reasons = set(self._walk_incomplete)
+        if node_cap:
+            reasons.add("node_limit")
+        for candidate in _COMPLETENESS_PRECEDENCE:
+            if candidate in reasons:
+                return candidate
+        return "complete"
 
     def _expand(
         self, name: str, direction: LineageDirection, *, include_routine: bool
@@ -267,9 +349,14 @@ class LineageService(Repository):
         memo_key = (name, direction, include_routine)
         cached = self._expand_memo.get(memo_key)
         if cached is not None:
-            return cached
+            hops, reasons = cached
+            # Replay the cached expansion's bounds: this walk is no more complete than the read
+            # that produced the hops it is reusing.
+            self._walk_incomplete.update(reasons)
+            return hops
+        before = frozenset(self._walk_incomplete)
         hops = self._expand_uncached(name, direction, include_routine=include_routine)
-        self._expand_memo[memo_key] = hops
+        self._expand_memo[memo_key] = (hops, frozenset(self._walk_incomplete) - before)
         return hops
 
     def _expand_uncached(
@@ -397,8 +484,15 @@ class LineageService(Repository):
         if not self.capability.is_available("composite_header"):
             return []
         parts = self._providers.composite_parts(name)[0]
+        root_key = name.strip().upper()
         hops: list[_Hop] = []
         for part in parts:
+            # A CompositeProvider is not its own part: its generated calc view reads its own tables,
+            # so this row is a resolver artefact. Scoped to composite_part deliberately - a declared
+            # transformation whose source and target are one object is a real BW modelling choice
+            # and must stay represented.
+            if part.name.strip().upper() == root_key:
+                continue
             hops.append(
                 _Hop(
                     part.name,
@@ -422,7 +516,18 @@ class LineageService(Repository):
         return hops
 
     def _composite_consumer_hops(self, name: str) -> list[_Hop]:
-        """CompositeProviders that consume ``name`` as a part provider (the reverse direction)."""
+        """CompositeProviders that consume ``name`` as a part provider (the reverse direction).
+
+        Rows are pruned to provider-view candidates *in SQL*, read in a deterministic order, and
+        paged until the source is exhausted or a stated bound stops discovery. The cap applies to
+        distinct resolved providers, never to raw rows - see ``_MAX_COMPOSITE_CONSUMERS`` for why
+        that distinction was a correctness defect rather than a tuning choice.
+
+        Both SQL predicates are authoritative rather than heuristic: a dependent outside the
+        generated package, and a hierarchy runtime view inside it, are both rejected by
+        ``provider_from_calc_view`` regardless, so excluding them in the database changes only how
+        many rows cross the wire.
+        """
         if not (
             self.capability.is_available("object_dependencies")
             and self.capability.is_available("composite_header")
@@ -433,47 +538,102 @@ class LineageService(Repository):
             tables.extend(candidate_tables(name, kind))
         if not tables:
             return []
+
         placeholders = ", ".join("?" for _ in tables)
-        rows = self.select(
-            self.dialect.paginate(
-                self.dialect.build_select(
-                    columns=["DISTINCT DEPENDENT_OBJECT_NAME"],
-                    from_logical="object_dependencies",
-                    where=[
-                        "DEPENDENT_SCHEMA_NAME = ?",
-                        f"BASE_OBJECT_NAME IN ({placeholders})",
-                        "DEPENDENCY_TYPE = ?",
-                    ],
-                    params=[_CALC_SCHEMA, *tables, _TRANSITIVE_DEPENDENCY],
-                ),
-                limit=_MAX_COMPOSITE_CONSUMERS,
-            )
+        hier_segment = CALC_VIEW_HIER_MARKER.rstrip("/")
+        base_query = self.dialect.build_select(
+            columns=["DISTINCT DEPENDENT_OBJECT_NAME"],
+            from_logical="object_dependencies",
+            where=[
+                "DEPENDENT_SCHEMA_NAME = ?",
+                f"BASE_OBJECT_NAME IN ({placeholders})",
+                "DEPENDENCY_TYPE = ?",
+                "DEPENDENT_OBJECT_NAME LIKE ?",
+                # Hierarchy views are excluded as a path *segment*, not as a bare substring, so a
+                # provider genuinely named '/HIERARCHY_X' is not caught by its own name.
+                "DEPENDENT_OBJECT_NAME NOT LIKE ?",
+                "DEPENDENT_OBJECT_NAME NOT LIKE ?",
+            ],
+            params=[
+                _CALC_SCHEMA,
+                *tables,
+                _TRANSITIVE_DEPENDENCY,
+                f"{CALC_VIEW_PACKAGE}%",
+                f"%{hier_segment}/%",
+                f"%{hier_segment}",
+            ],
+            order_by=["DEPENDENT_OBJECT_NAME"],
         )
+
+        root_key = name.strip().upper()
         hops: list[_Hop] = []
         seen: set[str] = set()
-        for (view_name,) in rows:
-            provider = provider_from_calc_view(str(view_name).strip())
-            if not provider or provider == name or provider in seen:
-                continue
-            seen.add(provider)
-            hops.append(
-                _Hop(
-                    provider,
-                    "compositeprovider",
-                    LineageEdge(
-                        src=name,
-                        dst=provider,
-                        kind="composite_part",
-                        derivation="declared",
-                        confidence="advisory",
-                        note="CompositeProvider resolved via its generated calc view",
-                        provenance=self.provenance(
-                            "object_dependencies", {"DEPENDENT_OBJECT_NAME": str(view_name).strip()}
-                        ),
-                    ),
+        for page in range(_MAX_CONSUMER_PAGES):
+            stopped = self._budget_stop()
+            if stopped is not None:
+                self._walk_incomplete.add(stopped)
+                return hops
+            rows = self.select(
+                self.dialect.paginate(
+                    base_query, limit=_CONSUMER_PAGE_ROWS, offset=page * _CONSUMER_PAGE_ROWS
                 )
             )
+            for (view_name,) in rows:
+                raw = str(view_name).strip()
+                provider = provider_from_calc_view(raw)
+                if not provider:
+                    continue
+                key = provider.strip().upper()
+                # A provider is not its own consumer. Its generated view legitimately depends on its
+                # own tables, so that row is a resolver artefact rather than a lineage relationship.
+                if key == root_key or key in seen:
+                    continue
+                seen.add(key)
+                hops.append(
+                    _Hop(
+                        provider,
+                        "compositeprovider",
+                        LineageEdge(
+                            src=name,
+                            dst=provider,
+                            kind="composite_part",
+                            derivation="declared",
+                            confidence="advisory",
+                            note="CompositeProvider resolved via its generated calc view",
+                            provenance=self.provenance(
+                                "object_dependencies", {"DEPENDENT_OBJECT_NAME": raw}
+                            ),
+                        ),
+                    )
+                )
+                if len(seen) >= _MAX_COMPOSITE_CONSUMERS:
+                    # Stopped on the stated cap. Whether more existed is unknown, so the walk is
+                    # reported as bounded rather than complete.
+                    self._walk_incomplete.add("semantic_limit")
+                    return hops
+            if len(rows) < _CONSUMER_PAGE_ROWS:
+                return hops  # a short page means the source is exhausted: a complete reading
+        self._walk_incomplete.add("semantic_limit")
         return hops
+
+    def _budget_stop(self) -> LineageCompleteness | None:
+        """Whether the active per-call budget leaves room for another page.
+
+        Checked rather than caught. Letting :class:`BudgetExceeded` fly from here would convert a
+        clean, reported budget stop into a degraded branch on every later node, so discovery leaves
+        headroom and says it stopped; the budget itself still governs the call.
+        """
+        budget = current_budget()
+        if budget is None:
+            return None
+        if (
+            budget.max_seconds > 0
+            and budget.elapsed_seconds >= budget.max_seconds - _BUDGET_TIME_HEADROOM
+        ):
+            return "time_budget"
+        if budget.max_queries > 0 and budget.queries >= budget.max_queries - _BUDGET_QUERY_HEADROOM:
+            return "query_budget"
+        return None
 
     # --- declared edges (transformations + DTPs) -----------------------------------------
 
@@ -737,11 +897,11 @@ class LineageService(Repository):
         nodes: dict[str, LineageNode],
         edges: list[LineageEdge],
         *,
-        truncated: bool,
+        completeness: LineageCompleteness = "complete",
     ) -> LineageGraph:
         caveats = [_ROUTINE_CAVEAT]
-        if truncated:
-            caveats.append(f"expansion stopped at depth {depth} or the {_MAX_NODES}-node cap")
+        if completeness != "complete":
+            caveats.append(_COMPLETENESS_CAVEATS[completeness])
         caveats.extend(_evidence_caveats(edges))
         return LineageGraph(
             root_id=root,
@@ -751,6 +911,7 @@ class LineageService(Repository):
             edges=edges,
             node_count=len(nodes),
             edge_count=len(edges),
-            truncated=truncated,
+            truncated=completeness != "complete",
+            completeness=completeness,
             caveats=caveats,
         )
