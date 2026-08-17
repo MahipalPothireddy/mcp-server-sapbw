@@ -32,7 +32,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
 | `bw_capability_report` | `constant` | 35,444 B | — | 5000 statements / 300s per call |
 | `bw_check_load_latency` | `per_system` | 585 B | — | 250 routine parses; 5000 statements / 300s per call |
-| `bw_check_schedule_risk` | `per_system` | 358 B | — | 5000 statements / 300s per call |
+| `bw_check_schedule_risk` | `per_system` | 390 B | — | 5000 statements / 300s per call |
 | `bw_compare_snapshots` | `per_system` | 380 B | — | 5000 statements / 300s per call |
 | `bw_compare_systems` | `per_system` | 1,412 B | — | 5000 statements / 300s per call |
 | `bw_create_snapshot` | `per_system` | 1,286 B | — | 5000 statements / 300s per call |
@@ -43,11 +43,11 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_get_analysis_auth` | `per_object` | 407 B | — | 5000 statements / 300s per call |
 | `bw_get_calc_view_lineage` | `per_object` | 390 B | — | 5000 statements / 300s per call |
 | `bw_get_chain` | `per_object` | 596 B | — | 5000 statements / 300s per call |
-| `bw_get_chain_runtimes` | `per_object` | 357 B | — | 5000 statements / 300s per call |
+| `bw_get_chain_runtimes` | `per_object` | 389 B | — | 5000 statements / 300s per call |
 | `bw_get_extractor_exit_code` | `per_system` | 410 B | — | 400 satellite program fetches (configurable); 5000 statements / 300s per call |
 | `bw_get_hana_crossings` | `per_page` | 193 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_get_lineage` | `per_graph_node` | 1,493 B | yes | 400 graph nodes, depth 12; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_get_load_closure` | `per_object` | 330 B | — | 5000 statements / 300s per call |
+| `bw_get_load_closure` | `per_object` | 362 B | — | 5000 statements / 300s per call |
 | `bw_get_provider_health` | `per_object` | 437 B | — | 5000 statements / 300s per call |
 | `bw_get_query` | `per_object` | 964 B | — | 5000 statements / 300s per call |
 | `bw_get_query_auth_exposure` | `per_object` | 587 B | — | 5000 statements / 300s per call |
@@ -55,7 +55,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_get_query_usage` | `per_object` | 244 B | — | 5000 statements / 300s per call |
 | `bw_get_routine_code` | `per_object` | 302 B | — | 5000 statements / 300s per call |
 | `bw_get_routine_register` | `per_system` | 1,116 B | — | 500 routines parsed (default 100); 5000 statements / 300s per call |
-| `bw_get_schedule_matrix` | `per_page` | 358 B | — | 500 rows per page; 5000 statements / 300s per call |
+| `bw_get_schedule_matrix` | `per_page` | 390 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_get_source_systems` | `per_system` | 405 B | — | 5000 statements / 300s per call |
 | `bw_get_transfer_rules` | `per_object` | 411 B | — | 5000 statements / 300s per call |
 | `bw_get_transformation` | `per_object` | 1,170 B | — | 5000 statements / 300s per call |

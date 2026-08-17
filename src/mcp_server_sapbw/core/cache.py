@@ -13,6 +13,7 @@ file lives under a git-ignored directory and never leaves the machine.
 from __future__ import annotations
 
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -42,6 +43,26 @@ class SqliteCache:
 
     ``fingerprint`` ties entries to a capability record; when it changes, stale entries miss and are
     evicted. ``clock`` is injectable for testing TTL behavior.
+
+    **Thread safety.** One instance is shared for the life of the process
+    (``ServerRuntime._caches``) and MCP tool calls are dispatched across a worker-thread pool, so
+    consecutive calls reach this object from different threads. Two things are therefore required,
+    and one alone is not enough:
+
+    * ``check_same_thread=False``, or SQLite refuses the second thread outright with
+      ``sqlite3.ProgrammingError``. That was the live defect: every cache-touching tool
+      (``bw_describe_object``, ``bw_analyze_object``, anything through ``cached_model``) failed
+      whenever its call landed on a thread other than the one that happened to open the cache, while
+      DB-only tools kept working - which made it look like a BW connection fault.
+    * an :class:`~threading.RLock` around every use of the connection. Dropping the thread check
+      removes the crash but not the races, and what remains does not announce itself: ``commit()``
+      is scoped to the *connection*, not the statement, so one thread committing inside :meth:`put`
+      would also commit another's in-flight ``DELETE`` from :meth:`_delete`; and :meth:`refresh`
+      reports ``cursor.rowcount`` after committing, which an interleaved write silently changes. A
+      wrong count is worse than a raised error, so the lock is not belt-and-braces.
+
+    The lock is re-entrant because :meth:`get` calls :meth:`_delete` on the expiry and
+    fingerprint-mismatch paths; a plain ``Lock`` would deadlock there.
     """
 
     def __init__(
@@ -61,11 +82,15 @@ class SqliteCache:
         self._runtime_ttl = min(int(runtime_ttl), _RUNTIME_TTL_CAP)
         self._clock = clock
 
+        # Re-entrant: get() -> _delete() acquires twice on the expiry and fingerprint paths.
+        self._lock = threading.RLock()
+
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(path))
-        self._conn.execute(_SCHEMA)
-        self._conn.commit()
+        self._conn = sqlite3.connect(str(path), check_same_thread=False)
+        with self._lock:
+            self._conn.execute(_SCHEMA)
+            self._conn.commit()
 
     @property
     def structural_ttl(self) -> int:
@@ -79,10 +104,12 @@ class SqliteCache:
 
     def entry_counts(self) -> dict[str, int]:
         """Entries per object type, for reporting what is at rest without reading any value."""
-        rows = self._conn.execute(
-            "SELECT object_type, COUNT(*) FROM cache_entries WHERE system = ? GROUP BY object_type",
-            (self._system,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT object_type, COUNT(*) FROM cache_entries WHERE system = ? "
+                "GROUP BY object_type",
+                (self._system,),
+            ).fetchall()
         return {str(object_type): int(count) for object_type, count in rows}
 
     def _ttl(self, tier: CacheTier) -> int:
@@ -91,42 +118,48 @@ class SqliteCache:
     def get(
         self, object_type: str, object_id: str, *, tier: CacheTier = "structural"
     ) -> str | None:
-        """Return the cached value, or ``None`` on miss / expiry / fingerprint change."""
-        row = self._conn.execute(
-            "SELECT value, extracted_at, fingerprint FROM cache_entries "
-            "WHERE system = ? AND object_type = ? AND object_id = ? AND tier = ?",
-            (self._system, object_type, object_id, tier),
-        ).fetchone()
-        if row is None:
-            return None
-        value, extracted_at, fingerprint = row
-        if fingerprint != self._fingerprint:
-            self._delete(object_type, object_id, tier)
-            return None
-        if self._clock() - float(extracted_at) > self._ttl(tier):
-            self._delete(object_type, object_id, tier)
-            return None
-        return str(value)
+        """Return the cached value, or ``None`` on miss / expiry / fingerprint change.
+
+        Held under one lock acquisition end to end, so the read and the eviction it may trigger
+        cannot be split by another thread's write.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value, extracted_at, fingerprint FROM cache_entries "
+                "WHERE system = ? AND object_type = ? AND object_id = ? AND tier = ?",
+                (self._system, object_type, object_id, tier),
+            ).fetchone()
+            if row is None:
+                return None
+            value, extracted_at, fingerprint = row
+            if fingerprint != self._fingerprint:
+                self._delete(object_type, object_id, tier)
+                return None
+            if self._clock() - float(extracted_at) > self._ttl(tier):
+                self._delete(object_type, object_id, tier)
+                return None
+            return str(value)
 
     def put(
         self, object_type: str, object_id: str, value: str, *, tier: CacheTier = "structural"
     ) -> None:
         """Store a value under the given key with the current fingerprint and timestamp."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO cache_entries "
-            "(system, object_type, object_id, tier, fingerprint, value, extracted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                self._system,
-                object_type,
-                object_id,
-                tier,
-                self._fingerprint,
-                value,
-                self._clock(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO cache_entries "
+                "(system, object_type, object_id, tier, fingerprint, value, extracted_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self._system,
+                    object_type,
+                    object_id,
+                    tier,
+                    self._fingerprint,
+                    value,
+                    self._clock(),
+                ),
+            )
+            self._conn.commit()
 
     def refresh(self, scope: str) -> int:
         """Invalidate cached entries by scope. Returns the number of rows removed.
@@ -134,25 +167,33 @@ class SqliteCache:
         ``scope`` of ``"all"`` clears everything; otherwise it matches an ``object_type`` (e.g.
         ``"chains"``) or a specific ``object_id``.
         """
-        if scope == "all":
-            cursor = self._conn.execute(
-                "DELETE FROM cache_entries WHERE system = ?", (self._system,)
-            )
-        else:
-            cursor = self._conn.execute(
-                "DELETE FROM cache_entries WHERE system = ? AND (object_type = ? OR object_id = ?)",
-                (self._system, scope, scope),
-            )
-        self._conn.commit()
-        return cursor.rowcount
+        # rowcount is read after the commit, so the delete and the count it reports have to be one
+        # atomic step: an interleaved write would otherwise make bw_refresh_cache report a number
+        # that describes neither call.
+        with self._lock:
+            if scope == "all":
+                cursor = self._conn.execute(
+                    "DELETE FROM cache_entries WHERE system = ?", (self._system,)
+                )
+            else:
+                cursor = self._conn.execute(
+                    "DELETE FROM cache_entries "
+                    "WHERE system = ? AND (object_type = ? OR object_id = ?)",
+                    (self._system, scope, scope),
+                )
+            self._conn.commit()
+            return cursor.rowcount
 
     def _delete(self, object_type: str, object_id: str, tier: CacheTier) -> None:
-        self._conn.execute(
-            "DELETE FROM cache_entries "
-            "WHERE system = ? AND object_type = ? AND object_id = ? AND tier = ?",
-            (self._system, object_type, object_id, tier),
-        )
-        self._conn.commit()
+        """Evict one entry. Re-entrant: :meth:`get` calls this while already holding the lock."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM cache_entries "
+                "WHERE system = ? AND object_type = ? AND object_id = ? AND tier = ?",
+                (self._system, object_type, object_id, tier),
+            )
+            self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()

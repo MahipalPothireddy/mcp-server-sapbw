@@ -263,6 +263,14 @@ def from_exception(exc: BaseException, **detail: str) -> BwError:
     The message is forwarded only for exception families whose text is scrubbed at the raise site.
     For anything else the failure class is named and the message is fixed, so an unrecognised
     exception can never carry a host name or a connection string into a tool response.
+
+    ``exception_module`` is reported alongside the class name because the class name alone is
+    ambiguous in the case that matters most. ``sqlite3.ProgrammingError`` (the local extract cache)
+    and ``hdbcli.dbapi.ProgrammingError`` (the BW session) are different faults with different
+    remedies, and a reply naming only ``ProgrammingError`` sent a live investigation after the BW
+    connection while the real defect was in the cache. Added rather than folded into ``exception``
+    so a caller already matching on the bare class name keeps working. A module name is a library
+    identifier - never a credential, host, statement or object name.
     """
     name = type(exc).__name__
     code = code_for_exception(exc)
@@ -271,5 +279,9 @@ def from_exception(exc: BaseException, **detail: str) -> BwError:
     return BwError(
         code=code,
         message=message,
-        detail={"exception": name, **{k: str(v) for k, v in detail.items()}},
+        detail={
+            "exception": name,
+            "exception_module": type(exc).__module__,
+            **{k: str(v) for k, v in detail.items()},
+        },
     )

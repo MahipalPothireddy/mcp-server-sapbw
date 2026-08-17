@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -45,16 +46,31 @@ IN_MEMORY = Path(":memory:")
 
 
 class SnapshotStore:
-    """Snapshots for one profile, in one SQLite file."""
+    """Snapshots for one profile, in one SQLite file.
+
+    **Thread safety.** ``check_same_thread=False`` was already set here, so unlike the extract cache
+    this store never raised across threads - and that is precisely why its remaining hazard stayed
+    invisible. One instance is shared for the life of the process
+    (``ServerRuntime._snapshot_stores``) and reached from whichever worker thread serves a call, and
+    ``commit()`` is scoped to the connection rather than the statement: one thread committing inside
+    :meth:`put` would also commit another's in-flight ``DELETE`` from :meth:`delete`, whose
+    ``rowcount`` is then read after that commit. Neither shows up as an error, so the same
+    :class:`~threading.RLock` discipline applies as in :mod:`~mcp_server_sapbw.core.cache`.
+
+    Re-entrant for the same reason the cache's is: it costs nothing and it removes the class of
+    deadlock that appears the first time one guarded method calls another.
+    """
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._in_memory = path == IN_MEMORY
+        self._lock = threading.RLock()
         if not self._in_memory:
             path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
+        with self._lock:
+            self._conn.executescript(_SCHEMA)
+            self._conn.commit()
 
     @property
     def path(self) -> Path:
@@ -62,23 +78,24 @@ class SnapshotStore:
 
     def put(self, snapshot: Snapshot) -> None:
         """Store a snapshot, replacing one with the same id."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO snapshots "
-            "(snapshot_id, system, taken_at, bw_release, object_count, edge_count, families, "
-            "truncated, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                snapshot.snapshot_id,
-                snapshot.system,
-                snapshot.taken_at.isoformat(),
-                snapshot.bw_release,
-                snapshot.object_count,
-                snapshot.edge_count,
-                json.dumps(snapshot.scope.families),
-                int(snapshot.scope.truncated),
-                snapshot.model_dump_json(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO snapshots "
+                "(snapshot_id, system, taken_at, bw_release, object_count, edge_count, families, "
+                "truncated, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    snapshot.snapshot_id,
+                    snapshot.system,
+                    snapshot.taken_at.isoformat(),
+                    snapshot.bw_release,
+                    snapshot.object_count,
+                    snapshot.edge_count,
+                    json.dumps(snapshot.scope.families),
+                    int(snapshot.scope.truncated),
+                    snapshot.model_dump_json(),
+                ),
+            )
+            self._conn.commit()
 
     def get(self, snapshot_id: str) -> Snapshot | None:
         """One snapshot by id, or ``None``.
@@ -87,9 +104,10 @@ class SnapshotStore:
         change shipped in a new server version must not turn an old snapshot into an error, and the
         caller's remedy is the same either way - take a fresh one.
         """
-        row = self._conn.execute(
-            "SELECT payload FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payload FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
+            ).fetchone()
         if row is None:
             return None
         try:
@@ -103,17 +121,18 @@ class SnapshotStore:
         ``before`` is what makes "compare the current state against the last one" work without the
         caller tracking ids: capture now, then ask for the latest taken before that.
         """
-        if before is None:
-            row = self._conn.execute(
-                "SELECT payload FROM snapshots WHERE system = ? ORDER BY taken_at DESC LIMIT 1",
-                (system,),
-            ).fetchone()
-        else:
-            row = self._conn.execute(
-                "SELECT payload FROM snapshots WHERE system = ? AND taken_at < ? "
-                "ORDER BY taken_at DESC LIMIT 1",
-                (system, before.isoformat()),
-            ).fetchone()
+        with self._lock:
+            if before is None:
+                row = self._conn.execute(
+                    "SELECT payload FROM snapshots WHERE system = ? ORDER BY taken_at DESC LIMIT 1",
+                    (system,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT payload FROM snapshots WHERE system = ? AND taken_at < ? "
+                    "ORDER BY taken_at DESC LIMIT 1",
+                    (system, before.isoformat()),
+                ).fetchone()
         if row is None:
             return None
         try:
@@ -133,6 +152,8 @@ class SnapshotStore:
             params = (system,)
         sql += " ORDER BY taken_at DESC LIMIT ?"
         params = (*params, int(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
         return [
             SnapshotSummary(
                 snapshot_id=row[0],
@@ -144,21 +165,26 @@ class SnapshotStore:
                 families=json.loads(row[6]),
                 truncated=bool(row[7]),
             )
-            for row in self._conn.execute(sql, params).fetchall()
+            for row in rows
         ]
 
     def delete(self, snapshot_id: str) -> bool:
-        cursor = self._conn.execute("DELETE FROM snapshots WHERE snapshot_id = ?", (snapshot_id,))
-        self._conn.commit()
-        return cursor.rowcount > 0
+        # rowcount is read after the commit, so both must happen under one acquisition.
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM snapshots WHERE snapshot_id = ?", (snapshot_id,)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def count(self, *, system: str | None = None) -> int:
-        if system:
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM snapshots WHERE system = ?", (system,)
-            ).fetchone()
-        else:
-            row = self._conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()
+        with self._lock:
+            if system:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM snapshots WHERE system = ?", (system,)
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()
         return int(row[0]) if row else 0
 
     def size_bytes(self) -> int:
@@ -174,7 +200,8 @@ class SnapshotStore:
             return 0
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
 
 def snapshot_file(system: str, cache_directory: Path, *, tenant: str | None = None) -> Path:
