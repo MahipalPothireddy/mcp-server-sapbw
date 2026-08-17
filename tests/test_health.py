@@ -28,11 +28,14 @@ _VOLUMES: dict[str, tuple[int, int]] = {
     BIC + "AFIN_ADSO2": (10_000, 20 * MB),  # active
     BIC + "AFIN_ADSO3": (250_000, 400 * MB),  # changelog - the bloat
     BIC + "ASALES_DSO00": (7_000, 14 * MB),
+    BIC + "FSALES_CUBE": (80_000, 120 * MB),  # F fact table
+    BIC + "ESALES_CUBE": (400_000, 500 * MB),  # E fact table (compressed)
 }
 # provider -> DTA_TYPE
 _DTA_TYPES = {
     "FIN_ADSO": "ADSO",
     "SALES_DSO": "ODSO",
+    "SALES_CUBE": "CUBE",
     "EMPTY_ADSO": "ADSO",
     # FLEX_T / FLEX_M are InfoObject master-data loads (text and attribute). Measured: on the
     # reference system all 214 FLEX_T and all 82 FLEX_M values resolve to RSDIOBJ, none unresolved.
@@ -54,14 +57,26 @@ _REQUESTS: dict[str, list[tuple[Any, ...]]] = {
         ("REQ_B", "@0A@", "20260728080000", "20260728080300", 0, "F", "", "STG_DSO"),
         ("REQ_A", "@08@", "20260720080000", "20260720081000", 5000, "F", "", "STG_DSO"),
     ],
+    # An InfoCube: the other object model the classic ledger legitimately records. Present so the
+    # ADSO path cannot regress it without a test noticing.
+    "SALES_CUBE": [
+        ("REQ_C2", "@08@", "20260728060000", "20260728061200", 34_000, "F", "2LIS_SRC", ""),
+        ("REQ_C1", "@09@", "20260727060000", "20260727060400", 120, "F", "2LIS_SRC", ""),
+    ],
 }
 _MAX_TS = "20260728120000"
 
 
 class ScriptedConnection:
+    """Records the SQL it was asked for, so ordering rules can be asserted rather than assumed."""
+
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
+        self.statements.append(sql)
         params = [str(p).strip() for p in (parameters or [])]
         if "M_CS_TABLES" in sql:
             wanted = [p for p in params if p in _VOLUMES]
@@ -335,6 +350,9 @@ _RSPM_OTHER_LAYERS: dict[str, list[tuple[Any, ...]]] = {
     ],
 }
 _RSPM_TLOGO = {"FIN_ADSO": "ADSO", "UNACTIVATED_ADSO": "ADSO", "ODD_TARGET": "QQQQ"}
+# What the classic ledger records here: a classic DSO and an InfoCube, and no Advanced DSO at all.
+# That is the measured shape on the reference system, and the reason the ADSO path exists.
+_CLASSIC_LEDGER_PROVIDERS = frozenset({"SALES_DSO", "SALES_CUBE"})
 
 
 class TwoLedgerConnection(ScriptedConnection):
@@ -343,6 +361,7 @@ class TwoLedgerConnection(ScriptedConnection):
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
+        self.statements.append(sql)
         params = [str(p).strip() for p in (parameters or [])]
         if "RSPMREQUEST" in sql:
             return self._rspm(sql, params)
@@ -352,7 +371,7 @@ class TwoLedgerConnection(ScriptedConnection):
             if "MAX(TIMESTAMP_ANF)" in sql:
                 return [(_MAX_TS,)]
             provider = params[0] if params else ""
-            if provider not in ("SALES_DSO",):
+            if provider not in _CLASSIC_LEDGER_PROVIDERS:
                 return []
             return super()._requests(sql, params)
         return super().execute_select(sql, parameters)
@@ -370,6 +389,30 @@ class TwoLedgerConnection(ScriptedConnection):
         if "COUNT(*)" in sql:
             return [(len(rows),)]
         return rows
+
+
+def _two_ledger_pair() -> tuple[HealthRepository, TwoLedgerConnection]:
+    """The same landscape, with the connection handed back so its SQL can be inspected."""
+    connection = TwoLedgerConnection()
+    return HealthRepository(connection, _two_ledger_capability()), connection
+
+
+def _two_ledger_capability() -> CapabilityRecord:
+    return CapabilityRecord(
+        system="qa",
+        bw_release="7.50",
+        abap_schema=SCHEMA,
+        discovered_at=datetime.now(UTC),
+        tables={
+            logical: TableStatus(
+                logical_name=logical,
+                resolved_name=physical,
+                present=True,
+                schema_name="SYS" if logical == "cs_tables" else SCHEMA,
+            )
+            for logical, physical in _RSPM_TABLES.items()
+        },
+    )
 
 
 def _two_ledger_repo() -> HealthRepository:
@@ -522,3 +565,68 @@ def test_require_health_accepts_the_tsn_ledger_alone() -> None:
         ),
     )
     assert repo.require_health() is None
+
+
+def test_infocubes_still_read_the_classic_ledger() -> None:
+    """The other object model RSSTATMANPART legitimately records, so a regression cannot hide.
+
+    The ADSO fix must not reroute InfoCubes: their currency, status decode (icon codes, not RSPM
+    two-letter codes), update mode and fact-table volume all have to keep coming from the classic
+    path.
+    """
+    health = _two_ledger_repo().get_health("SALES_CUBE")
+
+    assert health.object_type == "infocube"
+    assert health.last_request is not None
+    assert health.last_request.request_id == "REQ_C2"  # an RNR, not a 23-digit TSN
+    assert health.last_request.status == "success"
+    assert health.last_request.status_code == "@08@"  # icon code => the classic decode ran
+    assert health.last_request.update_mode == "full"  # only the classic ledger carries UPDMODE
+    assert health.last_request.records == 34_000
+    # The yellow request decodes as incomplete, which is distinct from both success and error.
+    assert [r.status for r in health.recent_requests] == ["success", "incomplete"]
+    assert health.failed_request_count == 0
+    assert not any("BW 7.4+ request framework" in c for c in health.caveats)
+    # Both fact tables located and reported, so volume did not regress either.
+    assert health.tables_found == 2
+    assert health.volume_resolved is True
+
+
+def test_the_latest_active_table_request_is_the_one_reported() -> None:
+    """Which request answers "when did this last load" is a rule, so state it and check it.
+
+    Two halves, and the fixture can only honestly prove one of each:
+
+    * **Ordering is delegated to the database.** A scripted connection returns rows in whatever
+      order the fixture lists them, so asserting on that would prove nothing about SQL. What is
+      checkable is that the reader *asks* for the right order - newest first by ``LAST_TIME_STAMP``,
+      the RSPM field that records when the request last changed state.
+    * **Selection is the reader's own logic**, and that is asserted directly: ``last_request`` is
+      the newest row whatever its status, while ``last_successful_request`` skips forward past the
+      housekeeping and error rows to the newest completed load. Those must not collapse into each
+      other - the whole point is that a provider can have a recent request and stale data.
+    """
+    repo, connection = _two_ledger_pair()
+    health = repo.get_health("FIN_ADSO")
+
+    ordering = [
+        sql
+        for sql in connection.statements
+        if "RSPMREQUEST" in sql and "LAST_TIME_STAMP" in sql and "ORDER BY" in sql
+    ]
+    assert ordering, "the ADSO currency read does not order by LAST_TIME_STAMP at all"
+    assert all("DESC" in sql.upper() for sql in ordering), (
+        "requests are ordered oldest-first, so the 'latest' request would be the oldest"
+    )
+
+    # Fixture order is newest-first: D (housekeeping), then GG, then RG.
+    assert health.last_request is not None
+    assert health.last_request.status_code == "D"
+    assert health.last_successful_request is not None
+    assert health.last_successful_request.status_code == "GG"
+    assert health.last_request.request_id != health.last_successful_request.request_id, (
+        "newest request and newest successful load collapsed into one, so a provider with a recent "
+        "failed or deleted request would read as freshly loaded"
+    )
+    # Age is measured from the successful load, never from the newest row.
+    assert health.data_age_days is not None
