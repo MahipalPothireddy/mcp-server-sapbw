@@ -6,6 +6,75 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — provider currency is per-object-model, not universal
+
+`bw_get_provider_health` reported "no load requests are recorded for this provider" for **every
+Advanced DSO** on the reference system — 248 of 248 active ones, the dominant provider type there —
+and offered the reader three explanations, all wrong: virtual, routine-filled, or archived. The real
+one is that BW has *two* request ledgers and this read one of them. `RSSTATMANPART` held 1.46 million
+rows and not a single ADSO among them (measured `DTA_TYPE` spread: CUBE, ODSO, FLEX_T, FLEX_M only);
+the ADSO history was 2.1 million rows away in the BW 7.4+ TSN framework, `RSPMREQUEST`, which was not
+read at all.
+
+The generalisation, not the patch: **which ledger records a provider is a property of its object
+model, not of the release.** Both are now read, chosen by object model, and the reply names which one
+answered.
+
+Four things the fix had to get right, each measured rather than assumed:
+
+- **A request is written once per storage layer**, so an unfiltered read reports every load three
+  times (measured: AQ 759,302 / AT 696,886 / CL 649,649). Currency is restricted to `STORAGE = 'AT'`,
+  the active table — what a query actually reads. Without the filter the newest row is often an
+  activation-queue entry for data no query can see yet.
+- **`REQUEST_STATUS` carries two verdicts**, decoded from dictionary domain `RSPM_REQUEST_STATUS`
+  rather than recalled. The first letter is BW's overall verdict and the second the technical one, so
+  `RG` ("overall not OK but technically OK") is an error despite its clean technical half.
+- **Not every status is a load outcome.** `D` (Deleted), `M` (Moved), `X` (Deleting) and `''` (New)
+  say nothing about whether data is present, so they decode to neither success nor failure and are
+  named in a caveat instead. This is the common path, not an edge case: measured, the newest
+  active-table request for a target is `D` far more often than `GG`, and reporting that as "the most
+  recent load ended unknown" sends a reader hunting a failure that never happened.
+- **A TSN is not a timestamp.** `REQUEST_TSN` is `NUMC(23)` — fourteen digits of `YYYYMMDDHHMMSS`
+  then nine of sub-second precision. It gets its own parser rather than a relaxed version of the
+  existing one, because loosening that length check would let a malformed `RSSTATMANPART` value parse
+  as a date, and silently accepting bad input is worse than returning nothing.
+
+**Half the defect was upstream of the ledger read.** The provider's *kind* was also inferred from
+`RSSTATMANPART` alone, so it came back `None` for every ADSO — and a `None` kind skips the
+Advanced-DSO branch as well as the generated-table lookup. A caller that did not already know the
+object's type therefore got neither volume nor currency. Kind now falls back to `RSPMREQUEST.TLOGO`,
+decoded from domain `RSTLOGO` (`ADSO` → "DataStore Object (advanced)"). `HCPR` is deliberately left
+out: a CompositeProvider has no generated tables of its own, so returning it as a kind would only
+produce an unresolvable volume read.
+
+Also corrected: `RSSTATMANPART.DTA_TYPE` values `FLEX_T` and `FLEX_M` were unmapped on the recorded
+evidence that "28 of 40 sampled were in no provider catalogue at all" — a check that looked only at
+*provider* catalogues. Re-measured against every catalogue, all 214 `FLEX_T` and all 82 `FLEX_M`
+values resolve to `RSDIOBJ` with nothing unresolved: they are InfoObject master-data loads, text and
+attribute respectively. A documented blank replaced by a measured fact, with the test that encoded
+the old conclusion updated and a separate one kept for codes whose meaning genuinely is not
+established.
+
+Verified live against BW 7.50: an Advanced DSO whose kind the caller does not supply now resolves to
+`adso`, reports 62,842 active-table requests, and dates its last successful load from the TSN ledger.
+`require_health` accepts the TSN framework as a currency source on its own, so a release recording
+ADSOs only there no longer reports health as unsupported. New capability: `adso_request` →
+`RSPMREQUEST`.
+
+### Fixed — the performance profile could not be regenerated reproducibly
+
+Adding wall-clock measurement to the compound envelope (`duration_ms`, `time_used_ms`) made
+`scripts/performance_profile.py` non-convergent: it measures serialised reply size, so an analysis
+that took 9 ms one run and 11 ms the next changed the recorded byte count. `--check` failed
+immediately after a rebuild — the same failure the `bw_performance_profile` self-reference exclusion
+already existed to prevent, from a different cause.
+
+Wall-clock durations are now zeroed before measurement, which is what `fixture_payload_bytes` always
+claimed to be: the fixed overhead of a reply's *shape*, not a property of the machine that ran it.
+Every tool is measured twice and the readings must agree, so a volatile field added later fails
+loudly with the field named and the two options spelled out, rather than surfacing as a flaky CI run
+on an unrelated commit.
+
 ### Changed — positioned as an engine, with MCP as the interface
 
 The README led with "an MCP server that exposes BW metadata as tools", which describes the transport

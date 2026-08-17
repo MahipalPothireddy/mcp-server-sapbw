@@ -196,6 +196,7 @@ GRANT_GROUPS: tuple[GrantGroup, ...] = (
                 "datasource_field",
                 "source_system",
                 "request_status",
+                "adso_request",
             }
         ),
         abap_objects=(
@@ -219,6 +220,7 @@ GRANT_GROUPS: tuple[GrantGroup, ...] = (
             "RSDSSEGFD",
             "RSBASIDOC",
             "RSSTATMANPART",
+            "RSPMREQUEST",
         ),
         extra_notes=(
             "RSAABAP carries ABAP routine source, which is customer intellectual property and "

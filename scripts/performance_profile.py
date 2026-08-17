@@ -324,12 +324,37 @@ def _bounds_for(tool: str, growth: GrowthClass) -> list[CostBound]:
 #: construction.
 _SELF_REFERENTIAL = frozenset({"bw_performance_profile"})
 
+#: Fields holding a wall-clock reading, zeroed before the payload is measured.
+#:
+#: These are genuine measurements and belong in the reply, but they are not part of a reply's
+#: *shape*, which is what ``fixture_payload_bytes`` documents. Left alone, an analysis that happened
+#: to take 9 ms one run and 11 ms the next changed the recorded byte count, so regeneration never
+#: converged and ``--check`` failed straight after a rebuild. Same failure mode as
+#: ``_SELF_REFERENTIAL`` above, from a different cause.
+_VOLATILE_FIELDS = frozenset({"duration_ms", "time_used_ms"})
+
+
+def _stabilise(value: Any) -> Any:
+    """Zero any wall-clock duration, so the measurement reflects shape rather than machine speed."""
+    if isinstance(value, dict):
+        return {
+            k: 0 if k in _VOLATILE_FIELDS and isinstance(v, int | float) else _stabilise(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_stabilise(v) for v in value]
+    return value
+
 
 def _measure_payloads() -> dict[str, int]:
     """Serialised reply size per tool, against the synthetic fixtures.
 
     A tool that cannot be invoked here is omitted, and the profile reports it as ``not_measured``
     rather than assigning it a size - an unmeasured payload is unknown, not small.
+
+    Every tool is measured twice and the two readings must agree. That guard is the point: a
+    volatile field added to a reply later would otherwise reintroduce the non-convergence quietly,
+    as a CI failure on an unrelated commit, and the reader would have no way to know why.
     """
 
     async def one(tool: str, args: dict[str, Any]) -> int:
@@ -338,16 +363,29 @@ def _measure_payloads() -> dict[str, int]:
                 result = await client.call_tool(tool, args)
             except Exception:
                 return -1
-            return len(json.dumps(result.structured_content, default=str).encode())
+            payload = _stabilise(result.structured_content)
+            return len(json.dumps(payload, default=str).encode())
+
+    def measure(tool: str, args: dict[str, Any]) -> int:
+        server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
+        return asyncio.run(one(tool, args))
 
     sizes: dict[str, int] = {}
     for tool, args in sorted(_ARGS.items()):
         if tool in _NEEDS_OUTPUT_DIR or tool in _SELF_REFERENTIAL:
             continue
-        server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
-        size = asyncio.run(one(tool, args))
-        if size >= 0:
-            sizes[tool] = size
+        size = measure(tool, args)
+        if size < 0:
+            continue
+        again = measure(tool, args)
+        if again != size:
+            raise SystemExit(
+                f"{tool} measured {size} then {again} bytes on identical input, so this profile "
+                f"cannot be regenerated reproducibly. Its reply carries a value that varies "
+                f"between runs; add that field to _VOLATILE_FIELDS if it is a wall-clock reading, "
+                f"or to _SELF_REFERENTIAL if the reply depends on this file."
+            )
+        sizes[tool] = size
     return sizes
 
 
@@ -383,6 +421,10 @@ def build() -> PerformanceProfile:
         "fixture_payload_bytes is a floor, not a forecast. The fixtures hold roughly one object "
         "per type, so the number shows the fixed overhead of a reply's shape and says nothing "
         "about per-row cost on a real system.",
+        "Wall-clock durations in a reply (duration_ms, time_used_ms) are zeroed before the payload "
+        "is measured. They are real measurements, but they are a property of the machine that ran "
+        "the call rather than of the reply's shape, and leaving them in made the recorded size "
+        "differ between two runs on identical input.",
         "growth is declared from the code and cites the constant that bounds it. It is not "
         "extrapolated from the fixture measurement - a one-object fixture cannot demonstrate what "
         "four thousand objects do.",

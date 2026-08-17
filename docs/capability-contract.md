@@ -13,9 +13,9 @@ neither a reader nor a stated reason.
 decision rests on the second. They used to share one word: `SUPPORTED` meant "a reader
 exists and a test covers it", but reads as "validated against supported BW versions".
 
-- **Implementation** - 80 of 99 capabilities are implemented.
+- **Implementation** - 81 of 100 capabilities are implemented.
 - **Validation** - 53 have been read through a real
-  feature against a live BW system, 17 are covered by the
+  feature against a live BW system, 18 are covered by the
   offline suite only, 29 are unproven, and
   **0 have been validated on a customer's own
   system**.
@@ -43,12 +43,13 @@ capability with a reader that no test touched reports `not_validated`.
 Presence of a table on *your* system is a third question again, answered per connection
 by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 
-## SUPPORTED (66)
+## SUPPORTED (67)
 
 | Capability | Object | Validation | Notes |
 |---|---|---|---|
 | `adso_header` | `RSOADSO` | `integration_tested` | read by the server |
 | `adso_keyfields` | `RSOADSOKEYFIELDS` | `integration_tested` | read by the server |
+| `adso_request` | `RSPMREQUEST` | `unit_tested` | read by the server |
 | `adso_text` | `RSOADSOT` | `integration_tested` | read by the server |
 | `attribute` | `RSDBCHATR` | `integration_tested` | read by the server |
 | `auth_hierarchy` | `RSECHIE` | `unit_tested` | read by the server |

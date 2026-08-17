@@ -22,15 +22,15 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 
 | Tool | Growth | Fixture payload | Shaped | Bounds |
 |---|---|--:|:-:|---|
-| `bw_access_report` | `constant` | 10,063 B | — | 5000 statements / 300s per call |
-| `bw_analyze_object` | `per_graph_node` | 7,357 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_analyze_process_chain` | `per_object` | 2,949 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_analyze_query` | `per_object` | 6,493 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_access_report` | `constant` | 10,097 B | — | 5000 statements / 300s per call |
+| `bw_analyze_object` | `per_graph_node` | 9,054 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_analyze_process_chain` | `per_object` | 3,885 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_analyze_query` | `per_object` | 7,863 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_routine` | `per_object` | 1,118 B | — | 5000 statements / 300s per call |
-| `bw_assess_change_impact` | `per_graph_node` | 8,000 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_assess_change_impact` | `per_graph_node` | 9,576 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_assess_landscape` | `per_system` | 5,282 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
-| `bw_capability_report` | `constant` | 35,161 B | — | 5000 statements / 300s per call |
+| `bw_capability_report` | `constant` | 35,444 B | — | 5000 statements / 300s per call |
 | `bw_check_load_latency` | `per_system` | 585 B | — | 250 routine parses; 5000 statements / 300s per call |
 | `bw_check_schedule_risk` | `per_system` | 358 B | — | 5000 statements / 300s per call |
 | `bw_compare_snapshots` | `per_system` | 380 B | — | 5000 statements / 300s per call |
@@ -81,7 +81,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_support_matrix` | `constant` | 22,217 B | — | 5000 statements / 300s per call |
 | `bw_system_profile` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
 | `bw_trace_to_source` | `per_graph_node` | 1,742 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
-| `bw_troubleshoot_missing_data` | `per_graph_node` | 6,884 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_troubleshoot_missing_data` | `per_graph_node` | 8,261 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 
 ## Observed on the reference system
 
@@ -93,6 +93,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 ## What these numbers are not
 
 - fixture_payload_bytes is a floor, not a forecast. The fixtures hold roughly one object per type, so the number shows the fixed overhead of a reply's shape and says nothing about per-row cost on a real system.
+- Wall-clock durations in a reply (duration_ms, time_used_ms) are zeroed before the payload is measured. They are real measurements, but they are a property of the machine that ran the call rather than of the reply's shape, and leaving them in made the recorded size differ between two runs on identical input.
 - growth is declared from the code and cites the constant that bounds it. It is not extrapolated from the fixture measurement - a one-object fixture cannot demonstrate what four thousand objects do.
 - statement counts are not measured. Budget charging lives in ReadOnlyConnection and the offline fixtures substitute their own connection, so no statement count is observable offline. Reported as not_measured rather than as zero.
 - observed latencies come from one reference system on one day, at one data volume. They are evidence that a call completes, not a service level.

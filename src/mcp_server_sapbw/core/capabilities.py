@@ -77,6 +77,14 @@ ABAP_TABLES: dict[str, str] = {
     # Source-system registry. NOTE: keyed by SLOGSYS (sender) and carrying OBJSTAT, not OBJVERS.
     "source_system": "RSBASIDOC",
     "request_status": "RSSTATMANPART",
+    # The BW 7.4+ TSN request framework, and the ONLY place an Advanced DSO's load history lives.
+    # RSSTATMANPART records classic DSOs, InfoCubes and InfoObject master-data loads; it holds no
+    # ADSO rows at all. Measured on the reference system: 248 active ADSOs, 0 rows in
+    # RSSTATMANPART, 216 distinct DATATARGET values in RSPMREQUEST of which every one is an ADSO
+    # (TLOGO = 'ADSO' on all 2,105,832 rows). Provider currency is therefore per-object-model, not
+    # universal - one ledger reader was an assumption about BW and it was wrong for the object
+    # model most of a modern landscape uses.
+    "adso_request": "RSPMREQUEST",
     # providers and descriptions
     "dso_header": "RSDODSO",
     "dso_text": "RSDODSOT",

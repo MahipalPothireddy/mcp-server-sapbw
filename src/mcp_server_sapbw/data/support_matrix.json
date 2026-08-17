@@ -5,7 +5,7 @@
     "Only BW 7.50 has been verified (SAP_BW 750, HANA 2.0). Every other release reports 'unverified' for every tool. That is an absence of evidence, stated rather than filled in: which metadata objects a release carries is what the capability resolver discovers at connect time, and predicting it from a version number here would be guesswork wearing the clothes of a support statement.",
     "On an unverified release, the capabilities resolved by pattern rather than by a known name are the ones that decide the answer: adso, analysis_auth, composite_provider, extractor, extractor_field, query_stats, transformation_text. Connect and run bw_capability_report to settle them in one call."
   ],
-  "contract_revision": "0.1.0+469688a7",
+  "contract_revision": "0.1.0+e6b90019",
   "releases": [
     {
       "evidence": "not_verified",

@@ -48,7 +48,7 @@ actually asks for, so `unit_tested` is observed. It is never inferred upward —
 capability that no test touches reports `not_validated`, and a test asserts that some do, because if
 every implemented capability reported as validated the column would be decoration.
 
-On the reference BW 7.50 system, of 78 capabilities usable there: **53 integration-tested, 15
+On the reference BW 7.50 system, of 81 capabilities usable there: **53 integration-tested, 18
 unit-tested only, 10 not validated, and 0 validated on a customer's own system.** That last number is
 reported rather than omitted — it is the honest position of a pre-1.0 build, and closing it is an
 onboarding exercise, not a development one.
@@ -75,7 +75,8 @@ onboarding exercise, not a development one.
   a designed-report vs. ad-hoc-navigation distinction.
 - **HANA calc views** — dependencies, CompositeProvider part resolution, and every BW↔HANA crossing.
 - **Provider health** — how much data a provider holds (active vs. changelog vs. inbound, never
-  summed) and how current it is, from BW's own request ledger.
+  summed) and how current it is, from BW's own request ledgers — of which there are two, and which
+  one applies is a property of the provider's object model, not of the release.
 - **Source-system topology** — which systems feed the warehouse, and which DataSources carry
   extractor enhancements; optionally the exit ABAP itself, read from the source system over ADT.
 - **Descriptions** — for every object, with explicit provenance (stored vs. generated).
