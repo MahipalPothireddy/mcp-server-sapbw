@@ -6,6 +6,43 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — one unmodelled endpoint type discarded the entire lineage graph
+
+`bw_get_lineage` returned **no graph at all** the moment a walk reached a query element used as a
+transformation endpoint. `RSTRAN` code `ELEM` decodes through the canonical table to `query_element`,
+which `LineageNodeType` did not contain, so building the node raised a Pydantic validation error and
+the whole call failed — rather than returning a graph with one oddly-typed node. Found by running
+`bw_analyze_object` against a live BW 7.50 system and then probing past the depths it uses: depths 1
+and 2 stayed clear of it, depth 3 hit it and died.
+
+The mechanism is worth naming because it defeats the type checker. The lineage walk types a node with
+`cast("LineageNodeType", normalise_object_type(code))`, and `normalise_object_type` returns the wider
+`BwObjectType`. mypy cannot relate two unconnected `Literal` types, so the cast silences it without
+proving anything: a decodable type missing from the lineage subset is invisible at type-check time
+and fatal at runtime.
+
+**`query_element` was not the only gap.** Crossing the two vocabularies found five TLOGO-decodable
+types absent from `LineageNodeType`, each of which would have failed identically: `ELEM`
+(`query_element`, the one hit here), `ISTS` (`transfer_structure`), `ISIP` (`infopackage`), `UPDR`
+(`update_rule`) and `RSPC` (`chain`). All five are now members, keeping the lineage vocabulary aligned
+with the canonical one instead of hiding legitimate BW objects as `unknown` — which would have traded
+a crash for a quiet inaccuracy. Genuinely unrecognised future codes still degrade to `unknown`, so
+the soft-fail path is intact; what is closed is the case of a *known* type the subset had not been
+told about.
+
+The durable half is an invariant test: every type `TLOGO_TO_TYPE` can produce must be a member of
+`LineageNodeType`. That is the check that would have caught this before a customer system did, and it
+turns the cast from a promise into something verified. Both new tests were confirmed to fail without
+the fix, since a regression test that passes either way proves nothing.
+
+This is the same drift `models/objects.py` was introduced to end — its docstring cites
+`LineageNodeType` missing `virtualprovider` as the earlier instance. That work fixed the instances
+known at the time without adding a check that the subsets stay covering, which is the argument for
+the invariant over another one-line addition.
+
+Verified on live BW 7.50: depth 3 went from `invalid_argument` with no graph to 120 nodes and 198
+edges including one `query_element`. Depths 1 and 2 are unchanged, so no existing answer moved.
+
 ### Fixed — provider currency is per-object-model, not universal
 
 `bw_get_provider_health` reported "no load requests are recorded for this provider" for **every

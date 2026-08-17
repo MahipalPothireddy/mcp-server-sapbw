@@ -23,8 +23,20 @@ from .objects import BwObjectRef, normalise_object_type
 from .provenance import Provenance
 from .transformations import UnresolvedRef
 
-# Node object types (RSTLOGO-derived for BW objects, plus boundary/extension types).
 # Node object types. A subset of the canonical BwObjectType vocabulary, not a parallel list.
+#
+# **Invariant, enforced by test:** every type ``models.objects.TLOGO_TO_TYPE`` can decode to must
+# appear here. The lineage walk types a node by passing a raw TLOGO code through
+# ``normalise_object_type`` and casting the result to this Literal, so a decodable type missing from
+# this list is not a type error - the cast hides it from mypy - but a Pydantic failure at runtime
+# that rejects the **entire** graph rather than one node.
+#
+# That is not hypothetical. ``ELEM`` (a query element used as a transformation endpoint) was
+# decodable and absent, so ``bw_get_lineage`` returned no graph at all the moment a walk reached one
+# on a real system - and four more codes (``ISTS``, ``ISIP``, ``UPDR``, ``RSPC``) were one landscape
+# away from doing the same. ``chain`` is included for completeness of the decode table rather than
+# because a chain is expected as a data-flow endpoint; representing it costs nothing, and crashing
+# on it costs the caller their answer.
 #
 # BREAKING (pre-1.0): a basic InfoCube is now ``infocube``, matching bw_describe_object and every
 # other surface. It was ``cube`` here alone, so correlating a lineage node with a described object
@@ -34,6 +46,7 @@ from .transformations import UnresolvedRef
 LineageNodeType = Literal[
     "datasource",
     "infosource",
+    "transfer_structure",  # ISTS - the BW 3.x hop between DataSource and InfoSource
     "dso",
     "adso",
     "infocube",
@@ -43,8 +56,12 @@ LineageNodeType = Literal[
     "infoobject",
     "transformation",
     "dtp",
+    "infopackage",  # ISIP - moves data from a DataSource into the PSA
+    "update_rule",  # UPDR - the BW 3.x equivalent of a transformation
+    "chain",  # RSPC - orchestration; here so a decodable code cannot fail the graph
     "calcview",
     "query",
+    "query_element",  # ELEM - a query element used as a transformation endpoint
     "report",
     "source_object",  # a node in a source system (ECC), attached by a connector/bundle
     "unresolved_dependency",  # a custom class/FM/method the parser could not resolve

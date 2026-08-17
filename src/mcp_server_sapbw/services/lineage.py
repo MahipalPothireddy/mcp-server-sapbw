@@ -43,7 +43,16 @@ from .table_resolver import candidate_tables, provider_from_calc_view
 # rather than a local copy: three copies of this map existed and had already drifted (this one said
 # "cube" where the provider vocabulary said "infocube").
 def _node_type(code: object) -> LineageNodeType:
-    """Canonical node type for a raw TLOGO code or a provider-type string."""
+    """Canonical node type for a raw TLOGO code or a provider-type string.
+
+    The ``cast`` is checked, not assumed. ``normalise_object_type`` returns the wider
+    ``BwObjectType``, and mypy cannot relate two unconnected ``Literal`` types, so this cast is the
+    only thing bridging them - which means it can be wrong at runtime while type-checking cleanly.
+    It was: ``ELEM`` decoded to ``query_element``, which ``LineageNodeType`` did not contain, and
+    the resulting Pydantic failure discarded the whole graph instead of one node. A test now asserts
+    that every type this function can return is a member of ``LineageNodeType``, so the cast rests
+    on a verified invariant rather than on a promise.
+    """
     return cast("LineageNodeType", normalise_object_type(code))
 
 
