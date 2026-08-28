@@ -130,6 +130,25 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "A metadata row declares this edge: a transformation, DTP, MultiProvider part or "
         "CompositeProvider part states the source and target directly.",
     ),
+    # How a consumer was resolved from a generated calc view. Distinct from the routine-parse
+    # vocabulary below, and the distinction is defect D10: an edge read out of
+    # SYS.OBJECT_DEPENDENCIES described itself as parsed out of ABAP. Both are advisory, but for
+    # different reasons and with different follow-up, so a caller deciding how far to trust an edge
+    # needs the mechanism that actually produced it.
+    ("calc_view_consumer", "provider"): (
+        "derived",
+        "generated_view_naming",
+        "Read from SYS.OBJECT_DEPENDENCIES: a generated calc view in the BW package depends on "
+        "this object's table, and the view's name resolves to its provider by BW's generation "
+        "convention. Declared as a dependency; resolved to a BW object by convention.",
+    ),
+    ("calc_view_consumer", "query"): (
+        "derived",
+        "generated_view_naming",
+        "Read from SYS.OBJECT_DEPENDENCIES: the calc view BW generates for this BEx query depends "
+        "on the object's table. The query and its provider come from the view's package name by "
+        "BW's generation convention.",
+    ),
     ("lineage_edge", "advisory"): (
         "inferred",
         "routine_select_parse",

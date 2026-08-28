@@ -20,7 +20,7 @@ from collections import deque
 from typing import Any, cast
 
 from ..core.budget import current_budget
-from ..models.evidence import summarise
+from ..models.evidence import evidence_for, summarise
 from ..models.lineage import (
     ImpactAnalysis,
     LineageCompleteness,
@@ -43,6 +43,7 @@ from .table_resolver import (
     CALC_VIEW_PACKAGE,
     candidate_tables,
     provider_from_calc_view,
+    query_from_calc_view,
 )
 
 
@@ -71,7 +72,8 @@ _UPDMODE_MAP: dict[str, UpdateMode] = {"F": "full", "D": "delta", "I": "init"}
 _CALC_SCHEMA = "_SYS_BIC"
 _TRANSITIVE_DEPENDENCY = 2
 
-# How many *distinct resolved consuming providers* one node may contribute. This is a semantic cap,
+# How many *distinct resolved consuming objects* one node may contribute - CompositeProviders and
+# BEx queries together, since both are discovered from the same read. This is a semantic cap,
 # and the distinction is the whole of defect D7: it used to bound raw dependency rows instead.
 # One provider's tables carry thousands of generated dependent views - measured on a QA system,
 # 8,692 rows for one provider, of which 7,040 were hierarchy runtime views that can never be a
@@ -509,6 +511,12 @@ class LineageService(Repository):
                             if part.via_table
                             else None
                         ),
+                        # The part_provider vocabulary, because that is how this fact was obtained:
+                        # a generated table name resolved by convention, confirmed against the
+                        # provider catalogue or not. Left to the default, a confirmed part claimed a
+                        # metadata row "states the source and target directly", and an unconfirmed
+                        # one claimed it came from parsing ABAP. Neither happened (D10).
+                        evidence=evidence_for("part_provider", part.confidence),
                         provenance=part.provenance,
                     ),
                 )
@@ -567,7 +575,8 @@ class LineageService(Repository):
 
         root_key = name.strip().upper()
         hops: list[_Hop] = []
-        seen: set[str] = set()
+        # Keyed by (type, name): a provider and a query may legitimately share a name.
+        seen: set[tuple[str, str]] = set()
         for page in range(_MAX_CONSUMER_PAGES):
             stopped = self._budget_stop()
             if stopped is not None:
@@ -580,32 +589,14 @@ class LineageService(Repository):
             )
             for (view_name,) in rows:
                 raw = str(view_name).strip()
-                provider = provider_from_calc_view(raw)
-                if not provider:
+                hop = self._consumer_hop(name, raw, root_key=root_key)
+                if hop is None:
                     continue
-                key = provider.strip().upper()
-                # A provider is not its own consumer. Its generated view legitimately depends on its
-                # own tables, so that row is a resolver artefact rather than a lineage relationship.
-                if key == root_key or key in seen:
+                key = (hop.node_type, hop.name.strip().upper())
+                if key in seen:
                     continue
                 seen.add(key)
-                hops.append(
-                    _Hop(
-                        provider,
-                        "compositeprovider",
-                        LineageEdge(
-                            src=name,
-                            dst=provider,
-                            kind="composite_part",
-                            derivation="declared",
-                            confidence="advisory",
-                            note="CompositeProvider resolved via its generated calc view",
-                            provenance=self.provenance(
-                                "object_dependencies", {"DEPENDENT_OBJECT_NAME": raw}
-                            ),
-                        ),
-                    )
-                )
+                hops.append(hop)
                 if len(seen) >= _MAX_COMPOSITE_CONSUMERS:
                     # Stopped on the stated cap. Whether more existed is unknown, so the walk is
                     # reported as bounded rather than complete.
@@ -615,6 +606,62 @@ class LineageService(Repository):
                 return hops  # a short page means the source is exhausted: a complete reading
         self._walk_incomplete.add("semantic_limit")
         return hops
+
+    def _consumer_hop(self, name: str, view_name: str, *, root_key: str) -> _Hop | None:
+        """One dependent calc view read as the object that owns it, or ``None`` if it owns nothing.
+
+        Two kinds of generated view reach here and they are **not** the same object. A provider view
+        belongs to a CompositeProvider; a ``query.<provider>`` view belongs to a BEx query. Both
+        previously read as CompositeProviders, so a query arrived under a synthesized name like
+        ``/QUERY.<PROVIDER>/<QUERY>`` and was typed ``compositeprovider`` - defect D9. A query
+        consuming this object is a real relationship, so it is kept and labelled, not discarded.
+        """
+        provenance = self.provenance("object_dependencies", {"DEPENDENT_OBJECT_NAME": view_name})
+
+        provider = provider_from_calc_view(view_name)
+        if provider:
+            # A provider is not its own consumer: its generated view legitimately depends on its own
+            # tables, so that row is a resolver artefact rather than a lineage relationship.
+            if provider.strip().upper() == root_key:
+                return None
+            return _Hop(
+                provider,
+                "compositeprovider",
+                LineageEdge(
+                    src=name,
+                    dst=provider,
+                    kind="composite_part",
+                    derivation="declared",
+                    confidence="advisory",
+                    note="CompositeProvider resolved via its generated calc view",
+                    evidence=evidence_for("calc_view_consumer", "provider"),
+                    provenance=provenance,
+                ),
+            )
+
+        resolved = query_from_calc_view(view_name)
+        if resolved is None:
+            return None
+        query_name, owning_provider = resolved
+        if query_name.strip().upper() == root_key:
+            return None
+        return _Hop(
+            query_name,
+            "query",
+            LineageEdge(
+                src=name,
+                dst=query_name,
+                kind="query_provider",
+                derivation="declared",
+                confidence="advisory",
+                note=(
+                    f"BEx query reading this object, resolved via its generated calc view "
+                    f"(query provider: {owning_provider})"
+                ),
+                evidence=evidence_for("calc_view_consumer", "query"),
+                provenance=provenance,
+            ),
+        )
 
     def _budget_stop(self) -> LineageCompleteness | None:
         """Whether the active per-call budget leaves room for another page.

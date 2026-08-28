@@ -68,6 +68,11 @@ CALC_VIEW_PACKAGE = "system-local.bw.bw2hana"
 # Hierarchy runtime views share the package but are not provider views.
 CALC_VIEW_HIER_MARKER = "/hier/"
 
+# BW generates one calc view per BEx query, under a "query.<provider>" package suffix. It shares the
+# package family with provider views but is not one, and reading it as a namespaced provider
+# produced a "CompositeProvider" whose name was a synthesized path - defect D9.
+CALC_VIEW_QUERY_SEGMENT = "query"
+
 # Roles whose row counts represent the provider's own persisted data (vs. changelog/inbound).
 PRIMARY_DATA_ROLES: frozenset[TableRole] = frozenset({"active", "fact_f", "fact_e", "master_attr"})
 
@@ -305,5 +310,46 @@ def provider_from_calc_view(view_name: str) -> str | None:
     # A namespaced provider encodes its namespace as a lowercase package suffix after "bw2hana".
     _, _, suffix = package.partition(f"{base}.")
     if suffix:
+        if _is_query_suffix(suffix):
+            # A generated *query* view. Not a provider, and not this function's to resolve:
+            # query_from_calc_view reads it. Returning a provider here is what made a BEx query
+            # arrive as a CompositeProvider named '/QUERY.<PROVIDER>/<QUERY>'.
+            return None
         return f"/{suffix.upper()}/{local}"
     return local
+
+
+def _is_query_suffix(suffix: str) -> bool:
+    """Whether a package suffix marks a generated query view rather than a provider namespace.
+
+    A query view's suffix is ``query.<provider>`` - two segments. A namespace suffix is one segment,
+    so a provider genuinely living in a ``/QUERY/`` namespace is left alone.
+    """
+    return suffix.lower().startswith(f"{CALC_VIEW_QUERY_SEGMENT}.")
+
+
+def query_from_calc_view(view_name: str) -> tuple[str, str] | None:
+    """The BEx query and the provider it reads, for a generated *query* calc view.
+
+    ``system-local.bw.bw2hana.query.sales_cp/Q_REVENUE`` -> ``("Q_REVENEUE", "SALES_CP")``, modulo
+    spelling. Returns ``None`` for anything that is not a generated query view, so a caller can try
+    :func:`provider_from_calc_view` and this one in either order without double-counting.
+
+    The query's own technical name is returned, because that is the object a BW developer looks up.
+    """
+    name = (view_name or "").strip()
+    if not name or is_hierarchy_view(name):
+        return None
+    package, _, local = name.rpartition("/")
+    if not local or not package:
+        return None
+    base = CALC_VIEW_PACKAGE.rsplit(".", maxsplit=1)[-1]
+    if base not in package:
+        return None
+    _, _, suffix = package.partition(f"{base}.")
+    if not _is_query_suffix(suffix):
+        return None
+    provider = suffix[len(CALC_VIEW_QUERY_SEGMENT) + 1 :]
+    if not provider:
+        return None
+    return local, provider.upper()

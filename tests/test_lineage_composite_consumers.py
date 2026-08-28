@@ -25,11 +25,18 @@ import pytest
 
 from mcp_server_sapbw.core.budget import charge_query, query_budget
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
+from mcp_server_sapbw.models.evidence import evidence_for
 from mcp_server_sapbw.models.lineage import LineageGraph
 from mcp_server_sapbw.models.provenance import UnsupportedResult
 from mcp_server_sapbw.services import lineage as lineage_mod
 from mcp_server_sapbw.services.lineage import LineageService
-from mcp_server_sapbw.services.table_resolver import CALC_VIEW_PACKAGE
+from mcp_server_sapbw.services.table_resolver import (
+    CALC_VIEW_PACKAGE,
+    CALC_VIEW_QUERY_SEGMENT,
+    is_hierarchy_view,
+    provider_from_calc_view,
+    query_from_calc_view,
+)
 
 SCHEMA = "TESTSCHEMA"
 PKG = CALC_VIEW_PACKAGE
@@ -311,3 +318,109 @@ def test_truncated_and_completeness_cannot_disagree() -> None:
     # And a stated bound must always show up in the bool.
     bounded = LineageGraph(root_id="X", direction="both", depth=1, completeness="query_budget")
     assert bounded.truncated is True
+
+
+# --- D9: a BEx query's generated view is a query, not a CompositeProvider ----------------------
+#
+# BW generates one calc view per query under a "query.<provider>" package suffix. That suffix was
+# read as a provider namespace, so a query arrived typed `compositeprovider` under a synthesized
+# name like '/QUERY.<PROVIDER>/<QUERY>'. The relationship is real; only the label was wrong.
+
+# Deliberately outside the customer (Z*/Y*) namespace: these are synthetic fixture names living in a
+# test file rather than under tests/fixtures/, and the leak check rightly refuses customer-shaped
+# literals there. Working around it by splitting the string would defeat the check.
+QUERY_PROVIDER = "HOST_CP"
+QUERY_NAMES = ["Q_REVENUE", "Q_MARGIN"]
+_QUERY_VIEWS = [
+    f"{PKG}.{CALC_VIEW_QUERY_SEGMENT}.{QUERY_PROVIDER.lower()}/{q}" for q in QUERY_NAMES
+]
+
+
+class QueryViewConnection(ScriptedConnection):
+    """Serves provider views, query views, and hierarchy noise from one population."""
+
+    def _dependencies(self, sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        global POPULATION  # noqa: PLW0603
+        original = POPULATION
+        POPULATION = [*original, *_QUERY_VIEWS]
+        try:
+            return super()._dependencies(sql, params)
+        finally:
+            POPULATION = original
+
+
+def _query_graph() -> Any:
+    graph = _service(QueryViewConnection()).get_lineage(ROOT, direction="downstream", depth=1)
+    assert not isinstance(graph, UnsupportedResult)
+    return graph
+
+
+def test_query_calc_view_becomes_a_query_node_not_a_composite_provider() -> None:
+    graph = _query_graph()
+    by_name = {n.name: n for n in graph.nodes}
+    for query in QUERY_NAMES:
+        assert query in by_name, f"{query} should reach the graph under its own technical name"
+        assert by_name[query].object_type == "query", (
+            "a BEx query's generated view must not be typed as a CompositeProvider"
+        )
+
+
+def test_query_consumers_do_not_masquerade_as_composite_providers() -> None:
+    graph = _query_graph()
+    composite = {e.dst for e in graph.edges if e.kind == "composite_part"}
+    assert composite == set(CONSUMERS), "only genuine CompositeProviders may be composite_part"
+    assert not [n for n in graph.nodes if n.name.startswith("/QUERY.")], (
+        "a synthesized '/QUERY.<PROVIDER>/<QUERY>' name must not reach the caller"
+    )
+
+
+def test_query_consumer_edge_uses_the_query_provider_kind() -> None:
+    graph = _query_graph()
+    query_edges = [e for e in graph.edges if e.dst in QUERY_NAMES]
+    assert len(query_edges) == len(QUERY_NAMES)
+    for edge in query_edges:
+        assert edge.kind == "query_provider"
+        assert edge.src == ROOT
+        # The owning provider is worth keeping: it is how a reader finds the query in BW.
+        assert QUERY_PROVIDER in (edge.note or ""), "the query's provider should be named"
+
+
+def test_a_provider_namespace_called_query_is_not_mistaken_for_a_query_view() -> None:
+    """The rule is the two-segment 'query.<provider>' suffix, not the word 'query'."""
+    namespaced = f"{PKG}.query/V_THING"  # a provider in a '/QUERY/' namespace
+    assert query_from_calc_view(namespaced) is None
+    assert provider_from_calc_view(namespaced) == "/QUERY/V_THING"
+
+    generated = f"{PKG}.query.some_cp/Q_ONE"
+    assert provider_from_calc_view(generated) is None
+    assert query_from_calc_view(generated) == ("Q_ONE", "SOME_CP")
+
+
+def test_hierarchy_view_with_a_trailing_segment_is_still_rejected() -> None:
+    assert is_hierarchy_view(f"{PKG}/CP_X/hier")
+    assert provider_from_calc_view(f"{PKG}/CP_X/hier") is None
+    # A provider genuinely named with a 'hier' prefix is not a hierarchy view.
+    assert not is_hierarchy_view(f"{PKG}/HIERARCHY_X")
+
+
+# --- D10: the evidence narrative must match how the fact was obtained -------------------------
+
+
+def test_calc_view_consumer_edges_do_not_claim_to_come_from_abap() -> None:
+    graph = _query_graph()
+    derived = [e for e in graph.edges if e.kind in ("composite_part", "query_provider")]
+    assert derived, "expected calc-view-derived edges"
+    for edge in derived:
+        assert edge.evidence is not None
+        assert edge.evidence.method != "routine_select_parse", (
+            "an edge read from OBJECT_DEPENDENCIES must not say it was parsed out of routine ABAP"
+        )
+        assert edge.evidence.method == "generated_view_naming"
+        assert "OBJECT_DEPENDENCIES" in (edge.evidence.detail or "")
+
+
+def test_routine_edges_still_say_they_came_from_abap() -> None:
+    """The fix must not blunt the distinction it exists to preserve."""
+    assert evidence_for("lineage_edge", "advisory").method == "routine_select_parse"
+    assert evidence_for("calc_view_consumer", "provider").method == "generated_view_naming"
+    assert evidence_for("calc_view_consumer", "provider").basis == "derived"

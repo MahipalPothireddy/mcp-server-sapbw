@@ -126,6 +126,17 @@ _COVERED: list[tuple[type[BaseModel], str, str]] = [
     (RoutineAnalysis, "completeness", "routine_analysis"),
 ]
 
+# Vocabularies chosen by a *call site* rather than derived from a field's Literal, with the codes
+# that call site uses. A service can know something the model cannot: two edges may share
+# `confidence="advisory"` and still have been obtained by different mechanisms, and the reader needs
+# the mechanism. Registered here so the orphan check below stays meaningful - a vocabulary nothing
+# uses is still caught - and so each code is verified to have a mapping.
+_CALL_SITE_COVERED: dict[str, tuple[str, ...]] = {
+    # services/lineage.py: a consumer discovered through a generated calc view, which is either a
+    # CompositeProvider's view or a BEx query's. Neither was parsed out of ABAP.
+    "calc_view_consumer": ("provider", "query"),
+}
+
 
 def _literal_values(model: type[BaseModel], field: str) -> list[str]:
     annotation = model.model_fields[field].annotation
@@ -156,9 +167,20 @@ def test_every_value_of_every_legacy_vocabulary_has_a_mapping() -> None:
     )
 
 
+def test_every_call_site_vocabulary_code_has_a_mapping() -> None:
+    """A code a service passes must map, or the edge reaches the caller as basis='unknown'."""
+    missing = [
+        f"{vocabulary!r}={code!r}"
+        for vocabulary, codes in _CALL_SITE_COVERED.items()
+        for code in codes
+        if evidence_for(vocabulary, code).method == "unmapped_code"
+    ]
+    assert not missing, f"call-site vocabulary codes with no mapping: {missing}"
+
+
 def test_no_vocabulary_in_the_mapping_is_orphaned() -> None:
     """A mapping entry nothing maps through is dead weight and hides a removed field."""
-    used = {vocabulary for _model, _field, vocabulary in _COVERED}
+    used = {vocabulary for _model, _field, vocabulary in _COVERED} | set(_CALL_SITE_COVERED)
     assert VOCABULARIES - used == set(), f"unused vocabularies in _MAPPING: {VOCABULARIES - used}"
 
 
