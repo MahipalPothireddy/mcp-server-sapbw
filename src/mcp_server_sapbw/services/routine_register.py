@@ -203,6 +203,10 @@ class RoutineRegisterService(Repository):
                     # RSAABAP is not OBJVERS-auto in the dialect; state it explicitly.
                     where=["OBJVERS = 'A'"],
                     group_by=["CODEID"],
+                    # Capped scan over the whole ABAP source table. The register is ranked and then
+                    # truncated, so an arbitrary slice would rank a different set of routines each
+                    # time - and the register exists precisely to be worked down in order (D8).
+                    order_by=["CODEID"],
                 ),
                 limit=_SIZE_SCAN_CAP,
             )

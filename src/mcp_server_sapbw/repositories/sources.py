@@ -146,6 +146,10 @@ class SourcesRepository(Repository):
                     from_logical="datasource",
                     where=["LOGSYS <> ''"],
                     group_by=["LOGSYS"],
+                    # Capped read: this set is compared against the registry to find logical systems
+                    # BDLS never rewrote, so an arbitrary slice would name a different set of
+                    # unregistered systems on each run (D8).
+                    order_by=["LOGSYS"],
                 ),
                 limit=_MAX_SYSTEMS,
             )
@@ -168,6 +172,7 @@ class SourcesRepository(Repository):
                     columns=["SLOGSYS", "SRCTYPE", "OBJSTAT"],
                     from_logical="source_system",
                     compare_versions=True,
+                    order_by=["SLOGSYS"],  # capped read; see _logical_system_usage
                 ),
                 limit=_MAX_SYSTEMS,
             )
@@ -257,6 +262,7 @@ class SourcesRepository(Repository):
                     from_logical="datasource_field",
                     where=[f"({conditions})"],
                     group_by=["DATASOURCE"],
+                    order_by=["DATASOURCE"],  # capped read; see D8
                 ),
                 limit=_MAX_ENHANCED * 4,
             )

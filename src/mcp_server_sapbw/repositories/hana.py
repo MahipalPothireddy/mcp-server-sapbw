@@ -201,6 +201,9 @@ class HanaRepository(Repository):
                 self.dialect.build_select(
                     columns=["BASE_SCHEMA_NAME", "BASE_OBJECT_NAME", "BASE_OBJECT_TYPE"],
                     from_logical="object_dependencies",
+                    # Ordered because the read is capped: an unordered LIMIT returns an arbitrary
+                    # subset, and possibly a different one per call (D8).
+                    order_by=["BASE_SCHEMA_NAME", "BASE_OBJECT_NAME"],
                     where=[
                         "DEPENDENT_SCHEMA_NAME = ?",
                         "DEPENDENT_OBJECT_NAME = ?",
@@ -731,6 +734,7 @@ class HanaRepository(Repository):
                 self.dialect.build_select(
                     columns=["DEPENDENT_OBJECT_NAME"],
                     from_logical="object_dependencies",
+                    order_by=["DEPENDENT_OBJECT_NAME"],  # capped read; see D8
                     where=[
                         "DEPENDENT_SCHEMA_NAME = ?",
                         "BASE_SCHEMA_NAME = ?",

@@ -164,6 +164,9 @@ class LoadClosureService(Repository):
                     from_logical="chain_edges",
                     where=["CHAIN_ID = ?"],
                     params=[chain_id],
+                    # Capped read. Chain steps decide which providers a chain is reported to load,
+                    # so an arbitrary slice changes the answer to "what does this chain load" (D8).
+                    order_by=["TYPE", "VARIANTE"],
                 ),
                 limit=_MAX_STEPS,
             )
@@ -217,6 +220,7 @@ class LoadClosureService(Repository):
                     from_logical="dtp",
                     where=["TGT = ?", "OBJVERS = 'A'"],
                     params=[provider],
+                    order_by=["DTP"],  # capped read; see _steps_of
                 ),
                 limit=_MAX_LOADING_CHAINS,
             )
@@ -240,6 +244,7 @@ class LoadClosureService(Repository):
                     from_logical="chain_edges",
                     where=[f"VARIANTE IN ({placeholders})"],
                     params=list(dtp_ids),
+                    order_by=["CHAIN_ID"],  # capped read; see _steps_of
                 ),
                 limit=_MAX_LOADING_CHAINS,
             )
@@ -282,6 +287,7 @@ class LoadClosureService(Repository):
                     from_logical="chain_edges",
                     where=["TYPE = ?", f"VARIANTE IN ({placeholders})"],
                     params=[_SUBCHAIN_STEP_TYPE, *chain_ids],
+                    order_by=["CHAIN_ID"],  # capped read; see _steps_of
                 ),
                 limit=_MAX_LOADING_CHAINS,
             )

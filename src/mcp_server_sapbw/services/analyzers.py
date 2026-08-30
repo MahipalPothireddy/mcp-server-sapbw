@@ -50,6 +50,24 @@ _DSO_TYPES = ("ODSO", "ADSO")
 _DSO_IN = "TARGETTYPE IN ('ODSO', 'ADSO')"
 _DSO_SRC_IN = "SOURCETYPE IN ('ODSO', 'ADSO')"
 
+
+def _orderable(columns: list[str]) -> list[str]:
+    """The plain column names among ``columns``, usable in an ORDER BY.
+
+    Skips aggregates and aliased expressions (``COUNT(DISTINCT X) AS Y``), which cannot be ordered
+    on by name in an ungrouped query, and strips a leading ``DISTINCT``.
+    """
+    plain: list[str] = []
+    for column in columns:
+        candidate = column.strip()
+        if candidate.upper().startswith("DISTINCT "):
+            candidate = candidate[len("DISTINCT ") :].strip()
+        if "(" in candidate or " " in candidate:
+            continue
+        plain.append(candidate)
+    return plain
+
+
 SCENARIO_TITLES: dict[str, str] = {
     "9.1": "Full-update loads with routine lookups on less-frequently-refreshed objects",
     "9.2": "Deep DSO -> calc view -> CompositeProvider -> query layer stacks",
@@ -214,6 +232,14 @@ class Analyzers(Repository):
         order_by: list[str] | None = None,
         group_by: list[str] | None = None,
     ) -> list[tuple[Any, ...]]:
+        """One capped read of RSTRAN. Always ordered, whether or not the caller said so.
+
+        Every call here is bounded by ``limit``, so an unordered read returns an arbitrary subset -
+        and nine call sites feed scenario findings from it. Defaulting the order rather than fixing
+        each caller means a *new* caller cannot reintroduce the defect by omitting it (D8).
+        """
+        if order_by is None:
+            order_by = list(group_by) if group_by else _orderable(columns)
         base = self.dialect.build_select(
             columns=columns,
             from_logical="transformation",
@@ -506,6 +532,9 @@ class Analyzers(Repository):
                     from_logical="dtp",
                     where=["UPDMODE = ?", "OBJVERS = 'A'"],  # RSBK* -> no auto OBJVERS
                     params=["F"],
+                    # Capped scan feeding scenario 9.1's candidate set: an arbitrary slice would
+                    # report a different set of latency findings on each run (D8).
+                    order_by=["TGT"],
                 ),
                 limit=_SCAN_CAP,
             )
@@ -666,6 +695,7 @@ class Analyzers(Repository):
                         from_logical="extractor",
                         where=["OLTPSOURCE = ?", "OBJVERS = 'A'"],  # ROO* -> no auto OBJVERS
                         params=[source],
+                        order_by=["DELTA"],  # one row taken from possibly many; see D8
                     ),
                     limit=1,
                 )
@@ -682,6 +712,9 @@ class Analyzers(Repository):
                     from_logical="dtp",
                     where=["TGT = ?", "UPDMODE = ?", "OBJVERS = 'A'"],
                     params=[target, "F"],
+                    # Several full DTPs can target one object, and this takes one of them to name
+                    # the extractor: unordered, the finding cited an arbitrary source (D8).
+                    order_by=["SRC"],
                 ),
                 limit=1,
             )

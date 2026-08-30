@@ -509,6 +509,7 @@ class SecurityRepository(Repository):
                             from_logical="dict_columns",
                             where=["TABNAME = ?"],
                             params=[self.physical(logical)],
+                            order_by=["FIELDNAME"],  # capped read; see D8
                         ),
                         limit=1000,
                     )
@@ -547,6 +548,7 @@ class SecurityRepository(Repository):
                         from_logical="auth_text",
                         where=[f"{columns['auth']} IN ({placeholders})"],
                         params=list(auths),
+                        order_by=[str(columns["auth"])],  # capped read; see D8
                     ),
                     limit=_MAX_AUTHS,
                 )
@@ -580,6 +582,7 @@ class SecurityRepository(Repository):
                         from_logical="auth_hierarchy",
                         where=[f"{columns['auth']} = ?"],
                         params=[auth],
+                        order_by=list(physical),  # capped read; see D8
                     ),
                     limit=_MAX_RANGES,
                 )
@@ -623,6 +626,7 @@ class SecurityRepository(Repository):
                         where=[f"{auth_column} IN ({placeholders})"],
                         params=list(auths),
                         group_by=[auth_column],
+                        order_by=[auth_column],  # capped read; see D8
                     ),
                     limit=_MAX_AUTHS,
                 )
@@ -674,6 +678,7 @@ class SecurityRepository(Repository):
                         where=[f"{auth_column} IN ({placeholders})"],
                         params=list(auths),
                         group_by=[auth_column],
+                        order_by=[auth_column],  # capped read; see D8
                     ),
                     limit=_MAX_AUTHS,
                 )
@@ -743,6 +748,10 @@ class SecurityRepository(Repository):
                 self.dialect.build_select(
                     columns=[f"DISTINCT {columns['characteristic']}"],
                     from_logical="auth_values",
+                    # Ordered because the scan is capped. This set is compared against the
+                    # authorisation-relevant characteristics to find uncovered ones, so an arbitrary
+                    # slice would report a different coverage gap on each run (D8).
+                    order_by=[str(columns["characteristic"])],
                 ),
                 limit=_MAX_AUTHS,
             )

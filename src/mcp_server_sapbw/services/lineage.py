@@ -587,6 +587,9 @@ class LineageService(Repository):
                         from_logical="transformation",
                         where=[f"{key_col} = ?"],
                         params=[name],
+                        # An object is an endpoint of many transformations; LIMIT 1 without an order
+                        # reads its type off an arbitrary row (D8).
+                        order_by=[own_type_col],
                     ),
                     limit=1,
                 )
@@ -604,6 +607,7 @@ class LineageService(Repository):
                         from_logical="composite_header",
                         where=["HCPRNM = ?"],
                         params=[name],
+                        order_by=["HCPRNM"],  # capped at one row; see above
                     ),
                     limit=1,
                 )
@@ -1227,6 +1231,11 @@ class LineageService(Repository):
                     from_logical="routine_source",
                     where=["OBJVERS = 'A'", "UPPER(LINE) LIKE ?"],
                     params=[f"%{name.upper()}%"],
+                    # This is the reverse routine scan behind impact analysis, capped and then
+                    # deduped and sliced to _REVERSE_CODEID_CAP. Unordered, the surviving code-ids
+                    # were an arbitrary subset, so the routine-embedded consumers that make impact
+                    # analysis worth running differed between identical calls (D8).
+                    order_by=["CODEID"],
                 ),
                 limit=_REVERSE_CODEID_CAP * 20,  # many lines share a code-id; dedupe below
             )

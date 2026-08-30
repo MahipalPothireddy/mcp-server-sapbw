@@ -185,6 +185,10 @@ class SearchRepository(Repository):
                     from_logical=source.text_logical,
                     where=where,
                     params=[like.value],
+                    # Ordered because the scan is capped: a description search that binds the cap
+                    # would otherwise return a different arbitrary slice of the matches each time
+                    # it ran, so the same query would find an object and then not find it (D8).
+                    order_by=[source.id_column],
                 ),
                 limit=_INTERNAL_CAP,
             )
@@ -251,6 +255,7 @@ class SearchRepository(Repository):
                     from_logical="cube_text",
                     where=[like.clause("UPPER(TXTLG)")],
                     params=[like.value],
+                    order_by=["INFOCUBE"],  # capped scan; see _collect_descriptions
                 ),
                 limit=_INTERNAL_CAP,
             )

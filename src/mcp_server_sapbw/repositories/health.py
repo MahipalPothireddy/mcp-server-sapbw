@@ -511,6 +511,9 @@ class HealthRepository(Repository):
                         from_logical="request_status",
                         where=["DTA = ?"],
                         params=[provider],
+                        # A provider has many request rows; LIMIT 1 without an order picks an
+                        # arbitrary one, so the inferred kind could differ between calls (D8).
+                        order_by=["DTA_TYPE"],
                     ),
                     limit=1,
                 )
@@ -527,6 +530,7 @@ class HealthRepository(Repository):
                         from_logical="adso_request",
                         where=["DATATARGET = ?"],
                         params=[provider],
+                        order_by=["TLOGO"],  # capped at one row; see above
                     ),
                     limit=1,
                 )
