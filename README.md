@@ -99,7 +99,7 @@ The BW-specific reasoning is separable from the protocol, and already reaches yo
 |---|---|---|
 | **MCP tools, resources, prompts** | The interactive interface. 60 tools, 7 resource templates, 6 prompts. | yes (except three) |
 | **Rendered documentation** | `bw_generate_docs` writes a markdown knowledge base — per-object pages, Mermaid lineage, a gaps register — to a directory you name. | yes, to generate |
-| **Diagrams** | `bw_render_lineage` returns PNG or SVG, drawn entirely locally. Diagram content never leaves the machine. | yes, to generate |
+| **Diagrams** | `bw_render_lineage` returns PNG, SVG, or Mermaid source, drawn entirely locally. Diagram content never leaves the machine. | yes, to generate |
 | **Shipped data files** | Capability contract, support matrix and performance profile travel inside the package. `bw_support_matrix` and `bw_performance_profile` read them. | **no** |
 
 That last row is the load-bearing one for the claim. *Which of your tools work on BW 7.4? What will
@@ -492,7 +492,7 @@ rather than as resolved logic.
 | `bw_get_lineage` | `system`, `name`, `direction="both"`, `depth=6` | Directed data-flow graph, with advisory routine edges |
 | `bw_impact_analysis` | `system`, `name`, `depth=3` | Full downstream blast radius, **including routine-embedded consumers** invisible to BW where-used |
 | `bw_trace_to_source` | `system`, `name`, `depth=8` | Trace upstream, hop by hop, to the DataSource boundary |
-| `bw_render_lineage` | `system`, `name`, `direction="both"`, `depth=4`, `image_format="png"`, `output_dir?` | The same graph **as an image**, plus structured metadata |
+| `bw_render_lineage` | `system`, `name`, `direction="both"`, `depth=4`, `image_format="png"\|"svg"\|"mermaid"`, `output_dir?` | The same graph **as a diagram**, plus structured metadata. `mermaid` returns `flowchart LR` source for a markdown file or wiki page, from the same layout as the image |
 
 Diagrams are laid out left-to-right by dependency depth, colour-coded and shaped by BW object type,
 with advisory edges (routine-derived, or resolved by naming convention) drawn dashed and grey, edge

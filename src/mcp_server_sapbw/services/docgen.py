@@ -39,6 +39,7 @@ from ..repositories.queries import QueriesRepository
 from ..repositories.threex import ThreeXRepository
 from ..repositories.transformations import TransformationsRepository
 from .analyzers import SCENARIO_TITLES, Analyzers
+from .diagram import build_layout, render_mermaid
 from .lineage import LineageService
 from .load_closure import LoadClosureService
 
@@ -857,19 +858,15 @@ class DocGenerator(Repository):
 
     @staticmethod
     def _mermaid(graph: LineageGraph) -> str:
-        ids: dict[str, str] = {}
-        lines = ["```mermaid", "flowchart LR"]
-        for i, node in enumerate(graph.nodes):
-            node_id = f"n{i}"
-            ids[node.id] = node_id
-            lines.append(f'  {node_id}["{node.name}<br/>({node.object_type})"]')
-        for edge in graph.edges:
-            src, dst = ids.get(edge.src), ids.get(edge.dst)
-            if src and dst:
-                arrow = "-.->" if edge.confidence == "advisory" else "-->"
-                lines.append(f"  {src} {arrow}|{edge.kind}| {dst}")
-        lines.append("```")
-        return "\n".join(lines)
+        """The flow diagram, rendered through the shared diagram layout.
+
+        Deliberately not a second implementation. This page and ``bw_render_lineage`` answer the
+        same question in different media, and when the Mermaid was built here from the raw node list
+        the two disagreed on everything except which objects were involved: no stages, no type
+        colours, update modes missing from edge labels, space-padded DataSource names rendering as
+        boxes wider than the rest of the diagram, and no notice when the graph was truncated.
+        """
+        return render_mermaid(build_layout(graph))
 
     def _lineage_seeds(self, limit: int, closure: _LoadClosure) -> list[str]:
         """Objects to root lineage flows at: everything loaded first, transformations after.

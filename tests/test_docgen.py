@@ -297,6 +297,11 @@ def test_mermaid_renders_nodes_and_advisory_edges() -> None:
     assert "flowchart LR" in mermaid
     assert "DSO1" in mermaid and "LOOKUP" in mermaid
     assert "-.->" in mermaid  # advisory edge is dashed
+    # The page renders through the shared diagram layout, so it carries the type colouring and the
+    # readable type label rather than the raw enum token. Asserted here because this is the seam:
+    # a docgen-local re-implementation would satisfy the three checks above and lose all of it.
+    assert "classDef t_dso fill:" in mermaid
+    assert "DSO" in mermaid and "(dso)" not in mermaid
 
 
 def _crossing(bw_object: str, resolved: str | None, kind: str | None, resolution: str) -> Any:

@@ -14,7 +14,10 @@ from pydantic import Field
 
 from .completeness import BoundedResult
 
-DiagramFormat = Literal["png", "svg"]
+#: ``mermaid`` is text rather than an image, and is here because it answers the same question in a
+#: medium a picture cannot reach: a markdown file, a wiki page, a chat reply. It is rendered from
+#: the same layout as the other two, so the three cannot disagree about the graph.
+DiagramFormat = Literal["png", "svg", "mermaid"]
 
 
 class DiagramResult(BoundedResult):

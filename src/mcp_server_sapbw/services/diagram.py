@@ -31,9 +31,18 @@ ImageFormat = Literal["svg", "png"]
 # --- visual vocabulary --------------------------------------------------------------------
 
 # Fill / border per node type. Chosen for contrast on white and to survive greyscale printing.
+# Colour separates *families* rather than individual types - stores, movers, reporting, boundary -
+# because the type is always written in the box, so colour's job is to make the shape of a flow
+# legible at a glance. Every member of LineageNodeType must appear: a type missing from this table
+# used to fall through to grey and render labelled "object", which is how a DTP appeared in a
+# production diagram as an unnamed grey box. tests/test_diagram_mermaid.py holds it exhaustive.
 _NODE_STYLE: dict[LineageNodeType, tuple[str, str]] = {
+    # Boundary - where data enters BW.
     "datasource": ("#fde68a", "#b45309"),  # amber - the source-system boundary
     "infosource": ("#fed7aa", "#c2410c"),
+    "transfer_structure": ("#ffedd5", "#ea580c"),  # BW 3.x sibling of the InfoSource
+    "source_object": ("#fef3c7", "#92400e"),  # lives in the source system, not in BW
+    # Stores - objects that persist or expose data.
     "dso": ("#bfdbfe", "#1d4ed8"),  # blue - persisted staging/EDW
     "adso": ("#c7d2fe", "#4338ca"),
     "infocube": ("#ddd6fe", "#6d28d9"),  # violet - aggregated
@@ -41,16 +50,30 @@ _NODE_STYLE: dict[LineageNodeType, tuple[str, str]] = {
     "multiprovider": ("#e9d5ff", "#7e22ce"),
     "compositeprovider": ("#bbf7d0", "#15803d"),  # green - virtual consumption layer
     "infoobject": ("#fecdd3", "#be123c"),  # rose - master data
-    "query": ("#a5f3fc", "#0e7490"),  # cyan - reporting
     "calcview": ("#d9f99d", "#4d7c0f"),  # lime - HANA
+    # Movers - orchestration and logic. One neutral fill on purpose: these are not data, and
+    # telling a DTP from a transformation matters far less than telling either from a provider.
+    "transformation": ("#eef2f7", "#334155"),
+    "dtp": ("#eef2f7", "#475569"),
+    "infopackage": ("#eef2f7", "#64748b"),
+    "update_rule": ("#eef2f7", "#94a3b8"),  # BW 3.x equivalent of a transformation
+    "chain": ("#eef2f7", "#1e293b"),
+    # Reporting.
+    "query": ("#a5f3fc", "#0e7490"),  # cyan - reporting
+    "query_element": ("#cffafe", "#0e7490"),
+    "report": ("#bae6fd", "#0369a1"),
+    # Gaps. Red because an unresolved dependency is a finding, not a neutral node.
+    "unresolved_dependency": ("#fee2e2", "#b91c1c"),
     "unknown": ("#e5e7eb", "#6b7280"),
 }
 _DEFAULT_STYLE = ("#e5e7eb", "#6b7280")
 
-# Human labels for the legend (only types actually present are drawn).
+# Human labels for the legend and the node subtitle (only types actually present are drawn).
 _TYPE_LABEL: dict[LineageNodeType, str] = {
     "datasource": "DataSource",
     "infosource": "InfoSource",
+    "transfer_structure": "Transfer structure",
+    "source_object": "Source object",
     "dso": "DSO",
     "adso": "Advanced DSO",
     "infocube": "InfoCube",
@@ -58,8 +81,16 @@ _TYPE_LABEL: dict[LineageNodeType, str] = {
     "multiprovider": "MultiProvider",
     "compositeprovider": "CompositeProvider",
     "infoobject": "InfoObject",
-    "query": "Query",
     "calcview": "Calc view",
+    "transformation": "Transformation",
+    "dtp": "DTP",
+    "infopackage": "InfoPackage",
+    "update_rule": "Update rule",
+    "chain": "Process chain",
+    "query": "Query",
+    "query_element": "Query element",
+    "report": "Report",
+    "unresolved_dependency": "Unresolved",
     "unknown": "Unknown",
 }
 
@@ -538,3 +569,161 @@ def _draw_connector(
         [(x2, y2), (x2 - head * 1.6, y2 - head * 0.75), (x2 - head * 1.6, y2 + head * 0.75)],
         fill=colour,
     )
+
+
+# --- Mermaid ------------------------------------------------------------------------------
+#
+# A third output from the same layout, for the places a picture cannot go: a markdown file, a wiki
+# page, a chat reply. It reuses the layering, the label hygiene, the type colours and the edge
+# labels above rather than re-deriving them, because a diagram that disagrees with the PNG of the
+# same graph is worse than having only one of them.
+
+# Nodes rendered before the diagram stops being something a person can read. A lineage graph is
+# bounded at 400 nodes, and 400 boxes of Mermaid is a wall, not a diagram - so this bound exists for
+# legibility, is separate from the graph's own bound, and is reported on the canvas when it binds.
+_MERMAID_MAX_NODES = 80
+# Above this, per-stage grouping stops helping: twenty labelled boxes around a hairball is noise.
+_MERMAID_MAX_SUBGRAPH_NODES = 60
+# Stage bands only mean something once there are at least two of them to compare.
+_MERMAID_MIN_STAGES = 2
+
+#: Mermaid reserves these in label position. `#` first - the replacements themselves contain one.
+_MERMAID_ESCAPES: tuple[tuple[str, str], ...] = (
+    ("#", "#35;"),
+    ('"', "#quot;"),
+    ("<", "#lt;"),
+    (">", "#gt;"),
+)
+
+
+def _mermaid_label(text: str, *, limit: int = _MAX_LABEL_CHARS) -> str:
+    """A BW object name safe to place inside a quoted Mermaid label.
+
+    Two distinct jobs. Whitespace collapsing and clipping are the same readability treatment the
+    image path applies - a DataSource endpoint is stored space-padded as
+    ``<DATASOURCE><padding><LOGSYS>``, and pasted raw it produces a box wider than the rest of the
+    diagram put together. Escaping is a correctness matter: an unescaped ``"`` closes the label
+    early and Mermaid then fails to parse the **whole** diagram, so one odd name would cost the
+    entire picture rather than one node. BW names are not expected to contain these characters, but
+    node names also arrive from ABAP parse output, where that is an assumption about data rather
+    than a guarantee.
+    """
+    out = _shorten(text, limit)
+    for char, replacement in _MERMAID_ESCAPES:
+        out = out.replace(char, replacement)
+    return out
+
+
+def _mermaid_class_defs(present: list[LineageNodeType]) -> list[str]:
+    """One ``classDef`` per object type actually drawn, from the shared colour vocabulary."""
+    lines: list[str] = []
+    for node_type in present:
+        fill, border = _style_for(node_type)
+        lines.append(
+            f"  classDef {_mermaid_class(node_type)} fill:{fill},stroke:{border},"
+            "stroke-width:1px,color:#0f172a;"
+        )
+    return lines
+
+
+def _mermaid_class(node_type: LineageNodeType) -> str:
+    return f"t_{node_type}"
+
+
+def render_mermaid(layout: DiagramLayout, *, max_nodes: int = _MERMAID_MAX_NODES) -> str:
+    """Render the layout as a Mermaid ``flowchart LR`` block, fenced and ready to paste.
+
+    What makes it readable rather than merely correct: nodes are grouped into the dependency stages
+    the layout already computed, so the flow reads left to right in bands; each node carries its
+    type colour from the same table the PNG uses; edge labels carry the hop kind *and* every update
+    mode, so a pair with both a full and a delta DTP does not read as one of them; the root is
+    emphasised; and advisory edges are dashed, as everywhere else.
+
+    Bounded for legibility at ``max_nodes``, independently of the graph's own 400-node bound. When
+    either bound binds, a note node says so inside the diagram - the same contract as the notice
+    printed on the SVG canvas, because a reader who sees only the picture must be told the same
+    thing as one who reads the payload.
+    """
+    kept = layout.nodes[:max_nodes]
+    ids = {node.id: f"n{index}" for index, node in enumerate(kept)}
+
+    present: list[LineageNodeType] = []
+    for node in kept:
+        if node.node_type not in present:
+            present.append(node.node_type)
+
+    grouped = _mermaid_grouped(kept)
+    lines = ["```mermaid", "flowchart LR"]
+    lines += _mermaid_class_defs(present)
+    lines += _mermaid_nodes(kept, ids)
+
+    for edge in layout.edges:
+        src, dst = ids.get(edge.src), ids.get(edge.dst)
+        if src is None or dst is None:
+            continue  # an endpoint fell outside the legibility bound: no dangling arrow is drawn
+        arrow = "-.->" if edge.confidence == "advisory" else "-->"
+        label = _edge_label(edge) or edge.kind.replace("_", " ")
+        lines.append(f'  {src} {arrow}|"{_mermaid_label(label, limit=40)}"| {dst}')
+
+    lines += [f"  class {ids[node.id]} {_mermaid_class(node.node_type)};" for node in kept]
+    root = next((node for node in kept if node.is_root), None)
+    if root is not None:
+        lines.append(f"  style {ids[root.id]} stroke-width:3px;")
+    lines += _mermaid_bound_note(
+        shown=len(kept), total=len(layout.nodes), cut=layout.truncated, grouped=grouped
+    )
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def _mermaid_grouped(kept: list[LayoutNode]) -> bool:
+    """Whether stage bands will help, or just add twenty labelled boxes around a hairball."""
+    stages = {node.layer for node in kept}
+    return len(stages) >= _MERMAID_MIN_STAGES and len(kept) <= _MERMAID_MAX_SUBGRAPH_NODES
+
+
+def _mermaid_nodes(kept: list[LayoutNode], ids: dict[str, str]) -> list[str]:
+    """Node declarations, grouped into dependency stages while grouping still aids reading."""
+
+    def declare(node: LayoutNode, indent: str) -> str:
+        type_label = _TYPE_LABEL.get(node.node_type, "object")
+        return f'{indent}{ids[node.id]}["{_mermaid_label(node.label)}<br/>{type_label}"]'
+
+    if not _mermaid_grouped(kept):
+        return [declare(node, "  ") for node in kept]
+
+    by_layer: dict[int, list[LayoutNode]] = {}
+    for node in kept:
+        by_layer.setdefault(node.layer, []).append(node)
+    lines: list[str] = []
+    for layer, members in sorted(by_layer.items()):
+        lines.append(f'  subgraph stage{layer}["Stage {layer + 1}"]')
+        lines.append("    direction TB")
+        lines += [declare(node, "    ") for node in members]
+        lines.append("  end")
+    return lines
+
+
+def _mermaid_bound_note(*, shown: int, total: int, cut: bool, grouped: bool) -> list[str]:
+    """A note node stating any bound that shaped the picture, and what to do about it.
+
+    The same contract as the notice printed on the SVG canvas: a reader who sees only the diagram is
+    told what a reader of the payload is told. Each bound names its own remedy, because they differ:
+    the legibility bound is answered by asking a narrower question, the walk's bound by a shallower
+    one, and losing the stage bands by neither. Stating them together as one "truncated" would send
+    a reader to the wrong fix.
+    """
+    notes: list[str] = []
+    if total > shown:
+        notes.append(f"showing {shown} of {total} objects - narrow the direction or depth")
+    if cut:
+        notes.append("graph truncated upstream - lower the depth for a complete reading")
+    if not grouped and (total > shown or shown > _MERMAID_MAX_SUBGRAPH_NODES):
+        notes.append("too wide for stage bands")
+    if not notes:
+        return []
+    return [
+        f'  bound["{_mermaid_label(". ".join(notes), limit=160)}"]',
+        "  classDef bounded fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d;",
+        "  class bound bounded;",
+    ]

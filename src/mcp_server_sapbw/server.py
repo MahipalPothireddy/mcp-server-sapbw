@@ -120,7 +120,13 @@ from .services.analysis import AnalysisReaders, AnalysisService
 from .services.analyzers import Analyzers
 from .services.assessment import AssessmentService
 from .services.capability_report import build_report
-from .services.diagram import build_layout, png_available, render_png, render_svg
+from .services.diagram import (
+    build_layout,
+    png_available,
+    render_mermaid,
+    render_png,
+    render_svg,
+)
 from .services.docgen import DocGenerator, DocGenResult
 from .services.exit_analysis import ExitAnalysisService
 from .services.lineage import LineageService
@@ -2031,13 +2037,18 @@ def bw_render_lineage(
     image_format: DiagramFormat = "png",
     output_dir: str | None = None,
 ) -> ToolResult:
-    """Render an object's data flow as an image (PNG by default, or SVG).
+    """Render an object's data flow as a diagram: PNG (default), SVG, or Mermaid source.
 
     Nodes are laid out left-to-right by dependency depth and colour-coded by BW object type;
     advisory edges (routine-derived, or resolved by naming convention) are dashed so a heuristic
     never looks like a declared fact, and a truncated graph says so on the canvas. Rendering is
     entirely local — diagram content never leaves the machine. Returns the image for inline display
     plus structured metadata; pass ``output_dir`` to also write a vector (SVG) copy.
+
+    ``image_format="mermaid"`` returns ``flowchart LR`` source instead of a raster, for a markdown
+    file or a wiki page. It is built from the same layout as the image, so the two cannot disagree,
+    and it is bounded for legibility at a smaller node count than the graph itself — when that binds
+    the diagram carries a note saying how many objects it is showing.
     """
     depth = max(1, min(depth, _MAX_DIAGRAM_DEPTH))
     graph = runtime().lineage(system).get_lineage(name, direction=direction, depth=depth)
@@ -2057,6 +2068,7 @@ def bw_render_lineage(
         target.write_text(svg, encoding="utf-8")
         svg_path = str(target)
 
+    mermaid = render_mermaid(layout) if image_format == "mermaid" else None
     png_bytes = render_png(layout) if image_format == "png" else None
     if image_format == "png" and png_bytes is None:
         caveats.append(
@@ -2066,7 +2078,7 @@ def bw_render_lineage(
         root=graph.root_id,
         direction=direction,
         depth=depth,
-        image_format="png" if png_bytes else "svg",
+        image_format=("mermaid" if mermaid else "png" if png_bytes else "svg"),
         node_count=graph.node_count,
         edge_count=graph.edge_count,
         layer_count=layout.layer_count,
@@ -2082,9 +2094,10 @@ def bw_render_lineage(
         png_available=png_available(),
         caveats=caveats,
     )
-    content: list[Any] = (
-        [Image(data=png_bytes, format="png")] if png_bytes else [svg]  # SVG travels as text
-    )
+    content: list[Any] = [mermaid] if mermaid else []
+    if not content:
+        # SVG travels as text; PNG as image content a client can display inline.
+        content = [Image(data=png_bytes, format="png")] if png_bytes else [svg]
     return ToolResult(content=content, structured_content=result.model_dump())
 
 
