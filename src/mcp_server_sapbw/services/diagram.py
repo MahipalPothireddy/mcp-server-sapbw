@@ -240,7 +240,11 @@ def _edge_label(edge: LineageEdge) -> str:
         parts.append("DTP")
     elif edge.kind == "multiprovider_part":
         parts.append("part of")
-    if edge.update_mode:
+    # Every mode, not just the significant one: a diagram labelled 'delta' on a pair that also has
+    # a full DTP tells the reader the opposite of the risk-relevant fact.
+    if edge.update_modes:
+        parts.append("+".join(edge.update_modes))
+    elif edge.update_mode:
         parts.append(edge.update_mode)
     return " / ".join(parts)
 

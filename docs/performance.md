@@ -27,7 +27,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_analyze_process_chain` | `per_object` | 3,885 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_query` | `per_object` | 7,863 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_routine` | `per_object` | 1,118 B | — | 5000 statements / 300s per call |
-| `bw_assess_change_impact` | `per_graph_node` | 9,632 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_assess_change_impact` | `per_graph_node` | 9,652 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_assess_landscape` | `per_system` | 5,282 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
 | `bw_capability_report` | `constant` | 35,444 B | — | 5000 statements / 300s per call |
@@ -46,7 +46,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_get_chain_runtimes` | `per_object` | 389 B | — | 5000 statements / 300s per call |
 | `bw_get_extractor_exit_code` | `per_system` | 410 B | — | 400 satellite program fetches (configurable); 5000 statements / 300s per call |
 | `bw_get_hana_crossings` | `per_page` | 193 B | — | 500 rows per page; 5000 statements / 300s per call |
-| `bw_get_lineage` | `per_graph_node` | 1,521 B | yes | 400 graph nodes, depth 12; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_get_lineage` | `per_graph_node` | 1,541 B | yes | 400 graph nodes, depth 12; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_get_load_closure` | `per_object` | 362 B | — | 5000 statements / 300s per call |
 | `bw_get_provider_health` | `per_object` | 437 B | — | 5000 statements / 300s per call |
 | `bw_get_query` | `per_object` | 964 B | — | 5000 statements / 300s per call |
@@ -80,7 +80,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_security_overview` | `per_system` | 407 B | — | 50,000 RSECVAL rows scanned; 5000 statements / 300s per call |
 | `bw_support_matrix` | `constant` | 22,217 B | — | 5000 statements / 300s per call |
 | `bw_system_profile` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
-| `bw_trace_to_source` | `per_graph_node` | 1,770 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
+| `bw_trace_to_source` | `per_graph_node` | 1,790 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
 | `bw_troubleshoot_missing_data` | `per_graph_node` | 8,261 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 
 ## Observed on the reference system

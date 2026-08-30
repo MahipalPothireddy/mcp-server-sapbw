@@ -162,7 +162,17 @@ class LineageEdge(BaseModel):
     derivation: Literal["declared", "routine"] = "declared"
     confidence: Literal["exact", "advisory"] = "exact"
     transformation_id: str | None = None
-    update_mode: UpdateMode | None = None  # from RSBKDTP for dtp edges
+    #: Every distinct active update mode BW has between this pair, from RSBKDTP. A pair commonly
+    #: carries more than one - a repair/init full DTP alongside the regular delta - and on a
+    #: measured production system 208 of 1043 active pairs (20%) did. Reporting one of them was a
+    #: defect rather than a simplification: which one won depended on the order the database
+    #: returned rows, so the same edge read 'full' or 'delta' on different runs of the same call.
+    update_modes: list[UpdateMode] = Field(default_factory=list)
+    #: The most operationally significant mode among ``update_modes`` (full > init > delta), kept
+    #: as a scalar for readers that want one value. A full load is what makes a re-run destructive
+    #: and what creates the stale-lookup hazard, so it is the one worth surfacing first. Read
+    #: ``update_modes`` when the distinction matters.
+    update_mode: UpdateMode | None = None
     chain_id: str | None = None
     chain_frequency: str | None = None
     note: str | None = None

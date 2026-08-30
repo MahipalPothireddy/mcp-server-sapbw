@@ -11,7 +11,8 @@ only reachable via TR2's routine, so impact_analysis(LOOKUP_DSO) must surface SA
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any, get_args
 
@@ -19,6 +20,7 @@ from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.lineage import LineageNodeType
 from mcp_server_sapbw.models.objects import TLOGO_TO_TYPE
 from mcp_server_sapbw.models.provenance import UnsupportedResult
+from mcp_server_sapbw.services import lineage as lineage_module
 from mcp_server_sapbw.services.lineage import LineageService, _node_type
 
 SCHEMA = "TESTSCHEMA"
@@ -104,6 +106,20 @@ class ScriptedConnection:
 
     @staticmethod
     def _dtp(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        # Batched frontier prefetch: keyed by the whole BFS level, so the key column is selected
+        # too and every row says which requested name it belongs to.
+        if "SRC IN (" in sql:
+            return [
+                (name, t, ty, um)
+                for name in map(str, params)
+                for t, ty, um in _DTP_BY_SRC.get(name, [])
+            ]
+        if "TGT IN (" in sql:
+            return [
+                (name, s, ty, um)
+                for name in map(str, params)
+                for s, ty, um in _DTP_BY_TGT.get(name, [])
+            ]
         name = str(params[0])
         if "SRC = ?" in sql:
             return [(t, ty, um) for t, ty, um in _DTP_BY_SRC.get(name, [])]
@@ -129,15 +145,24 @@ class ScriptedConnection:
         if "TRANID IN" in sql:  # reverse: targets for tranids
             wanted = {str(p) for p in params}
             return [(t, _HEADER[t][6], _HEADER[t][4]) for t in _HEADER if t in wanted]
+        # Batched frontier prefetch, one statement per BFS level per direction.
+        if "SOURCENAME IN (" in sql:
+            return [
+                (name, t, ty, tr)
+                for name in map(str, params)
+                for t, ty, tr in _TRANS_BY_SOURCE.get(name, [])
+            ]
+        if "TARGETNAME IN (" in sql:
+            return [
+                (name, s, ty, tr)
+                for name in map(str, params)
+                for s, ty, tr in _TRANS_BY_TARGET.get(name, [])
+            ]
         name = str(params[0])
         if "SOURCENAME = ?" in sql:  # downstream declared
             return [(t, ty, tr) for t, ty, tr in _TRANS_BY_SOURCE.get(name, [])]
-        if "TARGETNAME = ?" in sql:
-            if "SOURCENAME" in sql:  # upstream declared (selects SOURCENAME)
-                return [(s, ty, tr) for s, ty, tr in _TRANS_BY_TARGET.get(name, [])]
-            return [
-                (tr,) for _, _, tr in _TRANS_BY_TARGET.get(name, [])
-            ]  # transformations_targeting
+        if "TARGETNAME = ?" in sql:  # upstream declared; also serves transformations_targeting
+            return [(s, ty, tr) for s, ty, tr in _TRANS_BY_TARGET.get(name, [])]
         return []
 
 
@@ -311,3 +336,263 @@ def test_every_decodable_tlogo_type_is_a_valid_lineage_node_type() -> None:
     assert _node_type("NOPE") == "unknown"
     assert _node_type("") == "unknown"
     assert _node_type(None) == "unknown"
+
+
+# --- frontier prefetch: batched declared-edge reads -------------------------------------------
+#
+# The landscape above is a single chain, so every BFS level holds exactly one node and the prefetch
+# never fires on it - which is why the whole suite passed before these tests existed. A fan-out is
+# needed to reach the batched path at all.
+#
+#   U1, U2 --> HUB --> A1 --> B1, B2
+#                  --> A2 --> B3
+#                  --> A3 --> B4
+#
+# Levels 1 and 2 of a both-directions walk are 5 and 4 nodes wide respectively.
+
+_FAN_BY_SOURCE = {
+    "HUB": [("A1", "ODSO", "TA1"), ("A2", "ODSO", "TA2"), ("A3", "ODSO", "TA3")],
+    "A1": [("B1", "CUBE", "TB1"), ("B2", "CUBE", "TB2")],
+    "A2": [("B3", "CUBE", "TB3")],
+    "A3": [("B4", "CUBE", "TB4")],
+    "U1": [("HUB", "ODSO", "TU1")],
+    "U2": [("HUB", "ODSO", "TU2")],
+}
+_FAN_BY_TARGET = {
+    "HUB": [("U1", "RSDS", "TU1"), ("U2", "RSDS", "TU2")],
+    "A1": [("HUB", "ODSO", "TA1")],
+    "A2": [("HUB", "ODSO", "TA2")],
+    "A3": [("HUB", "ODSO", "TA3")],
+    "B1": [("A1", "ODSO", "TB1")],
+    "B2": [("A1", "ODSO", "TB2")],
+    "B3": [("A2", "ODSO", "TB3")],
+    "B4": [("A3", "ODSO", "TB4")],
+}
+# HUB -> A1 deliberately carries two active DTPs with different modes, which is the ordinary BW
+# shape (a repair/init full DTP beside the regular delta) and was measured on 208 of 1043 active
+# pairs on a production system. Full is listed *first* so that a last-row-wins implementation - the
+# D13 behaviour - reports 'delta' and fails the assertions below, rather than arriving at 'full' by
+# luck of the ordering.
+_FAN_DTP_BY_SRC = {
+    "HUB": [("A1", "ODSO", "F"), ("A1", "ODSO", "D"), ("A2", "ODSO", "D")],
+    "A1": [("B1", "CUBE", "D")],
+}
+_FAN_DTP_BY_TGT = {
+    "A1": [("HUB", "ODSO", "F"), ("HUB", "ODSO", "D")],
+    "A2": [("HUB", "ODSO", "D")],
+    "B1": [("A1", "ODSO", "D")],
+}
+
+
+class FanOutConnection:
+    """Wide BFS levels, and a count of the statements the walk actually issued."""
+
+    def __init__(self) -> None:
+        self.statements = 0
+
+    def execute_select(
+        self, sql: str, parameters: Sequence[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        self.statements += 1
+        params = list(parameters or [])
+        if "RSBKDTP" in sql:
+            return self._dtp(sql, params)
+        if "RSTRANSTEPROUT" in sql or "RSAABAP" in sql:
+            return []  # no routines in this landscape
+        if "RSDCUBE" in sql:
+            return []
+        if "RSTRAN" in sql:
+            return self._rstran(sql, params)
+        return []
+
+    def _rstran(self, sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        if "OBJSTAT" in sql or "STARTROUTINE IN" in sql or "TRANID IN" in sql:
+            return []
+        if "SOURCENAME IN (" in sql:
+            return [
+                (name, t, ty, tr)
+                for name in map(str, params)
+                for t, ty, tr in _FAN_BY_SOURCE.get(name, [])
+            ]
+        if "TARGETNAME IN (" in sql:
+            return [
+                (name, s, ty, tr)
+                for name in map(str, params)
+                for s, ty, tr in _FAN_BY_TARGET.get(name, [])
+            ]
+        name = str(params[0]) if params else ""
+        if "SOURCENAME = ?" in sql:
+            return list(_FAN_BY_SOURCE.get(name, []))
+        if "TARGETNAME = ?" in sql:
+            return list(_FAN_BY_TARGET.get(name, []))
+        return []
+
+    @staticmethod
+    def _dtp(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        if "SRC IN (" in sql:
+            return [
+                (name, t, ty, um)
+                for name in map(str, params)
+                for t, ty, um in _FAN_DTP_BY_SRC.get(name, [])
+            ]
+        if "TGT IN (" in sql:
+            return [
+                (name, s, ty, um)
+                for name in map(str, params)
+                for s, ty, um in _FAN_DTP_BY_TGT.get(name, [])
+            ]
+        name = str(params[0]) if params else ""
+        if "SRC = ?" in sql:
+            return list(_FAN_DTP_BY_SRC.get(name, []))
+        return list(_FAN_DTP_BY_TGT.get(name, []))
+
+
+def _shape(graph: Any) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    """The whole answer, in order: batching must not reorder the graph either."""
+    return (
+        [(n.name, n.object_type) for n in graph.nodes],
+        [
+            (e.src, e.dst, e.kind, e.transformation_id, e.update_mode, tuple(e.update_modes))
+            for e in graph.edges
+        ],
+    )
+
+
+def _fan_walk(connection: FanOutConnection) -> Any:
+    graph = LineageService(connection, _capability()).get_lineage("HUB", direction="both", depth=3)
+    assert not isinstance(graph, UnsupportedResult)
+    return graph
+
+
+@contextmanager
+def _prefetch_disabled() -> Iterator[None]:
+    """Raise the frontier threshold past any real level, leaving only the per-node reads."""
+    previous = lineage_module._PREFETCH_MIN_FRONTIER
+    lineage_module._PREFETCH_MIN_FRONTIER = 10**6
+    try:
+        yield
+    finally:
+        lineage_module._PREFETCH_MIN_FRONTIER = previous
+
+
+def test_the_frontier_prefetch_actually_fires_on_a_wide_level() -> None:
+    """Guards the guard: without a wide level, none of the tests below prove anything.
+
+    The pre-existing landscape is a chain, so every level is one node and the prefetch is skipped
+    by ``_PREFETCH_MIN_FRONTIER``. That is how the batched path came to be fully green and fully
+    untested at the same time, so this asserts the batches are issued rather than assuming it.
+    """
+    batches: list[tuple[tuple[str, ...], bool]] = []
+    original = LineageService._prefetch_transformations
+
+    def spy(self: LineageService, names: list[str], *, downstream: bool) -> None:
+        if names:
+            batches.append((tuple(names), downstream))
+        original(self, names, downstream=downstream)
+
+    LineageService._prefetch_transformations = spy  # type: ignore[method-assign]
+    try:
+        _fan_walk(FanOutConnection())
+    finally:
+        LineageService._prefetch_transformations = original  # type: ignore[method-assign]
+
+    assert batches, "no batched read was issued, so the batched path is not under test"
+    assert any(len(names) > 1 for names, _ in batches), (
+        "every batch held one name, which is the per-node read wearing a different SQL shape"
+    )
+
+
+def test_frontier_prefetch_returns_the_identical_graph() -> None:
+    """The load-bearing test: batching is only allowed to change cost, never the answer.
+
+    Also the reason a *silently empty* batched read cannot ship unnoticed. If the IN-list predicate
+    were wrong, the caches would fill with empty lists, the fallback would never fire, and edges
+    would vanish - and that shows up here as a graph that differs from the per-node one.
+    """
+    batched = _shape(_fan_walk(FanOutConnection()))
+    with _prefetch_disabled():
+        per_node = _shape(_fan_walk(FanOutConnection()))
+    assert batched == per_node
+
+
+def test_frontier_prefetch_costs_fewer_statements() -> None:
+    """The point of the change, asserted rather than asserted-about in a commit message."""
+    batched_connection = FanOutConnection()
+    _fan_walk(batched_connection)
+
+    per_node_connection = FanOutConnection()
+    with _prefetch_disabled():
+        _fan_walk(per_node_connection)
+
+    assert batched_connection.statements < per_node_connection.statements, (
+        f"batched={batched_connection.statements} per_node={per_node_connection.statements}"
+    )
+
+
+def test_an_unattributable_batched_row_falls_back_instead_of_dropping_edges() -> None:
+    """A wrong key-matching assumption must cost speed, not correctness.
+
+    The prefetch attributes each returned row to a requested name by its key column. If that
+    mapping fails - padding, case, or a column that does not hold what we think - the tempting
+    behaviour is to skip the row, which caches an empty list and quietly deletes edges from the
+    graph. Instead the whole chunk is abandoned and every node in it reads for itself, so the
+    answer is the per-node answer.
+    """
+
+    class Misattributing(FanOutConnection):
+        def _rstran(self, sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+            rows = super()._rstran(sql, params)
+            if " IN (" in sql and "TRANID IN" not in sql:
+                return [("NO_SUCH_OBJECT", *row[1:]) for row in rows]
+            return rows
+
+    degraded = _shape(_fan_walk(Misattributing()))
+    healthy = _shape(_fan_walk(FanOutConnection()))
+    assert degraded == healthy
+
+
+def test_a_pair_with_several_dtp_modes_reports_all_of_them() -> None:
+    """D13: the edge carried whichever update mode the database happened to return last.
+
+    Found by the batching work rather than by review: the batched and per-node walks over the same
+    production ADSO produced identical topology but disagreed on ``update_mode`` for 12 edges, which
+    is only possible if the value was order-dependent. A direct read then showed 208 of 1043 active
+    object pairs on that system carry more than one active UPDMODE - one pair had five DTPs, three
+    full and two delta - so this was a wrong fact on a fifth of the DTP-bearing pairs, not a rare
+    tie. It matters because a full load is what makes a re-run destructive and what creates the
+    stale-master-data hazard, so silently reporting 'delta' hides exactly the risk worth seeing.
+    """
+    graph = _fan_walk(FanOutConnection())
+    edge = next(e for e in graph.edges if e.src == "HUB" and e.dst == "A1")
+
+    assert list(edge.update_modes) == ["full", "delta"], (
+        "both declared modes must survive; the fixture orders the rows so that a last-row-wins "
+        "implementation reports 'delta' alone and fails here"
+    )
+    assert edge.update_mode == "full", "the scalar summary must be the significant mode, not a race"
+
+    # And a pair with one mode still reads as one mode, so the fix did not turn every edge into a
+    # list of possibilities.
+    single = next(e for e in graph.edges if e.src == "HUB" and e.dst == "A2")
+    assert list(single.update_modes) == ["delta"]
+    assert single.update_mode == "delta"
+
+
+def test_the_reported_update_mode_does_not_depend_on_row_order() -> None:
+    """The property behind D13, asserted directly: reverse the rows, get the same answer."""
+
+    class Reversed(FanOutConnection):
+        def _rstran(self, sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+            return list(reversed(super()._rstran(sql, params)))
+
+        def _dtp(self, sql: str, params: list[Any]) -> list[tuple[Any, ...]]:  # type: ignore[override]
+            return list(reversed(FanOutConnection._dtp(sql, params)))
+
+    forward = {
+        (e.src, e.dst): (e.update_mode, tuple(e.update_modes))
+        for e in _fan_walk(FanOutConnection()).edges
+    }
+    backward = {
+        (e.src, e.dst): (e.update_mode, tuple(e.update_modes)) for e in _fan_walk(Reversed()).edges
+    }
+    assert forward == backward

@@ -66,6 +66,17 @@ def _node_type(code: object) -> LineageNodeType:
 
 _UPDMODE_MAP: dict[str, UpdateMode] = {"F": "full", "D": "delta", "I": "init"}
 
+# Most operationally significant first. A full load is what makes a re-run destructive and what
+# creates the stale-lookup hazard scenario 9.1 looks for, so where a pair carries several modes the
+# scalar `update_mode` reports the full one rather than whichever row the database returned last.
+_UPDMODE_PRECEDENCE: tuple[UpdateMode, ...] = ("full", "init", "delta")
+
+
+def _sorted_modes(modes: set[UpdateMode]) -> list[UpdateMode]:
+    """Distinct update modes in significance order, so the scalar summary is reproducible."""
+    return [mode for mode in _UPDMODE_PRECEDENCE if mode in modes]
+
+
 # HANA schema holding generated BW calc views. Part-provider edges need TRANSITIVE dependencies
 # (type 2): BW layers a CompositeProvider's calc view over intermediate views, so a part provider's
 # active table is never a *direct* dependency of it (verified live). Bounded by the table filter.
@@ -104,6 +115,38 @@ _MAX_NODES = 400
 _MAX_DEPTH = 12
 _ROUTINE_TRANS_CAP = 25  # transformations-per-node whose routines we parse for lookups
 _REVERSE_CODEID_CAP = 150  # RSAABAP code-ids scanned in the reverse (impact) routine search
+
+# Frontier prefetch. Names per batched IN-list: RSTRAN and RSBKDTP are small (~1.3k rows on a
+# measured production system) so the predicate is cheap, and the chunk exists to keep the bind
+# parameter count well inside any driver's limit rather than to bound the scan.
+_PREFETCH_CHUNK = 200
+# Below this a batch is just the single-node query plus bookkeeping, so it is not worth issuing.
+_PREFETCH_MIN_FRONTIER = 2
+
+# (key column, other-endpoint name column, other-endpoint type column) per direction. Shared by the
+# single-node reads and their batched prefetch so the two cannot drift into reading different rows.
+_TRAN_COLUMNS: dict[bool, tuple[str, str, str]] = {
+    True: ("SOURCENAME", "TARGETNAME", "TARGETTYPE"),
+    False: ("TARGETNAME", "SOURCENAME", "SOURCETYPE"),
+}
+_DTP_COLUMNS: dict[bool, tuple[str, str, str]] = {
+    True: ("SRC", "TGT", "TGTTLOGO"),
+    False: ("TGT", "SRC", "SRCTLOGO"),
+}
+
+
+def _prefetch_directions(direction: LineageDirection) -> tuple[bool, ...]:
+    """Which declared-edge branches a walk in ``direction`` will ask for."""
+    if direction == "downstream":
+        return (True,)
+    if direction == "upstream":
+        return (False,)
+    return (True, False)
+
+
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[start : start + size] for start in range(0, len(items), size)]
+
 
 _ROUTINE_CAVEAT = (
     "routine-derived edges are advisory (heuristic lower bound): dynamic SQL, function-module and "
@@ -193,6 +236,15 @@ class LineageService(Repository):
         self._node_type_memo: dict[str, LineageNodeType] = {}
         self._consumers_memo: dict[str, list[tuple[str, LineageNodeType, str]]] = {}
         self._trace_memo: dict[tuple[str, int], TraceToSource] = {}
+        # Declared-edge rows prefetched a BFS level at a time, keyed by (name, downstream) and
+        # holding (other_name, other_type_code, tran_id_or_updmode). A present key with an empty
+        # list means "read, no rows"; an absent key means "not read", and the reader then issues
+        # its own single-node query. That distinction is what makes the prefetch optional.
+        self._pf_tran: dict[tuple[str, bool], list[tuple[str, str, str]]] = {}
+        self._pf_dtp: dict[tuple[str, bool], list[tuple[str, str, str]]] = {}
+        #: name -> (provider, compuid) or None. ``None`` is a cached answer, not a miss, so the
+        #: `in` test rather than `.get` is what makes "this is not a query" cost one lookup.
+        self._query_provider_memo: dict[str, tuple[str, str] | None] = {}
 
     # --- public API ----------------------------------------------------------------------
 
@@ -308,24 +360,143 @@ class LineageService(Repository):
         hit_node_cap = False
 
         while queue:
-            current, level = queue.popleft()
-            if current in visited or level >= depth:
-                continue
-            visited.add(current)
-            for hop in self._expand(current, direction, include_routine=include_routine):
-                self._ensure_node(nodes, hop.name, hop.node_type, hop.edge.provenance)
-                key = (hop.edge.src, hop.edge.dst, hop.edge.kind)
-                if key not in edge_keys:
-                    edge_keys.add(key)
-                    edges.append(hop.edge)
-                if len(nodes) >= _MAX_NODES:
-                    hit_node_cap = True
+            # Drain a whole BFS level before expanding any of it, so the level's declared edges can
+            # be read in a few batched statements instead of ~5 per node. The queue is
+            # non-decreasing in level (expanding level N only ever appends level N+1), so every
+            # entry of the lowest level is contiguous at the front. Expansion order within the
+            # level, and therefore edge order, is unchanged from popping one at a time.
+            level = queue[0][1]
+            frontier: list[str] = []
+            queued_in_level: set[str] = set()
+            while queue and queue[0][1] == level:
+                candidate, _ = queue.popleft()
+                if candidate in visited or candidate in queued_in_level:
+                    continue
+                queued_in_level.add(candidate)
+                frontier.append(candidate)
+            if level >= depth:
+                break  # levels only increase, so nothing left to expand
+            self._prefetch_frontier(frontier, direction, include_routine=include_routine)
+            for current in frontier:
+                visited.add(current)
+                for hop in self._expand(current, direction, include_routine=include_routine):
+                    self._ensure_node(nodes, hop.name, hop.node_type, hop.edge.provenance)
+                    key = (hop.edge.src, hop.edge.dst, hop.edge.kind)
+                    if key not in edge_keys:
+                        edge_keys.add(key)
+                        edges.append(hop.edge)
+                    if len(nodes) >= _MAX_NODES:
+                        hit_node_cap = True
+                        break
+                    if hop.name not in visited:
+                        queue.append((hop.name, level + 1))
+                if hit_node_cap:
                     break
-                if hop.name not in visited:
-                    queue.append((hop.name, level + 1))
             if hit_node_cap:
                 break
         return nodes, edges, self._completeness(node_cap=hit_node_cap)
+
+    # --- frontier prefetch ---------------------------------------------------------------
+
+    def _prefetch_frontier(
+        self, frontier: list[str], direction: LineageDirection, *, include_routine: bool
+    ) -> None:
+        """Fill the declared-edge caches for one BFS level in a few batched statements.
+
+        Expanding a node costs ~5 single-row statements against RSTRAN and RSBKDTP, and a deep
+        walk's cost is dominated by per-statement round-trip latency rather than by the work each
+        statement does: a depth-3 both-directions walk re-run warm dropped 21% of its statements
+        but only 14% of its wall time. Reading a level's worth of the same rows through one IN-list
+        per branch collapses the count without changing which rows are read.
+
+        Deliberately best-effort. Every reader falls back to its own single-node query when a name
+        is absent from the cache, so a prefetch that is skipped, chunked short, or declined for
+        lack of budget costs speed and never correctness - a bug here degrades to today's
+        behaviour rather than producing a different graph.
+        """
+        # Nodes whose expansion is already memoised issue no statements at all, so prefetching
+        # them would be pure cost.
+        pending = [
+            name for name in frontier if (name, direction, include_routine) not in self._expand_memo
+        ]
+        if len(pending) < _PREFETCH_MIN_FRONTIER:
+            return
+        # Checked, not caught: with the allowance nearly spent, the expansions themselves need
+        # what is left more than the prefetch does, and they fall back cleanly.
+        if self._budget_stop() is not None:
+            return
+        for downstream in _prefetch_directions(direction):
+            self._prefetch_transformations(
+                [n for n in pending if (n, downstream) not in self._pf_tran], downstream=downstream
+            )
+            if self.capability.is_available("dtp"):
+                self._prefetch_dtps(
+                    [n for n in pending if (n, downstream) not in self._pf_dtp],
+                    downstream=downstream,
+                )
+
+    def _prefetch_transformations(self, names: list[str], *, downstream: bool) -> None:
+        key_col, other_name_col, other_type_col = _TRAN_COLUMNS[downstream]
+        for chunk in _chunks(names, _PREFETCH_CHUNK):
+            owner_of = {name.strip().upper(): name for name in chunk}
+            buckets: dict[str, list[tuple[str, str, str]]] = {name: [] for name in chunk}
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=[key_col, other_name_col, other_type_col, "TRANID"],
+                    from_logical="transformation",
+                    where=[f"{key_col} IN ({placeholders})"],
+                    params=list(chunk),
+                    order_by=[key_col, "TRANID"],
+                )
+            )
+            attributed = True
+            for key_value, other_name, other_type, tran_id in rows:
+                owner = owner_of.get(str(key_value).strip().upper())
+                if owner is None:
+                    attributed = False
+                    break
+                buckets[owner].append(
+                    (str(other_name).strip(), str(other_type).strip(), str(tran_id).strip())
+                )
+            if not attributed:
+                # A returned key matching no requested name means the key-matching assumption is
+                # wrong on this system. Caching these buckets would turn that into *missing edges*,
+                # so the chunk is abandoned and every node in it falls back to its own read.
+                continue
+            for name, collected in buckets.items():
+                self._pf_tran[(name, downstream)] = collected
+
+    def _prefetch_dtps(self, names: list[str], *, downstream: bool) -> None:
+        key_col, other_name_col, other_type_col = _DTP_COLUMNS[downstream]
+        for chunk in _chunks(names, _PREFETCH_CHUNK):
+            owner_of = {name.strip().upper(): name for name in chunk}
+            buckets: dict[str, list[tuple[str, str, str]]] = {name: [] for name in chunk}
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=[key_col, other_name_col, other_type_col, "UPDMODE"],
+                    from_logical="dtp",
+                    # RSBK* prefix: no OBJVERS auto-inject, so it is stated here as in the
+                    # single-node read.
+                    where=[f"{key_col} IN ({placeholders})", "OBJVERS = 'A'"],
+                    params=list(chunk),
+                    order_by=[key_col, other_name_col],
+                )
+            )
+            attributed = True
+            for key_value, other_name, other_type, updmode in rows:
+                owner = owner_of.get(str(key_value).strip().upper())
+                if owner is None:
+                    attributed = False
+                    break
+                buckets[owner].append(
+                    (str(other_name).strip(), str(other_type).strip(), str(updmode).strip())
+                )
+            if not attributed:
+                continue  # abandon the chunk rather than cache it - see _prefetch_transformations
+            for name, collected in buckets.items():
+                self._pf_dtp[(name, downstream)] = collected
 
     def _completeness(self, *, node_cap: bool) -> LineageCompleteness:
         """The single most limiting bound this walk hit, or ``complete``."""
@@ -455,14 +626,10 @@ class LineageService(Repository):
         """
         if not self.capability.is_available("query_dir"):
             return []
-        query_repo = self._query_repo()
-        header = query_repo._header(name)
-        if header is None:
+        resolved = self._query_provider_of(name)
+        if resolved is None:
             return []
-        providers = query_repo._providers_list(str(header[0]))
-        if not providers:
-            return []
-        provider = providers[0]
+        provider, compuid = resolved
         edge = LineageEdge(
             src=name if downstream else provider,
             dst=provider if downstream else name,
@@ -470,9 +637,31 @@ class LineageService(Repository):
             derivation="declared",
             confidence="exact",
             note="provider resolved from the BEx query metadata",
-            provenance=self.provenance("query_provider", {"COMPUID": str(header[0])}),
+            provenance=self.provenance("query_provider", {"COMPUID": compuid}),
         )
         return [_Hop(provider, "unknown", edge)]
+
+    def _query_provider_of(self, name: str) -> tuple[str, str] | None:
+        """``(provider, compuid)`` if ``name`` is a BEx query, else ``None``. Memoised per name.
+
+        A both-directions walk asks this once per direction for every node, and the two calls do
+        identical work - only the resulting edge's orientation differs. Measured on a production
+        depth-3 walk, this branch spent 48.3s over 456 statements, almost exactly two per node,
+        which is the duplicate. The memo also covers the common case worth avoiding: most nodes are
+        not queries at all, and each was paying the lookup twice to find that out.
+        """
+        if name in self._query_provider_memo:
+            return self._query_provider_memo[name]
+        resolved: tuple[str, str] | None = None
+        query_repo = self._query_repo()
+        header = query_repo._header(name)
+        if header is not None:
+            compuid = str(header[0])
+            providers = query_repo._providers_list(compuid)
+            if providers:
+                resolved = (providers[0], compuid)
+        self._query_provider_memo[name] = resolved
+        return resolved
 
     # --- CompositeProvider part edges (via the generated HANA calc view) ------------------
 
@@ -693,6 +882,7 @@ class LineageService(Repository):
         for other_name, info in merged.items():
             other_type = _node_type(info["type_code"])
             src, dst = (name, other_name) if downstream else (other_name, name)
+            modes = _sorted_modes(cast("set[UpdateMode]", info.get("update_modes") or set()))
             hops.append(
                 _Hop(
                     other_name,
@@ -704,7 +894,8 @@ class LineageService(Repository):
                         derivation="declared",
                         confidence="exact",
                         transformation_id=info.get("tran_id"),
-                        update_mode=info.get("update_mode"),
+                        update_modes=modes,
+                        update_mode=modes[0] if modes else None,
                         provenance=info["provenance"],
                     ),
                 )
@@ -714,61 +905,91 @@ class LineageService(Repository):
     def _collect_transformation_hops(
         self, name: str, *, downstream: bool, merged: dict[str, dict[str, Any]]
     ) -> None:
-        key_col, other_name_col, other_type_col = (
-            ("SOURCENAME", "TARGETNAME", "TARGETTYPE")
-            if downstream
-            else ("TARGETNAME", "SOURCENAME", "SOURCETYPE")
-        )
+        for other, type_code, tran_id in self._transformation_rows(name, downstream=downstream):
+            if not other:
+                continue
+            merged[other] = {
+                "type_code": type_code,
+                "tran_id": tran_id or None,
+                "provenance": self.provenance("transformation", {"TRANID": tran_id}),
+            }
+
+    def _transformation_rows(self, name: str, *, downstream: bool) -> list[tuple[str, str, str]]:
+        """``(other_name, other_type_code, tran_id)`` for one endpoint, prefetched or read now.
+
+        Ordered by TRANID in both paths. Two transformations can connect the same pair of objects,
+        and the caller keeps the last row per neighbour, so an unordered read let the surviving
+        TRANID depend on whatever order the database happened to return - and the routine cap in
+        :meth:`_transformations_targeting` truncates the same list. Stating the order makes the
+        batched and single-node paths agree and makes either one reproducible.
+        """
+        cached = self._pf_tran.get((name, downstream))
+        if cached is not None:
+            return cached
+        key_col, other_name_col, other_type_col = _TRAN_COLUMNS[downstream]
         rows = self.select(
             self.dialect.build_select(
                 columns=[other_name_col, other_type_col, "TRANID"],
                 from_logical="transformation",
                 where=[f"{key_col} = ?"],
                 params=[name],
+                order_by=["TRANID"],
             )
         )
-        for other_name, other_type, tran_id in rows:
-            other = str(other_name).strip()
-            if not other:
-                continue
-            merged[other] = {
-                "type_code": str(other_type).strip(),
-                "tran_id": str(tran_id).strip() or None,
-                "provenance": self.provenance("transformation", {"TRANID": str(tran_id).strip()}),
-            }
+        return [
+            (str(other_name).strip(), str(other_type).strip(), str(tran_id).strip())
+            for other_name, other_type, tran_id in rows
+        ]
 
     def _collect_dtp_hops(
         self, name: str, *, downstream: bool, merged: dict[str, dict[str, Any]]
     ) -> None:
         if not self.capability.is_available("dtp"):
             return
-        key_col, other_name_col, other_type_col = (
-            ("SRC", "TGT", "TGTTLOGO") if downstream else ("TGT", "SRC", "SRCTLOGO")
-        )
+        for other, type_code, updmode in self._dtp_rows(name, downstream=downstream):
+            if not other:
+                continue
+            update_mode = _UPDMODE_MAP.get(updmode)
+            existing = merged.get(other)
+            if existing is None:
+                prov_key = {"SRC": name} if downstream else {"TGT": name}
+                existing = merged[other] = {
+                    "type_code": type_code,
+                    "dtp_only": True,
+                    "provenance": self.provenance("dtp", prov_key),
+                }
+            # Accumulated, not assigned. Several active DTPs routinely connect one pair with
+            # different modes - a repair/init full alongside the regular delta - so the last row
+            # read is not "the" update mode. Overwriting here meant the answer depended on row
+            # order, and the same edge came back 'full' or 'delta' on different runs (D13).
+            if update_mode is not None:
+                modes = cast("set[UpdateMode]", existing.setdefault("update_modes", set()))
+                modes.add(update_mode)
+
+    def _dtp_rows(self, name: str, *, downstream: bool) -> list[tuple[str, str, str]]:
+        """``(other_name, other_type_code, updmode)`` for one endpoint, prefetched or read now.
+
+        Ordered by the neighbour's name in both paths, for the same reason as
+        :meth:`_transformation_rows`: several DTPs can connect one pair of objects and the caller
+        keeps the last update mode it sees, so an unstated order let the database decide.
+        """
+        cached = self._pf_dtp.get((name, downstream))
+        if cached is not None:
+            return cached
+        key_col, other_name_col, other_type_col = _DTP_COLUMNS[downstream]
         rows = self.select(
             self.dialect.build_select(
                 columns=[other_name_col, other_type_col, "UPDMODE"],
                 from_logical="dtp",
                 where=[f"{key_col} = ?", "OBJVERS = 'A'"],  # RSBK* prefix: no OBJVERS auto-inject
                 params=[name],
+                order_by=[other_name_col],
             )
         )
-        for other_name, other_type, updmode in rows:
-            other = str(other_name).strip()
-            if not other:
-                continue
-            update_mode = _UPDMODE_MAP.get(str(updmode).strip())
-            existing = merged.get(other)
-            if existing is not None:
-                existing["update_mode"] = update_mode  # enrich the transformation edge
-            else:
-                prov_key = {"SRC": name} if downstream else {"TGT": name}
-                merged[other] = {
-                    "type_code": str(other_type).strip(),
-                    "update_mode": update_mode,
-                    "dtp_only": True,
-                    "provenance": self.provenance("dtp", prov_key),
-                }
+        return [
+            (str(other_name).strip(), str(other_type).strip(), str(updmode).strip())
+            for other_name, other_type, updmode in rows
+        ]
 
     # --- routine-derived edges -----------------------------------------------------------
 
@@ -812,15 +1033,18 @@ class LineageService(Repository):
         return hops
 
     def _transformations_targeting(self, name: str) -> list[str]:
-        rows = self.select(
-            self.dialect.build_select(
-                columns=["TRANID"],
-                from_logical="transformation",
-                where=["TARGETNAME = ?"],
-                params=[name],
-            )
-        )
-        return [str(r[0]).strip() for r in rows if str(r[0]).strip()]
+        """Transformations whose target is ``name``, ordered by TRANID.
+
+        Reads the upstream declared-edge rows, which already carry TRANID per target, so during a
+        walk this is free rather than a statement of its own. ``_ROUTINE_TRANS_CAP`` truncates the
+        result, which is why the order is stated: an unordered read decided which routines got
+        parsed - and therefore which advisory edges existed - by whatever the database returned.
+        """
+        return [
+            tran_id
+            for _other, _type, tran_id in self._transformation_rows(name, downstream=False)
+            if tran_id
+        ]
 
     def _routine_consumers_of(self, name: str) -> list[tuple[str, LineageNodeType, str]]:
         """Reverse: (target, type, tran_id) for transformations whose routines reference name.
