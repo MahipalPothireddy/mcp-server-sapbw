@@ -14,6 +14,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .completeness import BoundedResult
 from .provenance import Provenance
 
 # Ordered from least to most severe; used for sorting findings in a report.
@@ -49,23 +50,21 @@ class Finding(BaseModel):
     unpopulated_reason: str | None = None
 
 
-class ScenarioReport(BaseModel):
+class ScenarioReport(BoundedResult):
     """The result of running one scenario analyzer: its findings plus scope and gap metadata.
 
     ``analyzed_count`` is how many candidate objects were examined (so an empty ``findings`` list
-    is distinguishable from "nothing was analyzed"); ``truncated`` is set when the analysis hit its
-    object cap; ``connector_required`` names the external system when the scenario could not be
-    fully populated from BW alone; ``caveats`` records scope limits and documented gaps.
+    is distinguishable from "nothing was analyzed"); ``completeness`` says which bound stopped the
+    analysis, where ``truncated`` said only that one did; ``connector_required`` names the external
+    system when the scenario could not be fully populated from BW alone; ``caveats`` records scope
+    limits and documented gaps.
     """
-
-    model_config = ConfigDict(extra="forbid")
 
     scenario: str
     title: str
     findings: list[Finding] = Field(default_factory=list)
     finding_count: int = 0
     analyzed_count: int = 0
-    truncated: bool = False
     connector_required: str | None = None
     caveats: list[str] = Field(default_factory=list)
 

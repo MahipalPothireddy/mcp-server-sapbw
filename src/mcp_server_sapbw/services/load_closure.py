@@ -25,6 +25,7 @@ from collections import defaultdict, deque
 from typing import Any
 
 from ..models.chains import ChainCadence, LoadClosure, LoadedProvider
+from ..models.completeness import COMPLETE, bounded
 from ..models.provenance import UnsupportedResult
 from ..repositories.base import Repository
 from ..repositories.chains import ChainsRepository
@@ -152,7 +153,7 @@ class LoadClosureService(Repository):
             providers_loaded=providers,
             subchains_walked=walked,
             step_categories=dict(categories),
-            truncated_recursion=truncated,
+            completeness=(bounded("recursion_limit", scope="subchains") if truncated else COMPLETE),
             caveats=caveats,
         )
 

@@ -62,6 +62,7 @@ from .models.chains import (
     LoadClosure,
     ScheduleMatrixEntry,
 )
+from .models.completeness import COMPLETE, bounded
 from .models.diagram import DiagramFormat, DiagramResult
 from .models.ecc import ConnectorUnavailable, ExitInventory
 from .models.errors import (
@@ -2072,7 +2073,11 @@ def bw_render_lineage(
         advisory_edge_count=advisory,
         width=layout.width,
         height=layout.height,
-        truncated=graph.truncated,
+        # Forwarded from the graph rather than recomputed, so a reader who sees only the picture is
+        # told the same bound as one who reads the JSON (D6).
+        completeness=(
+            bounded(graph.completeness) if graph.completeness != "complete" else COMPLETE
+        ),
         svg_path=svg_path,
         png_available=png_available(),
         caveats=caveats,

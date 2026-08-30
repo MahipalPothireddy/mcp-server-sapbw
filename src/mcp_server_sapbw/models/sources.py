@@ -21,6 +21,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .completeness import BoundedResult
 from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
@@ -99,14 +100,11 @@ class DataSourceEnhancement(BaseModel):
     provenance: Provenance | list[Provenance]
 
 
-class EnhancementInventory(BaseModel):
+class EnhancementInventory(BoundedResult):
     """Extractor-enhancement inventory across DataSources."""
-
-    model_config = ConfigDict(extra="forbid")
 
     enhanced: list[DataSourceEnhancement] = Field(default_factory=list)
     enhanced_count: int = 0  # DataSources with at least one customer-namespace field
     total_datasources: int = 0
-    truncated: bool = False
     connector_required: str | None = None  # names the connector needed for the exit logic
     caveats: list[str] = Field(default_factory=list)

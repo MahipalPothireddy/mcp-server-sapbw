@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from ..core.dialect import quote_ident
+from ..models.completeness import BoundHit, Completeness, bounded
 from ..models.evidence import evidence_for
 from ..models.hana import (
     BaseTableRef,
@@ -242,6 +243,20 @@ class HanaRepository(Repository):
                 )
             )
         consumers, consumers_truncated = self._consuming_bw_providers(view_name)
+        # Which cap bound, not merely that one did (D6). The two mean different things to a caller:
+        # a capped base-table list understates what the view reads, a capped consumer list
+        # understates who depends on it.
+        hits: list[BoundHit] = []
+        if truncated:
+            hits.append(BoundHit(bound="row_cap", scope="base_tables", limit=_MAX_BASE_TABLES))
+        if consumers_truncated:
+            hits.append(
+                BoundHit(
+                    bound="semantic_limit",
+                    scope="consuming_bw_providers",
+                    limit=_MAX_PROVIDER_CONSUMERS,
+                )
+            )
         caveats = ["/BIC/ and /BI0/ base-table resolution to BW objects is advisory (naming-based)"]
         if consumers:
             caveats.append(
@@ -258,7 +273,7 @@ class HanaRepository(Repository):
             base_tables=base_tables,
             resolved_bw_objects=resolved,
             consuming_bw_providers=consumers,
-            truncated=truncated or consumers_truncated,
+            completeness=Completeness(bounds=hits),
             caveats=caveats,
             provenance=self.provenance(
                 "object_dependencies",
@@ -485,7 +500,9 @@ class HanaRepository(Repository):
         ]
         base.filters = list(parsed.filters)
         base.unrecognised_elements = list(parsed.unrecognised_elements)
-        base.truncated = bool(parsed.truncated)
+        if parsed.truncated:
+            # One of the parser's per-section bounds stopped it; the section is named there.
+            base.completeness = bounded("row_cap", scope="definition_sections")
 
         base.evidence = evidence_for("calc_view_definition", "activated_repository")
         base.caveats.append(
@@ -520,14 +537,24 @@ class HanaRepository(Repository):
         bw_reads = self._bw_reads_hana(abap, calc_view, limit, offset)
         crossings = hana_reads[0] + bw_reads[0]
         caveats = ["only direct dependencies (DEPENDENCY_TYPE=1) are included"]
-        if hana_reads[2] or bw_reads[2]:
+        # Each direction pages independently, so they are reported independently: a caller paging
+        # one of them needs to know which side still has rows behind it (D6).
+        hits = [
+            BoundHit(bound="page_limit", scope=scope, limit=limit)
+            for scope, exhausted in (
+                ("hana_reads_bw", hana_reads[2]),
+                ("bw_reads_hana", bw_reads[2]),
+            )
+            if exhausted
+        ]
+        if hits:
             caveats.append("crossing list truncated per direction; totals are exact")
         return HanaCrossingReport(
             crossings=crossings,
             total_count=hana_reads[1] + bw_reads[1],
             hana_reads_bw_count=hana_reads[1],
             bw_reads_hana_count=bw_reads[1],
-            truncated=hana_reads[2] or bw_reads[2],
+            completeness=Completeness(bounds=hits),
             caveats=caveats,
         )
 

@@ -34,6 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .capability import ValidationStatus
 from .chains import Chain, ChainRuntimes, LoadClosure
+from .completeness import BoundedResult
 from .evidence import Evidence, EvidenceBasis, EvidenceCompleteness, EvidenceSummary
 from .findings import Finding, severity_rank
 from .health import ProviderHealth
@@ -266,7 +267,7 @@ class AnalysisExecution(BaseModel):
     duration_ms: int = 0
 
 
-class AnalysisBudget(BaseModel):
+class AnalysisBudget(BoundedResult):
     """The allowance this call ran inside, and what it spent.
 
     Reported on success as well as on exhaustion. Previously the spend was visible only when the
@@ -275,14 +276,12 @@ class AnalysisBudget(BaseModel):
     the size", invisible until it became a partial answer.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
     query_limit: int | None = None
     queries_used: int | None = None
     time_limit_ms: int | None = None
     time_used_ms: int | None = None
     #: True when a bound stopped the analysis short - the budget, or a section's own row cap.
-    truncated: bool = False
+    #: Which of the two it was. The bool could not tell them apart, and they need different
     #: False when no budget was active, so the other fields are absent rather than zero.
     measured: bool = False
 

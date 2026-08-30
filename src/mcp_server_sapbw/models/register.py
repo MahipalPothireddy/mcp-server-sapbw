@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .completeness import BoundedResult
 from .provenance import Provenance
 from .transformations import RoutineKind
 
@@ -48,10 +49,8 @@ class RoutineRegisterEntry(BaseModel):
     provenance: Provenance
 
 
-class RoutineRegister(BaseModel):
+class RoutineRegister(BoundedResult):
     """Every transformation routine in the system, ranked, with analysis depth reported."""
-
-    model_config = ConfigDict(extra="forbid")
 
     entries: list[RoutineRegisterEntry] = Field(default_factory=list)
     # Portfolio totals, complete regardless of the parse budget.
@@ -64,7 +63,6 @@ class RoutineRegister(BaseModel):
     anti_pattern_totals: dict[str, int] = Field(default_factory=dict)
     limit: int = 0
     offset: int = 0
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
 
 

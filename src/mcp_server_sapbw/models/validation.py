@@ -35,6 +35,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .completeness import BoundedResult
 from .evidence import EvidenceBasis, EvidenceCompleteness
 
 #: The validation ladder, weakest first. Mirrors ``models.capability.ValidationStatus`` in meaning;
@@ -122,10 +123,8 @@ class GroundTruth(BaseModel):
     notes: str | None = None
 
 
-class ScenarioMeasurement(BaseModel):
+class ScenarioMeasurement(BoundedResult):
     """What the call cost, taken from the compound envelope rather than a stopwatch."""
-
-    model_config = ConfigDict(extra="forbid")
 
     #: From ``Analysis.execution.queries_executed``. ``None`` when nothing counted — never 0, which
     #: would claim the call issued no statements.
@@ -133,7 +132,6 @@ class ScenarioMeasurement(BaseModel):
     response_time_ms: int | None = None
     payload_bytes: int | None = None
     #: From ``Analysis.budget.truncated``: whether a bound stopped the answer short.
-    truncated: bool = False
 
 
 class ValidationScenario(BaseModel):

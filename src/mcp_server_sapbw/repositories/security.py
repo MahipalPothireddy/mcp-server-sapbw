@@ -31,6 +31,7 @@ from typing import Any
 from ..core.cache import SqliteCache
 from ..core.capabilities import SupportsSelect, unsupported_result
 from ..models.capability import CapabilityRecord
+from ..models.completeness import COMPLETE, BoundHit, Completeness, bounded
 from ..models.provenance import UnsupportedResult
 from ..models.security import (
     AnalysisAuth,
@@ -338,7 +339,9 @@ class SecurityRepository(Repository):
             hierarchy_nodes=self._hierarchy_nodes(name),
             grants_everything=name == CATCH_ALL or grants_all,
             assigned_users=self._users_of(name),
-            truncated=truncated,
+            completeness=(
+                bounded("row_cap", scope="ranges", limit=_MAX_RANGES) if truncated else COMPLETE
+            ),
             caveats=caveats,
             provenance=self.provenance("auth_values", {"AUTH": name}),
         )
@@ -403,7 +406,25 @@ class SecurityRepository(Repository):
             auth_relevant_characteristics=relevant,
             uncovered_characteristics=uncovered,
             users_with_any_authorisation=self._distinct_user_count(),
-            truncated=scan_truncated or total > len(summaries),
+            # Two different bounds were being merged into one bool (D6), and they mean opposite
+            # things about the *findings*: a page limit leaves the counts correct and shows fewer
+            # authorisations, while a truncated value scan makes the counts themselves - including
+            # `uncovered_characteristics`, which is the live configuration fault this tool exists to
+            # surface - a lower bound. Reported separately so a caller can tell which it is.
+            completeness=Completeness(
+                bounds=[
+                    *(
+                        [BoundHit(bound="row_cap", scope="value_scan", limit=_MAX_SCAN_ROWS)]
+                        if scan_truncated
+                        else []
+                    ),
+                    *(
+                        [BoundHit(bound="page_limit", scope="authorisations", limit=len(summaries))]
+                        if total > len(summaries)
+                        else []
+                    ),
+                ]
+            ),
             caveats=caveats,
             provenance=self.provenance("auth_values", {}),
         )

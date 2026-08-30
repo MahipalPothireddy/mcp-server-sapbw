@@ -34,6 +34,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .completeness import BoundedResult
 from .findings import Finding, Severity
 
 #: Why a scenario contributed what it did. Only ``assessed`` is evidence about the landscape.
@@ -76,10 +77,8 @@ def grade_for(score: int) -> str:
     return GRADE_BANDS[-1][1]  # pragma: no cover - the last band floors at 0
 
 
-class ScenarioOutcome(BaseModel):
+class ScenarioOutcome(BoundedResult):
     """What one analysis contributed, and why."""
-
-    model_config = ConfigDict(extra="forbid")
 
     scenario: str = Field(min_length=1)
     title: str
@@ -92,7 +91,6 @@ class ScenarioOutcome(BaseModel):
     #: Candidates examined. Zero with ``assessed`` is impossible by construction; zero is what
     #: makes ``nothing_to_assess`` distinguishable from a clean result.
     analyzed_count: int = 0
-    truncated: bool = False
     #: Points this scenario removed from the score, so the total is decomposable per analysis.
     deduction: float = 0.0
 

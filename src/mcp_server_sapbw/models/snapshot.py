@@ -33,6 +33,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .completeness import BoundedResult
 from .objects import BwObjectRef
 
 #: Object families a snapshot can capture. Selectable, because volume differs by two orders of
@@ -165,10 +166,8 @@ class Snapshot(BaseModel):
         return len(self.edges)
 
 
-class SnapshotSummary(BaseModel):
+class SnapshotSummary(BoundedResult):
     """A snapshot's identity without its contents, for listing and for diff headers."""
-
-    model_config = ConfigDict(extra="forbid")
 
     snapshot_id: str
     system: str
@@ -177,7 +176,6 @@ class SnapshotSummary(BaseModel):
     object_count: int = 0
     edge_count: int = 0
     families: list[str] = Field(default_factory=list)
-    truncated: bool = False
 
 
 class FactChange(BaseModel):
@@ -223,7 +221,7 @@ class RekeyedObject(BaseModel):
     matched_on: str
 
 
-class SnapshotDiff(BaseModel):
+class SnapshotDiff(BoundedResult):
     """What differs between two snapshots, and what the comparison could not cover.
 
     ``comparable`` is the field to read first. False means the two sides can report different things
@@ -231,8 +229,6 @@ class SnapshotDiff(BaseModel):
     evidence of a difference. The diff is still returned, restricted to what both sides can see, and
     ``comparability`` says what was excluded and why.
     """
-
-    model_config = ConfigDict(extra="forbid")
 
     left: SnapshotSummary
     right: SnapshotSummary
@@ -257,7 +253,7 @@ class SnapshotDiff(BaseModel):
     changed_by_fact: dict[str, int] = Field(default_factory=dict)
     #: Identity rules applied before comparing, so a caller knows what was made equal on purpose.
     normalisations: list[str] = Field(default_factory=list)
-    truncated: bool = False
+    #: Which bound stopped either side's capture; a diff over a bounded capture cannot
     caveats: list[str] = Field(default_factory=list)
 
     @property

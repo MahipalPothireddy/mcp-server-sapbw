@@ -26,6 +26,7 @@ from ..connectors.base import ConnectorRegistry
 from ..connectors.bi import BiConnector
 from ..connectors.ecc import EccConnector
 from ..models.chains import FrequencyClass, ScheduleMatrixEntry
+from ..models.completeness import COMPLETE, Completeness, bounded
 from ..models.ecc import ExitBranch, ExitInventory
 from ..models.findings import Finding, ScenarioReport, Severity
 from ..models.objects import BwObjectRef, normalise_object_type
@@ -49,6 +50,17 @@ _DS = "RSDS"  # DataSource
 _DSO_TYPES = ("ODSO", "ADSO")
 _DSO_IN = "TARGETTYPE IN ('ODSO', 'ADSO')"
 _DSO_SRC_IN = "SOURCETYPE IN ('ODSO', 'ADSO')"
+
+
+def _capped(hit: bool, *, scope: str, limit: int) -> Completeness:
+    """``Completeness`` for a scenario stopped by the caller's object cap (D6).
+
+    Every analyzer bounds its candidate set the same way, so the bound is named in one place rather
+    than repeated at ten call sites - which is also what stops the ten from drifting apart.
+    """
+    if not hit:
+        return COMPLETE
+    return bounded("row_cap", scope=scope, limit=limit)
 
 
 def _orderable(columns: list[str]) -> list[str]:
@@ -303,7 +315,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES[scenario],
             findings=findings,
             analyzed_count=len(rows[:limit]),
-            truncated=truncated,
+            completeness=_capped(truncated, scope="candidates", limit=limit),
             caveats=caveats,
         )
 
@@ -398,7 +410,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.5"],
             findings=findings,
             analyzed_count=len(merged[:limit]),
-            truncated=truncated,
+            completeness=_capped(truncated, scope="candidates", limit=limit),
             caveats=[
                 "Semantic differences the merge hides (e.g. an order vs. a shipment sharing a key) "
                 "are business-level and must be reviewed by a data modeler; this analyzer surfaces "
@@ -520,7 +532,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.1"],
             findings=findings,
             analyzed_count=evaluated,
-            truncated=truncated,
+            completeness=_capped(truncated, scope="candidates", limit=limit),
             caveats=caveats,
         )
 
@@ -744,7 +756,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.2"],
             findings=findings,
             analyzed_count=len(roots),
-            truncated=len(findings) >= limit,
+            completeness=_capped(len(findings) >= limit, scope="findings", limit=limit),
             caveats=[
                 "The stack is traced through declared DSO->DSO transformations; the calc-view and "
                 "CompositeProvider hops above the top DSO are visible via bw_get_calc_view_lineage "
@@ -869,7 +881,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["unused_providers"],
             findings=findings,
             analyzed_count=len(candidates),
-            truncated=len(findings) >= limit,
+            completeness=_capped(len(findings) >= limit, scope="findings", limit=limit),
             caveats=[
                 "A provider is reported only when it feeds no transformation, has no "
                 "Query-Designer query, and is no CompositeProvider part. These are candidates to "
@@ -1028,7 +1040,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.6"],
             findings=findings,
             analyzed_count=inventory.total_datasources,
-            truncated=inventory.truncated,
+            completeness=inventory.completeness,
             connector_required=inventory.connector_required if reason else None,
             caveats=caveats,
         )
@@ -1368,7 +1380,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.7"],
             findings=findings,
             analyzed_count=len(reports[:limit]),
-            truncated=len(reports) > limit,
+            completeness=_capped(len(reports) > limit, scope="reports", limit=limit),
             caveats=caveats,
         )
 
@@ -1496,7 +1508,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["9.8"],
             findings=findings,
             analyzed_count=len(sources[:limit]),
-            truncated=len(sources) > limit,
+            completeness=_capped(len(sources) > limit, scope="sources", limit=limit),
             caveats=[
                 f"Dashboard side supplied by the {platform} inventory; whether the view is shared "
                 "with BW comes from the generated '0BW:BIA:' provider views in "
@@ -1555,7 +1567,7 @@ class Analyzers(Repository):
             title=SCENARIO_TITLES["layer_violations"],
             findings=findings,
             analyzed_count=len(findings),
-            truncated=len(findings) >= limit,
+            completeness=_capped(len(findings) >= limit, scope="findings", limit=limit),
             caveats=[
                 f"Deep-stack threshold is {max_dso_depth} DSO->DSO hops; adjust via max_dso_depth.",
                 "Circular dependencies are detected at any length, not just pairs: each finding "

@@ -25,6 +25,7 @@ from ..models.assessment import (
     grade_for,
 )
 from ..models.capability import CapabilityRecord
+from ..models.completeness import COMPLETE
 from ..models.findings import Finding, ScenarioReport, Severity, severity_rank
 from ..models.provenance import UnsupportedResult
 from .analyzers import SCENARIO_TITLES, Analyzers
@@ -155,7 +156,9 @@ class AssessmentService:
             finding_count=result.finding_count if result else 0,
             by_severity=counts,
             analyzed_count=result.analyzed_count if result else 0,
-            truncated=bool(result.truncated) if result else False,
+            # Forwarded whole, so a scenario's bound survives the roll-up. A score computed over
+            # bounded analyses is an upper bound, which only stays visible if the bound does (D6).
+            completeness=(result.completeness if result else COMPLETE),
             deduction=round(deduction, 2),
         )
 

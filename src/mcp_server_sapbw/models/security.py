@@ -37,6 +37,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .completeness import BoundedResult
 from .provenance import Provenance
 
 #: How a range's bounds are interpreted (RSECVAL SIGN / OPTION, decoded).
@@ -107,15 +108,13 @@ class AnalysisAuthSummary(BaseModel):
     provenance: Provenance | list[Provenance]
 
 
-class AnalysisAuth(BaseModel):
+class AnalysisAuth(BoundedResult):
     """One analysis authorisation in full, including its value ranges.
 
     Only ``bw_get_analysis_auth`` returns this. ``contains_data_values`` is always true and
     stated explicitly, so a caller (or an audit of a transcript) can see that this payload
     carried permission data rather than structure.
     """
-
-    model_config = ConfigDict(extra="forbid")
 
     name: str
     description: str | None = None
@@ -125,7 +124,6 @@ class AnalysisAuth(BaseModel):
     grants_everything: bool = False
     assigned_users: list[str] = Field(default_factory=list)
     contains_data_values: Literal[True] = True
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 
@@ -147,10 +145,8 @@ class AuthRelevantCharacteristic(BaseModel):
     provenance: Provenance | list[Provenance]
 
 
-class SecurityOverview(BaseModel):
+class SecurityOverview(BoundedResult):
     """The landscape's row-level security posture, without any concrete permission values."""
-
-    model_config = ConfigDict(extra="forbid")
 
     authorisation_count: int = 0
     generated_count: int = 0
@@ -160,7 +156,6 @@ class SecurityOverview(BaseModel):
     auth_relevant_characteristics: list[AuthRelevantCharacteristic] = Field(default_factory=list)
     uncovered_characteristics: list[str] = Field(default_factory=list)
     users_with_any_authorisation: int | None = None
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 

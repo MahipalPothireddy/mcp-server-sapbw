@@ -19,6 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .completeness import BoundedResult
 from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
@@ -70,7 +71,7 @@ class BwProviderView(BaseModel):
     provenance: Provenance
 
 
-class CalcViewLineage(BaseModel):
+class CalcViewLineage(BoundedResult):
     """A calc view's direct base tables and the BW providers that consume it.
 
     ``consuming_bw_providers`` is the BW side of the boundary: the InfoProviders whose generated
@@ -78,14 +79,11 @@ class CalcViewLineage(BaseModel):
     calc-view -> CompositeProvider hop, which BW's own where-used lists do not report.
     """
 
-    model_config = ConfigDict(extra="forbid")
-
     view_name: str
     schema_name: str = "_SYS_BIC"
     base_tables: list[BaseTableRef] = Field(default_factory=list)
     resolved_bw_objects: list[str] = Field(default_factory=list)
     consuming_bw_providers: list[BwProviderView] = Field(default_factory=list)
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 
@@ -229,7 +227,7 @@ class CalcViewSemanticColumn(BaseModel):
     formula: str | None = None
 
 
-class CalcViewDefinition(BaseModel):
+class CalcViewDefinition(BoundedResult):
     """What a calculation view actually does, read from its activated definition.
 
     ``parsed`` is the field to read first. False means the logic could not be read and
@@ -270,20 +268,16 @@ class CalcViewDefinition(BaseModel):
     node_counts: dict[str, int] = Field(default_factory=dict)
     #: Elements inside the semantic layer this grammar does not cover: a gap, not an absence.
     unrecognised_elements: list[str] = Field(default_factory=list)
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
     evidence: Evidence | None = None
     provenance: Provenance | list[Provenance]
 
 
-class HanaCrossingReport(BaseModel):
+class HanaCrossingReport(BoundedResult):
     """The bidirectional BW<->HANA crossing table for a scope."""
-
-    model_config = ConfigDict(extra="forbid")
 
     crossings: list[HanaCrossing] = Field(default_factory=list)
     total_count: int = 0
     hana_reads_bw_count: int = 0
     bw_reads_hana_count: int = 0
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)

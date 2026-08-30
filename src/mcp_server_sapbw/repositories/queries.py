@@ -17,6 +17,7 @@ from typing import Any
 
 from ..core.dialect import quote_ident
 from ..models.aggregation import AggregationRule, ExceptionAggregation
+from ..models.completeness import COMPLETE, bounded
 from ..models.provenance import UnsupportedResult
 from ..models.queries import (
     ElementProperties,
@@ -336,7 +337,14 @@ class QueriesRepository(Repository):
             elements=elements,
             edges=edges,
             variables=variables,
-            truncated=truncated,
+            # Names the bound rather than only flagging it (D6). A capped element tree matters
+            # beyond this response: field-level lineage walks these elements, so an incomplete tree
+            # produces incomplete lineage that would otherwise look whole.
+            completeness=(
+                bounded("row_cap", scope="element_tree", limit=_MAX_ELEMENTS)
+                if truncated
+                else COMPLETE
+            ),
             caveats=[
                 *(["element tree capped"] if truncated else []),
                 *self._aggregation_caveats(elements),

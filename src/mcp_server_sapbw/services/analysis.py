@@ -44,6 +44,7 @@ from ..models.analysis import (
 )
 from ..models.capability import CapabilityRecord, ValidationStatus
 from ..models.chains import Chain, ChainRuntimes, LoadClosure
+from ..models.completeness import BoundHit, Completeness
 from ..models.ecc import ConnectorUnavailable
 from ..models.evidence import Evidence, EvidenceSummary, summarise
 from ..models.findings import Finding, Severity
@@ -509,10 +510,7 @@ class _Run:
         """The allowance and the spend, reported on success as well as on exhaustion."""
         budget = current_budget()
         if budget is None:
-            return AnalysisBudget(
-                measured=False,
-                truncated=self.budget_exhausted or self._any_truncated(),
-            )
+            return AnalysisBudget(measured=False, completeness=self._budget_completeness())
         snapshot = budget.snapshot()
         used = (
             max(budget.queries - self.queries_at_start, 0)
@@ -524,8 +522,25 @@ class _Run:
             queries_used=used,
             time_limit_ms=int(float(snapshot["max_seconds"]) * 1000) or None,
             time_used_ms=int((time.monotonic() - self.started_at) * 1000),
-            truncated=self.budget_exhausted or self._any_truncated(),
+            completeness=self._budget_completeness(),
             measured=True,
+        )
+
+    def _budget_completeness(self) -> Completeness:
+        """Which of the two causes stopped the analysis short.
+
+        The bool merged them, and they need opposite responses: a per-call budget stop is fixed by
+        raising the allowance, a section's own row cap by narrowing the request. Both can hold (D6).
+        """
+        return Completeness(
+            bounds=[
+                *([BoundHit(bound="query_budget")] if self.budget_exhausted else []),
+                *(
+                    [BoundHit(bound="row_cap", scope="analysis_sections")]
+                    if self._any_truncated()
+                    else []
+                ),
+            ]
         )
 
     def _any_truncated(self) -> bool:

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..models.completeness import BoundHit, Completeness
 from ..models.provenance import UnsupportedResult
 from ..models.register import RoutineRegister, RoutineRegisterEntry
 from ..models.transformations import RoutineKind
@@ -125,7 +126,24 @@ class RoutineRegisterService(Repository):
             anti_pattern_totals=dict(sorted(totals.items())),
             limit=limit,
             offset=offset,
-            truncated=offset + limit < len(entries),
+            # Two bounds, and the second one the old bool could not express at all (D6). Paging is
+            # benign - the totals stay exact. The parse budget is not: entries beyond it carry
+            # `analyzed=false`, so their pattern counts are *unknown* rather than zero, and a caller
+            # ranking by anti-patterns is ranking a partially analysed portfolio.
+            completeness=Completeness(
+                bounds=[
+                    *(
+                        [BoundHit(bound="page_limit", scope="entries", limit=limit)]
+                        if offset + limit < len(entries)
+                        else []
+                    ),
+                    *(
+                        [BoundHit(bound="parse_budget", scope="anti_patterns", limit=budget)]
+                        if len(analyses) < len(known)
+                        else []
+                    ),
+                ]
+            ),
             caveats=self._caveats(len(known), len(analyses), orphaned),
         )
 

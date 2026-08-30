@@ -17,6 +17,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .aggregation import AggregationRule, ExceptionAggregation
+from .completeness import BoundedResult
 from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
@@ -276,10 +277,8 @@ class QueryVariable(BaseModel):
     provenance: Provenance
 
 
-class Query(BaseModel):
+class Query(BoundedResult):
     """A BEx query definition: header, element tree, restrictions, and variables."""
-
-    model_config = ConfigDict(extra="forbid")
 
     compuid: str
     compid: str | None = None  # technical name (RSZCOMPDIR.COMPID)
@@ -293,7 +292,6 @@ class Query(BaseModel):
     elements: list[QueryElement] = Field(default_factory=list)
     edges: list[QueryElementEdge] = Field(default_factory=list)
     variables: list[QueryVariable] = Field(default_factory=list)
-    truncated: bool = False
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]
 

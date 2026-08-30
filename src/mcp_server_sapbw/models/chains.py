@@ -13,6 +13,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .completeness import Completeness, bounded
 from .evidence import Evidence, evidence_for
 from .provenance import Provenance
 
@@ -85,7 +86,17 @@ class Chain(BaseModel):
     subchain_ids: list[str] = Field(default_factory=list)
     subchains: list[Chain] = Field(default_factory=list)  # resolved recursively (cycle-guarded)
     truncated_recursion: bool = False  # True if a cycle or max depth stopped resolution
+    #: Which bound stopped nesting, where the flag said only that one did (D6).
+    completeness: Completeness = Field(default_factory=Completeness)
     provenance: Provenance | list[Provenance]
+
+    @model_validator(mode="after")
+    def _reconcile_recursion_bound(self) -> Chain:
+        if not self.completeness.is_complete:
+            self.truncated_recursion = True
+        elif self.truncated_recursion:
+            self.completeness = bounded("recursion_limit", scope="subchains")
+        return self
 
 
 class DurationStats(BaseModel):
@@ -224,7 +235,18 @@ class LoadClosure(BaseModel):
     subchains_walked: list[str] = Field(default_factory=list)
     step_categories: dict[str, int] = Field(default_factory=dict)
     truncated_recursion: bool = False
+    #: Which bound stopped the walk, where ``truncated_recursion`` said only that one did (D6).
+    #: Reconciled with it below, so the two cannot disagree.
+    completeness: Completeness = Field(default_factory=Completeness)
     caveats: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _reconcile_recursion_bound(self) -> LoadClosure:
+        if not self.completeness.is_complete:
+            self.truncated_recursion = True
+        elif self.truncated_recursion:
+            self.completeness = bounded("recursion_limit", scope="subchains")
+        return self
 
 
 class ScheduleMatrixEntry(BaseModel):

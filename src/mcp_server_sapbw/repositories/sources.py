@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from ..models.completeness import COMPLETE, bounded
 from ..models.provenance import UnsupportedResult
 from ..models.sources import (
     DataSourceEnhancement,
@@ -246,7 +247,11 @@ class SourcesRepository(Repository):
             enhanced=enhanced,
             enhanced_count=len(ordered),
             total_datasources=total,
-            truncated=truncated,
+            completeness=(
+                bounded("row_cap", scope="enhanced_datasources", limit=limit)
+                if truncated
+                else COMPLETE
+            ),
             connector_required="ECC",
             caveats=caveats,
         )

@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 from ..core.contract import contract_revision
+from ..models.completeness import COMPLETE, BoundHit, Completeness
 from ..models.objects import BwObjectRef, BwObjectType, normalise_object_type
 from ..models.provenance import UnsupportedResult
 from ..models.providers import classify_cube_type
@@ -442,7 +443,24 @@ def summarise(snapshot: Snapshot) -> SnapshotSummary:
         object_count=snapshot.object_count,
         edge_count=snapshot.edge_count,
         families=list(snapshot.scope.families),
-        truncated=snapshot.scope.truncated,
+        completeness=_scope_completeness(snapshot.scope),
+    )
+
+
+def _scope_completeness(scope: Any) -> Completeness:
+    """Which families hit the row cap during capture.
+
+    Naming them matters more here than anywhere else: a later diff reads an object missing from a
+    bounded capture as *deleted*. The families are listed so a reader can see whether the difference
+    they are looking at is inside one of them (D6).
+    """
+    if not scope.truncated_families:
+        return COMPLETE
+    return Completeness(
+        bounds=[
+            BoundHit(bound="row_cap", scope=family, limit=scope.row_cap)
+            for family in sorted(scope.truncated_families)
+        ]
     )
 
 
@@ -562,7 +580,12 @@ def compare(left: Snapshot, right: Snapshot) -> SnapshotDiff:
         },
         changed_by_fact=_changed_by_fact(changed),
         normalisations=[_LOGICAL_SYSTEM_NOTE, _VOLATILE_NOTE],
-        truncated=left.scope.truncated or right.scope.truncated,
+        completeness=Completeness(
+            bounds=[
+                *_scope_completeness(left.scope).bounds,
+                *_scope_completeness(right.scope).bounds,
+            ]
+        ),
         caveats=caveats,
     )
 
