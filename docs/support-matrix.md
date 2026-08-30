@@ -29,9 +29,9 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 
 | Release | verified | expected | unverified | needs_connector | unknown |
 |---|---|---|---|---|---|
-| `BW 7.40` | 0 | 0 | 58 | 2 | 0 |
-| `BW 7.50` | 42 | 16 | 0 | 2 | 0 |
-| `BW/4HANA 2.0` | 0 | 0 | 58 | 2 | 0 |
+| `BW 7.40` | 0 | 0 | 59 | 2 | 0 |
+| `BW 7.50` | 43 | 16 | 0 | 2 | 0 |
+| `BW/4HANA 2.0` | 0 | 0 | 59 | 2 | 0 |
 
 ## Per tool
 
@@ -59,6 +59,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_generate_docs` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_edges`, `chain_text`, `dso_field`, `dso_header`, `dso_text`, `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `hana_views`, `log_chain`, `object_dependencies`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_field`, `transformation_rule`, `transformation_step_rout`, `transformation_text` |
 | `bw_get_analysis_auth` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_calc_view_lineage` | `unverified` | `verified` | `unverified` | `integration_tested` | `object_dependencies` |
+| `bw_get_calc_view_logic` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_chain` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_edges`, `chain_text` |
 | `bw_get_chain_runtimes` | `unverified` | `verified` | `unverified` | `integration_tested` | `log_chain` |
 | `bw_get_extractor_exit_code` | `needs_connector` | `needs_connector` | `needs_connector` | `not_validated` | - |

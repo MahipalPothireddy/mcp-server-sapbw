@@ -83,7 +83,7 @@ class DenyingConnection:
         if "FROM SYS.VIEWS" in sql:
             return [(n,) for n in (parameters or []) if str(n) in HANA_PRESENT]
         if "_SYS_REPO" in sql and "ACTIVE_OBJECT" in sql:
-            return [("_SYS_REPO",)]
+            return [("ACTIVE_OBJECT",)]
         if "MIN(DATUM)" in sql:
             return [("20240101",)]
         if "DD02L" in sql and "LIKE" in sql:

@@ -22,7 +22,7 @@ MCP is currently the only *interactive* interface, and the one this repository i
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **60 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **61 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -293,7 +293,7 @@ Denial and absence are now recorded separately, and `bw_access_report` names the
 `bw_support_matrix` is keyed by **tool**, because that is the unit the question is asked in. Its
 `requires` field bridges to the capability contract and is **measured**, by attributing each metadata
 read to the tool that caused it while the offline suite runs — so it cannot drift the way a
-hand-written mapping across 60 tools would. It is a lower bound: everything listed really is read,
+hand-written mapping across 61 tools would. It is a lower bound: everything listed really is read,
 and a code path no test reaches contributes nothing.
 
 There is deliberately no `supported` verdict. Every value says where the claim comes from:
@@ -580,6 +580,7 @@ empty, and an empty list costs no requests.
 |---|---|---|
 | `bw_list_calc_views` | `system`, `bw_consuming_only=false`, `limit`, `offset` | Calc views (`_SYS_BIC`), optionally only those reading BW tables |
 | `bw_get_calc_view_lineage` | `system`, `view_name` | A calc view's direct base tables (resolved to BW objects, advisory) **and the InfoProviders consuming it** |
+| `bw_get_calc_view_logic` | `system`, `view_name` | What a calc view **does**: nodes, join types and join columns, filters, calculated columns **with their formulas**, input parameters, per-measure aggregation |
 | `bw_get_hana_crossings` | `system`, `calc_view?`, `limit`, `offset` | Every BW↔HANA boundary crossing, both directions, each with how its BW side resolved |
 
 The BW side of a crossing is either a `/BIC/` table (resolved by naming convention, advisory) or a

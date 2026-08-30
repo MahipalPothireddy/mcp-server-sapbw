@@ -203,7 +203,7 @@
       "tool": "bw_capability_report",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
-      "fixture_payload_bytes": 35444,
+      "fixture_payload_bytes": 35772,
       "payload_measurement": "measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
@@ -419,6 +419,24 @@
       "growth": "per_object",
       "growth_basis": "Proportional to the one object named - its fields, rules, elements or run history - not to how many such objects exist.",
       "fixture_payload_bytes": 390,
+      "payload_measurement": "measured",
+      "fixture_statements": null,
+      "statements_measurement": "not_measured",
+      "bounds": [
+        {
+          "bound": "5000 statements / 300s per call",
+          "constant": "core.budget.DEFAULT_MAX_QUERIES / DEFAULT_MAX_SECONDS",
+          "on_hit": "BudgetResult naming what was spent and where it stopped"
+        }
+      ],
+      "shaped": false,
+      "notes": []
+    },
+    {
+      "tool": "bw_get_calc_view_logic",
+      "growth": "per_object",
+      "growth_basis": "Proportional to the one object named - its fields, rules, elements or run history - not to how many such objects exist.",
+      "fixture_payload_bytes": 425,
       "payload_measurement": "measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
@@ -1205,7 +1223,7 @@
       "tool": "bw_support_matrix",
       "growth": "constant",
       "growth_basis": "Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one.",
-      "fixture_payload_bytes": 22217,
+      "fixture_payload_bytes": 22566,
       "payload_measurement": "measured",
       "fixture_statements": null,
       "statements_measurement": "not_measured",
@@ -1297,7 +1315,7 @@
   "totals": {
     "constant": 9,
     "per_graph_node": 7,
-    "per_object": 17,
+    "per_object": 18,
     "per_system": 15,
     "per_page": 12
   },

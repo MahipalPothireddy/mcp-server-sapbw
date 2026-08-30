@@ -180,6 +180,9 @@ _PER_OBJECT = (
     "bw_get_query_auth_exposure",
     "bw_get_analysis_auth",
     "bw_get_calc_view_lineage",
+    # Two bounded reads of one repository row - the size, then the definition - plus a local parse.
+    # Cost follows the one view named, and the definition size is bounded before it is fetched.
+    "bw_get_calc_view_logic",
     "bw_get_provider_health",
     "bw_get_transfer_rules",
     "bw_get_load_closure",

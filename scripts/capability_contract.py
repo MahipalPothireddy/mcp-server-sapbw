@@ -49,6 +49,7 @@ from mcp_server_sapbw.core.capabilities import (  # noqa: E402
     ABAP_TABLES,
     DISCOVER_PATTERNS,
     HANA_VIEWS,
+    REPO_TABLES,
 )
 
 # Implementation states. A capability is never simply "declared"; it is one of these.
@@ -168,6 +169,10 @@ LIVE_VERIFIED: frozenset[str] = frozenset(
         # HANA boundary
         "object_dependencies",
         "hana_views",
+        # Calc-view logic: read through bw_get_calc_view_logic against the reference production
+        # system, four modelled views parsed and their joins, formulas, filters and aggregation
+        # inspected, plus a 323 MB BW-generated definition correctly refused by its measured size.
+        "calc_view_definition",
         # BW 3.x dataflow
         "transfer_structure",
         "transfer_rule",
@@ -355,6 +360,7 @@ def _declared() -> dict[str, str]:
     declared: dict[str, str] = {}
     declared.update(ABAP_TABLES)
     declared.update(HANA_VIEWS)
+    declared.update(REPO_TABLES)
     declared.update(DISCOVER_PATTERNS)
     return declared
 

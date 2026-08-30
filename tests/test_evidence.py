@@ -139,6 +139,8 @@ _CALL_SITE_COVERED: dict[str, tuple[str, ...]] = {
     # from calc_view_consumer='query' - that one notices a generated view touching a table, this one
     # reads BW's own assignment - and the two are not interchangeable (D12).
     "declared_query_provider": ("rszcompic",),
+    # repositories/hana.py: the logic inside a calculation view, read from its activated definition.
+    "calc_view_definition": ("activated_repository",),
 }
 
 

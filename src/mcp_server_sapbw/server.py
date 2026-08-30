@@ -73,7 +73,12 @@ from .models.errors import (
     from_exception,
 )
 from .models.findings import ScenarioReport
-from .models.hana import CalcView, CalcViewLineage, HanaCrossingReport
+from .models.hana import (
+    CalcView,
+    CalcViewDefinition,
+    CalcViewLineage,
+    HanaCrossingReport,
+)
 from .models.health import ProviderHealth
 from .models.lineage import ImpactAnalysis, LineageDirection, LineageGraph, TraceToSource
 from .models.performance import PerformanceProfile
@@ -1797,6 +1802,31 @@ def bw_get_calc_view_lineage(system: str, view_name: str) -> CalcViewLineage | U
     calc-view -> CompositeProvider hop that BW's own where-used lists omit.
     """
     return runtime().hana(system).get_calc_view_lineage(view_name)
+
+
+@_readonly_tool
+def bw_get_calc_view_logic(system: str, view_name: str) -> CalcViewDefinition | UnsupportedResult:
+    """What a calculation view *does*, read from its activated definition.
+
+    ``bw_get_calc_view_lineage`` says which tables a view reads and who consumes it; this says what
+    it does with them: every node (projection / join / aggregation / union), each join's type,
+    cardinality and join columns, filter expressions, calculated columns **with their formulas**,
+    input parameters, and per-measure aggregation. That is the layer where a calculation can live
+    outside BW entirely - a figure computed in the view rather than in a transformation is invisible
+    to BW's own where-used lists, and a view change alters a DSO's content on the next load with no
+    BW warning.
+
+    Read ``parsed`` first. False means the logic could not be read and ``unparsed_reason`` says
+    which case it is: no activated definition exists (normal for a BW-generated runtime view), the
+    definition is above the size bound, or its shape is not one this parser recognises. An
+    unreadable definition is never reported as a view without logic.
+
+    ``view_name`` is the ``_SYS_BIC`` name, ``<PACKAGE_ID>/<OBJECT_NAME>``; an internal node path
+    resolves to the same activated object. Definitions this server will not fetch are named with
+    their measured size rather than silently skipped, because BW-generated definitions reach
+    hundreds of megabytes and fetching one would cost the caller more than the answer is worth.
+    """
+    return runtime().hana(system).get_calc_view_definition(view_name)
 
 
 @_readonly_tool

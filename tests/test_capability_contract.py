@@ -17,7 +17,12 @@ from pathlib import Path
 
 import pytest
 
-from mcp_server_sapbw.core.capabilities import ABAP_TABLES, DISCOVER_PATTERNS, HANA_VIEWS
+from mcp_server_sapbw.core.capabilities import (
+    ABAP_TABLES,
+    DISCOVER_PATTERNS,
+    HANA_VIEWS,
+    REPO_TABLES,
+)
 from mcp_server_sapbw.core.contract import contract, contract_revision
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -40,7 +45,7 @@ _HEADING = re.compile(r"^## ([A-Z_]+) \((\d+)\)$")
 
 
 def _declared() -> dict[str, str]:
-    return {**ABAP_TABLES, **HANA_VIEWS, **DISCOVER_PATTERNS}
+    return {**ABAP_TABLES, **HANA_VIEWS, **REPO_TABLES, **DISCOVER_PATTERNS}
 
 
 @pytest.fixture(scope="module")

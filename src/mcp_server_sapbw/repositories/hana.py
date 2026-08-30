@@ -21,18 +21,27 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from ..core.dialect import quote_ident
+from ..models.evidence import evidence_for
 from ..models.hana import (
     BaseTableRef,
     BwProviderView,
     CalcView,
+    CalcViewCalculatedColumn,
+    CalcViewColumnMapping,
+    CalcViewDataSourceRef,
+    CalcViewDefinition,
     CalcViewLineage,
+    CalcViewNode,
+    CalcViewParameter,
+    CalcViewSemanticColumn,
     CalcViewType,
     CrossingDirection,
     HanaCrossing,
     HanaCrossingReport,
 )
-from ..models.provenance import UnsupportedResult
+from ..models.provenance import Provenance, UnsupportedResult
 from ..models.providers import classify_cube_type
+from ..services.calcview_parser import CalcViewParseError, parse_calc_view
 from ..services.routine_parser import _resolve_bw_table
 from .base import Repository
 
@@ -52,6 +61,20 @@ _MAX_PROVIDER_CONSUMERS = 200  # BW provider views resolved per calc-view lineag
 
 # BW-generated per-InfoProvider HANA view: '0BW:BIA:<PROVIDER>' plus optional ':node' / '.node'.
 _BW_VIEW_PREFIX = "0BW:BIA:"
+
+# Repository packages BW generates into. A view under one of these was produced by BW's own
+# generation rather than modelled by a person.
+_BW_REPO_PACKAGE_PREFIX = "system-local.bw"
+
+# Largest activated definition this server will fetch and parse, in characters.
+#
+# Measured on the reference production system (589 activated calculation views): every *modelled*
+# view fits in 630 KB, while BW-*generated* definitions average 4.7 MB and reach 323 MB. Fetching a
+# 323 MB CLOB to answer a question about modelling logic would be a denial of service against the
+# caller, and the answer would be BW's own generated projection rather than anything a person wrote.
+# So the bound sits an order of magnitude above every modelled view and refuses the outliers by
+# reporting their measured size, which is a fact rather than a failure.
+_MAX_DEFINITION_CHARS = 4_000_000
 # Provider header tables probed to confirm a parsed provider name, most specific first.
 # (logical table, id column, kind) — 'cube_header' is refined by CUBETYPE.
 _PROVIDER_SOURCES: tuple[tuple[str, str, str], ...] = (
@@ -72,6 +95,23 @@ def _clean(value: Any) -> str | None:
 def _is_bw_generated(name: str) -> bool:
     upper = name.upper()
     return upper.startswith(("/BIC/", "/BI0/"))
+
+
+def _split_repo_name(view_name: str) -> tuple[str | None, str | None]:
+    """A ``_SYS_BIC`` view name split into its repository package and object.
+
+    Measured on the reference system: the runtime name is ``<PACKAGE_ID>/<OBJECT_NAME>``, and an
+    internal node of the same design-time object appends further segments
+    (``PKG.SUB/CV_A01/dp/Projection_1``). Package ids contain dots but never slashes, so the
+    first slash is the boundary, and everything after the second segment is an internal node path
+    pointing at the same activated definition.
+    """
+    cleaned = view_name.strip()
+    if "/" not in cleaned:
+        return None, None
+    package, _, rest = cleaned.partition("/")
+    object_name = rest.partition("/")[0]
+    return (package.strip() or None), (object_name.strip() or None)
 
 
 def _bw_view_provider(name: str) -> str | None:
@@ -222,6 +262,246 @@ class HanaRepository(Repository):
                 {"DEPENDENT_SCHEMA_NAME": _CALC_SCHEMA, "DEPENDENT_OBJECT_NAME": view_name},
             ),
         )
+
+    # --- calc-view logic (the activated definition) ---------------------------------------
+
+    def get_calc_view_definition(self, view_name: str) -> CalcViewDefinition | UnsupportedResult:
+        """What a calc view *does*: joins, filters, calculated columns, parameters, aggregation.
+
+        Cached like the other structural extracts, and only when something was actually read - a
+        view activated after a failed lookup must not stay cached as unreadable.
+        """
+        unsupported = self.require("calc_view_definition")
+        if unsupported is not None:
+            return unsupported
+        return self.cached_model(
+            "calc_view_logic",
+            view_name,
+            model=CalcViewDefinition,
+            build=lambda: self._calc_view_definition_uncached(view_name),
+            cache_when=lambda definition: definition.parsed,
+        )
+
+    def _calc_view_definition_uncached(self, view_name: str) -> CalcViewDefinition:
+        package_id, object_name = _split_repo_name(view_name)
+        provenance = self.provenance(
+            "calc_view_definition",
+            {"PACKAGE_ID": package_id or "", "OBJECT_NAME": object_name or ""},
+        )
+        base = CalcViewDefinition(
+            view_name=view_name,
+            package_id=package_id,
+            object_name=object_name,
+            is_bw_generated=bool(package_id and package_id.startswith(_BW_REPO_PACKAGE_PREFIX)),
+            provenance=provenance,
+        )
+        if package_id is None or object_name is None:
+            base.unparsed_reason = (
+                f"{view_name!r} does not decompose into a repository package and object name "
+                "(expected '<PACKAGE_ID>/<OBJECT_NAME>'), so no activated definition can be located"
+            )
+            return base
+
+        header = self._definition_header(package_id, object_name)
+        if header is None:
+            base.unparsed_reason = (
+                "no activated definition exists for this view in the repository. A BW-generated "
+                "runtime view can exist in _SYS_BIC without repository content; use "
+                "bw_get_calc_view_lineage for its base tables and consumers."
+            )
+            return base
+        suffix, size, changed_at, changed_by = header
+        base.definition_bytes = size
+        base.changed_at = base.changed_at or changed_at
+        if size > _MAX_DEFINITION_CHARS:
+            base.unparsed_reason = (
+                f"the activated definition is {size:,} characters, above the "
+                f"{_MAX_DEFINITION_CHARS:,} bound this server fetches. It was not read, so nothing "
+                "here is a statement about its logic. Definitions this large are BW-generated "
+                "rather than modelled; "
+                "bw_get_calc_view_lineage reports their base tables and consumers without the CLOB."
+            )
+            base.caveats.append(f"definition not read: {size:,} characters exceeds the bound")
+            return base
+
+        definition = self._definition_body(package_id, object_name, suffix)
+        if definition is None:
+            base.unparsed_reason = "the activated definition could not be fetched"
+            return base
+        try:
+            parsed = parse_calc_view(definition)
+        except CalcViewParseError as exc:
+            base.unparsed_reason = exc.reason
+            return base
+        return self._to_definition(base, parsed, changed_by=changed_by)
+
+    def _definition_header(
+        self, package_id: str, object_name: str
+    ) -> tuple[str, int, str | None, str | None] | None:
+        """``(suffix, size, changed_at, changed_by)`` without fetching the CLOB.
+
+        The size is read first, deliberately and always: it is what decides whether the definition
+        can be fetched at all, and asking afterwards would mean the CLOB had already crossed the
+        wire. ``attributeview`` is accepted alongside ``calculationview`` because the reference
+        system carries 407 of them and they are the same kind of modelling artefact.
+        """
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["OBJECT_SUFFIX", "LENGTH(CDATA)", "ACTIVATED_AT", "ACTIVATED_BY"],
+                from_logical="calc_view_definition",
+                where=[
+                    "PACKAGE_ID = ?",
+                    "OBJECT_NAME = ?",
+                    "OBJECT_SUFFIX IN ('calculationview', 'attributeview')",
+                ],
+                params=[package_id, object_name],
+                order_by=["OBJECT_SUFFIX"],
+            )
+        )
+        if not rows:
+            return None
+        suffix, size, activated_at, activated_by = rows[0]
+        return (
+            str(suffix).strip(),
+            int(size) if size is not None else 0,
+            _clean(activated_at),
+            _clean(activated_by),
+        )
+
+    def _definition_body(self, package_id: str, object_name: str, suffix: str) -> str | None:
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["CDATA"],
+                from_logical="calc_view_definition",
+                where=["PACKAGE_ID = ?", "OBJECT_NAME = ?", "OBJECT_SUFFIX = ?"],
+                params=[package_id, object_name, suffix],
+            )
+        )
+        if not rows or rows[0][0] is None:
+            return None
+        return str(rows[0][0])
+
+    def _to_definition(
+        self, base: CalcViewDefinition, parsed: Any, *, changed_by: str | None
+    ) -> CalcViewDefinition:
+        root = parsed.root
+        base.description = root.get("description")
+        base.changed_at = root.get("changed_at") or base.changed_at
+        base.data_category = root.get("data_category")
+        base.output_view_type = root.get("output_view_type")
+        base.schema_version = root.get("schema_version")
+        base.scenario_type = root.get("scenario_type")
+        base.final_node = root.get("final_node")
+        base.applies_analytic_privilege = bool(root.get("checks_privileges"))
+        base.parsed = True
+
+        for source in parsed.data_sources:
+            table = source.get("column_object") or ""
+            is_bw = _is_bw_generated(table)
+            obj, kind, _confidence = _resolve_bw_table(table) if is_bw else (None, None, None)
+            base.data_sources.append(
+                CalcViewDataSourceRef(
+                    id=source["id"],
+                    source_type=source.get("source_type"),
+                    schema_name=source.get("schema_name"),
+                    column_object=source.get("column_object"),
+                    resource_uri=source.get("resource_uri"),
+                    resolved_object=obj,
+                    resolved_kind=kind,
+                    provenance=base.provenance
+                    if isinstance(base.provenance, Provenance)
+                    else base.provenance[0],
+                )
+            )
+
+        counts: dict[str, int] = {}
+        for node in parsed.nodes:
+            counts[node["node_type"]] = counts.get(node["node_type"], 0) + 1
+            base.nodes.append(
+                CalcViewNode(
+                    id=node["id"],
+                    node_type=node["node_type"],
+                    raw_type=node.get("raw_type"),
+                    join_type=node.get("join_type"),
+                    cardinality=node.get("cardinality"),
+                    join_order=node.get("join_order"),
+                    join_attributes=list(node.get("join_attributes") or []),
+                    inputs=list(node.get("inputs") or []),
+                    mappings=[
+                        CalcViewColumnMapping(
+                            target=m["target"],
+                            source=m.get("source"),
+                            value=m.get("value"),
+                            kind=m.get("kind"),
+                            from_node=m.get("from_node"),
+                        )
+                        for m in node.get("mappings") or []
+                    ],
+                    filter_expression=node.get("filter"),
+                )
+            )
+        base.node_counts = dict(sorted(counts.items()))
+
+        base.calculated_columns = [
+            CalcViewCalculatedColumn(
+                name=column["name"],
+                formula=column.get("formula"),
+                datatype=column.get("datatype"),
+                length=column.get("length"),
+                expression_language=column.get("expression_language"),
+                node=column.get("node"),
+            )
+            for column in parsed.calculated_columns
+        ]
+        base.semantic_columns = [
+            CalcViewSemanticColumn(
+                name=column["name"],
+                role=column["role"],
+                description=column.get("description"),
+                aggregation=column.get("aggregation"),
+                measure_type=column.get("measure_type"),
+                is_key=bool(column.get("is_key")),
+                calculated=bool(column.get("calculated")),
+                origin_node=column.get("origin_node"),
+                origin_column=column.get("origin_column"),
+                formula=column.get("formula"),
+            )
+            for column in parsed.attributes
+        ]
+        base.input_parameters = [
+            CalcViewParameter(
+                name=parameter["name"],
+                is_input_parameter=bool(parameter.get("is_input_parameter")),
+                description=parameter.get("description"),
+                datatype=parameter.get("datatype"),
+                length=parameter.get("length"),
+                mandatory=parameter.get("mandatory"),
+                selection_type=parameter.get("selection_type"),
+            )
+            for parameter in parsed.parameters
+        ]
+        base.filters = list(parsed.filters)
+        base.unrecognised_elements = list(parsed.unrecognised_elements)
+        base.truncated = bool(parsed.truncated)
+
+        base.evidence = evidence_for("calc_view_definition", "activated_repository")
+        base.caveats.append(
+            "read from the activated definition in _SYS_REPO, which is what the modeller saved. An "
+            "inactive change is not visible here, and the runtime view in _SYS_BIC is what queries "
+            "actually execute."
+        )
+        if any(source.resolved_object for source in base.data_sources):
+            base.caveats.append(
+                "/BIC/ and /BI0/ data sources are resolved to BW objects by naming convention "
+                "(advisory), the same reading bw_get_calc_view_lineage uses"
+            )
+        if base.truncated:
+            base.caveats.append(
+                "the definition is larger than the per-section bounds; see truncated"
+            )
+        if changed_by:
+            base.caveats.append(f"last activated by {changed_by}")
+        return base
 
     # --- crossings -----------------------------------------------------------------------
 

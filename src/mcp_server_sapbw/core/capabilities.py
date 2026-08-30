@@ -174,6 +174,20 @@ HANA_VIEWS: dict[str, str] = {
     "cs_tables": "M_CS_TABLES",
 }
 
+#: HANA schema holding activated design-time repository content.
+REPO_SCHEMA = "_SYS_REPO"
+
+#: Design-time repository objects. These need a probe of their own rather than an entry in
+#: :data:`HANA_VIEWS`, and the reason is not cosmetic: the HANA probe reads ``SYS.VIEWS`` filtered
+#: to ``SCHEMA_NAME='SYS'``, so a *table* in ``_SYS_REPO`` is invisible there and gets recorded
+#: absent on every system - then resolved as ``SYS.ACTIVE_OBJECT`` if forced present, because
+#: the dialect builds its reference from the recorded schema.
+REPO_TABLES: dict[str, str] = {
+    # Activated calc-view / attribute-view definitions. CDATA holds the XML the modeller produced,
+    # which is the only place a view's joins, filters and formulas are written down.
+    "calc_view_definition": "ACTIVE_OBJECT",
+}
+
 # DISCOVER-tier families: logical group -> DD02L LIKE pattern. Names vary by release and must be
 # discovered, never assumed (mission Appendix A).
 DISCOVER_PATTERNS: dict[str, str] = {
@@ -286,11 +300,12 @@ class CapabilityResolver:
         release = self._detect_release(schema, connection)
         tables = self._probe_abap_existence(schema, connection)
         tables.update(self._probe_hana_objects(connection))
+        tables.update(self._probe_repo_objects(connection))
         discovered = self._discover(schema, connection)
         tables.update(discovered.table_status)
         self._populate_row_counts(schema, tables, connection)
         object_models, undetermined_models = self._detect_object_models(tables, discovered)
-        hana_repo = self._detect_hana_repo_style(connection)
+        hana_repo = self._detect_hana_repo_style(tables)
         retention = self._measure_retention(schema, tables, connection)
 
         return CapabilityRecord(
@@ -370,6 +385,17 @@ class CapabilityResolver:
         )
         rows, outcome = _attempt(connection, query, physical_names)
         return self._existence_statuses(HANA_VIEWS, rows, outcome, schema="SYS")
+
+    def _probe_repo_objects(self, connection: SupportsSelect) -> dict[str, TableStatus]:
+        """Existence of design-time repository tables, which live in ``_SYS_REPO``, not ``SYS``."""
+        physical_names = sorted(set(REPO_TABLES.values()))
+        placeholders = ", ".join("?" for _ in physical_names)
+        query = (
+            "SELECT TABLE_NAME FROM SYS.TABLES "
+            f"WHERE SCHEMA_NAME = '{REPO_SCHEMA}' AND TABLE_NAME IN ({placeholders})"
+        )
+        rows, outcome = _attempt(connection, query, physical_names)
+        return self._existence_statuses(REPO_TABLES, rows, outcome, schema=REPO_SCHEMA)
 
     @staticmethod
     def _existence_statuses(
@@ -496,16 +522,16 @@ class CapabilityResolver:
                 inconclusive.add(variant)
         return models, sorted(inconclusive)
 
-    def _detect_hana_repo_style(self, connection: SupportsSelect) -> HanaRepoStyle:
-        query = (
-            "SELECT TABLE_NAME FROM SYS.TABLES "
-            "WHERE SCHEMA_NAME = '_SYS_REPO' AND TABLE_NAME = 'ACTIVE_OBJECT'"
-        )
-        try:
-            rows = connection.execute_select(query)
-        except Exception:
-            return "none"
-        return "sys_repo" if rows else "none"
+    @staticmethod
+    def _detect_hana_repo_style(tables: dict[str, TableStatus]) -> HanaRepoStyle:
+        """Read off the repository probe rather than issuing a second identical statement.
+
+        This used to run its own ``SYS.TABLES`` query for exactly the object
+        :meth:`_probe_repo_objects` now records, so the two could disagree - and the style said
+        ``sys_repo`` while nothing could resolve the table.
+        """
+        status = tables.get("calc_view_definition")
+        return "sys_repo" if status is not None and status.present else "none"
 
     def _measure_retention(
         self, schema: str, tables: dict[str, TableStatus], connection: SupportsSelect

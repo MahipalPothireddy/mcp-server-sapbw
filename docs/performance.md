@@ -12,7 +12,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 |---|--:|---|
 | `constant` | 9 | Reads the server's own description or the discovery record, both bounded by this build rather than by the landscape. The same size on a small system and a huge one. |
 | `per_page` | 12 | Returns one page of rows. Cost is set by `limit`, not by system size; `total_count` says how much is behind it. |
-| `per_object` | 17 | Proportional to the one object named - its fields, rules, elements or run history - not to how many such objects exist. |
+| `per_object` | 18 | Proportional to the one object named - its fields, rules, elements or run history - not to how many such objects exist. |
 | `per_graph_node` | 7 | Walks the dependency graph outward from one object, so cost follows the connected subgraph. A hub object is far more expensive than a leaf at the same depth. |
 | `per_system` | 15 | Scans a whole class of objects rather than one. These are the calls to plan for on a large system, and each names the cap that stops it running away. |
 
@@ -30,7 +30,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_assess_change_impact` | `per_graph_node` | 9,652 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_assess_landscape` | `per_system` | 5,282 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
-| `bw_capability_report` | `constant` | 35,444 B | — | 5000 statements / 300s per call |
+| `bw_capability_report` | `constant` | 35,772 B | — | 5000 statements / 300s per call |
 | `bw_check_load_latency` | `per_system` | 585 B | — | 250 routine parses; 5000 statements / 300s per call |
 | `bw_check_schedule_risk` | `per_system` | 390 B | — | 5000 statements / 300s per call |
 | `bw_compare_snapshots` | `per_system` | 380 B | — | 5000 statements / 300s per call |
@@ -42,6 +42,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_generate_docs` | `per_system` | not measured | — | 5,000 detail pages per section; 5000 statements / 300s per call |
 | `bw_get_analysis_auth` | `per_object` | 407 B | — | 5000 statements / 300s per call |
 | `bw_get_calc_view_lineage` | `per_object` | 390 B | — | 5000 statements / 300s per call |
+| `bw_get_calc_view_logic` | `per_object` | 425 B | — | 5000 statements / 300s per call |
 | `bw_get_chain` | `per_object` | 596 B | — | 5000 statements / 300s per call |
 | `bw_get_chain_runtimes` | `per_object` | 389 B | — | 5000 statements / 300s per call |
 | `bw_get_extractor_exit_code` | `per_system` | 410 B | — | 400 satellite program fetches (configurable); 5000 statements / 300s per call |
@@ -78,7 +79,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_review_scenario` | `per_system` | 366 B | — | 5000 statements / 300s per call |
 | `bw_search_objects` | `per_page` | 657 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_security_overview` | `per_system` | 407 B | — | 50,000 RSECVAL rows scanned; 5000 statements / 300s per call |
-| `bw_support_matrix` | `constant` | 22,217 B | — | 5000 statements / 300s per call |
+| `bw_support_matrix` | `constant` | 22,566 B | — | 5000 statements / 300s per call |
 | `bw_system_profile` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
 | `bw_trace_to_source` | `per_graph_node` | 1,790 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
 | `bw_troubleshoot_missing_data` | `per_graph_node` | 8,261 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |

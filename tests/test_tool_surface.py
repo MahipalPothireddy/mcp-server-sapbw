@@ -87,6 +87,7 @@ _ARGS: dict[str, dict[str, Any]] = {
     # --- HANA ---------------------------------------------------------------------------
     "bw_list_calc_views": {"system": _SYSTEM},
     "bw_get_calc_view_lineage": {"system": _SYSTEM, "view_name": "CV1"},
+    "bw_get_calc_view_logic": {"system": _SYSTEM, "view_name": "PKG.SUB/CV1"},
     "bw_get_hana_crossings": {"system": _SYSTEM},
     # --- provider health, sources, 3.x ---------------------------------------------------
     "bw_get_provider_health": {"system": _SYSTEM, "provider": "SALES_DSO"},

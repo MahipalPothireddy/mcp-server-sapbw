@@ -13,8 +13,8 @@ neither a reader nor a stated reason.
 decision rests on the second. They used to share one word: `SUPPORTED` meant "a reader
 exists and a test covers it", but reads as "validated against supported BW versions".
 
-- **Implementation** - 81 of 100 capabilities are implemented.
-- **Validation** - 53 have been read through a real
+- **Implementation** - 82 of 101 capabilities are implemented.
+- **Validation** - 54 have been read through a real
   feature against a live BW system, 18 are covered by the
   offline suite only, 29 are unproven, and
   **0 have been validated on a customer's own
@@ -43,7 +43,7 @@ capability with a reader that no test touched reports `not_validated`.
 Presence of a table on *your* system is a third question again, answered per connection
 by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 
-## SUPPORTED (67)
+## SUPPORTED (68)
 
 | Capability | Object | Validation | Notes |
 |---|---|---|---|
@@ -56,6 +56,7 @@ by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 | `auth_text` | `RSECTXT` | `unit_tested` | read by the server |
 | `auth_user` | `RSECUSERAUTH` | `unit_tested` | read by the server |
 | `auth_values` | `RSECVAL` | `unit_tested` | read by the server |
+| `calc_view_definition` | `ACTIVE_OBJECT` | `integration_tested` | read by the server |
 | `chain_attr` | `RSPCCHAINATTR` | `integration_tested` | read by the server |
 | `chain_edges` | `RSPCCHAIN` | `integration_tested` | read by the server |
 | `chain_text` | `RSPCCHAINT` | `integration_tested` | read by the server |

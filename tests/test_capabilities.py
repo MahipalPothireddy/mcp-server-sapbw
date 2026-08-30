@@ -58,8 +58,13 @@ def make_responder(
         if "FROM SYS.VIEWS" in sql:
             names = list(params or [])
             return [(n,) for n in names if str(n) in present_hana]
-        if "_SYS_REPO" in sql and "ACTIVE_OBJECT" in sql:
-            return [("_SYS_REPO",)] if repo else []
+        if "_SYS_REPO" in sql:
+            # Matched on the schema alone: the table name is a bind parameter now, not SQL text, so
+            # a fixture keying on it silently stops firing. And the *returned* name matters, because
+            # the probe matches it against the declared physical name - it did not before, when the
+            # repository-style check only tested that some row came back.
+            names = list(params or [])
+            return [(n,) for n in names] if repo else []
         if "MIN(DATUM)" in sql:
             return [(min_datum,)] if min_datum is not None else [(None,)]
         if "DD02L" in sql and "LIKE" in sql:

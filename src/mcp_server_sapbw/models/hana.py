@@ -121,6 +121,161 @@ class HanaCrossing(BaseModel):
         return self
 
 
+CalcViewNodeType = Literal["projection", "join", "aggregation", "union", "rank", "other"]
+
+
+class CalcViewDataSourceRef(BaseModel):
+    """One input a calc view reads, as the definition names it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    #: As stored: CALCULATION_VIEW, DATA_BASE_TABLE, DATA_BASE_VIEW.
+    source_type: str | None = None
+    schema_name: str | None = None
+    #: The catalog object for a table/view source.
+    column_object: str | None = None
+    #: The repository path for a calc-view source, e.g. ``/pkg/calculationviews/NAME``.
+    resource_uri: str | None = None
+    resolved_object: str | None = None  # BW object behind a /BIC/ or /BI0/ table (advisory)
+    resolved_kind: str | None = None
+    provenance: Provenance
+
+
+class CalcViewCalculatedColumn(BaseModel):
+    """A column the view computes, with the expression that computes it.
+
+    This is the answer to "where does this number come from" when the answer is not a BW
+    transformation. Reported verbatim rather than summarised: a formula that has been paraphrased
+    cannot be checked against the view.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    formula: str | None = None
+    datatype: str | None = None
+    length: str | None = None
+    expression_language: str | None = None
+    #: The node that computes it, so the column can be found in the modeller.
+    node: str | None = None
+
+
+class CalcViewColumnMapping(BaseModel):
+    """One column crossing one node boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    target: str
+    source: str | None = None
+    #: Set instead of ``source`` when the mapping supplies a constant.
+    value: str | None = None
+    #: The mapping's own xsi:type, which distinguishes an attribute mapping from a constant one.
+    kind: str | None = None
+    from_node: str | None = None
+
+
+class CalcViewNode(BaseModel):
+    """One node of the calculation scenario: a projection, join, aggregation or union."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    node_type: CalcViewNodeType = "other"
+    #: The stored xsi:type, kept so an unmapped node kind is still reported as itself.
+    raw_type: str | None = None
+    join_type: str | None = None  # inner / leftOuter / rightOuter / fullOuter / referential
+    cardinality: str | None = None
+    join_order: str | None = None
+    join_attributes: list[str] = Field(default_factory=list)
+    #: Node or data-source ids feeding this node.
+    inputs: list[str] = Field(default_factory=list)
+    mappings: list[CalcViewColumnMapping] = Field(default_factory=list)
+    filter_expression: str | None = None
+
+
+class CalcViewParameter(BaseModel):
+    """An input parameter or a variable the view declares.
+
+    ``is_input_parameter`` reflects ``parameter="true"`` in the definition. Both are declared the
+    same way, and the distinction decides whether a value is supplied by the caller at query time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    is_input_parameter: bool = False
+    description: str | None = None
+    datatype: str | None = None
+    length: str | None = None
+    mandatory: bool | None = None
+    selection_type: str | None = None
+
+
+class CalcViewSemanticColumn(BaseModel):
+    """A column the view publishes, and how it is aggregated."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    role: Literal["attribute", "measure"]
+    description: str | None = None
+    aggregation: str | None = None  # sum / min / max / count / avg
+    measure_type: str | None = None
+    is_key: bool = False
+    calculated: bool = False
+    origin_node: str | None = None
+    origin_column: str | None = None
+    formula: str | None = None
+
+
+class CalcViewDefinition(BaseModel):
+    """What a calculation view actually does, read from its activated definition.
+
+    ``parsed`` is the field to read first. False means the logic could not be read and
+    ``unparsed_reason`` says why - the definition is absent from the repository, too large to read
+    within the stated bound, or not a shape this parser recognises. An unreadable definition is
+    reported as unreadable rather than as a view with no logic, because those are opposite readings
+    and only one of them is about the view.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    view_name: str
+    schema_name: str = "_SYS_BIC"
+    package_id: str | None = None
+    object_name: str | None = None
+    description: str | None = None
+    changed_at: str | None = None  # as stored; not normalised to a timestamp type
+    data_category: str | None = None  # CUBE / DIMENSION
+    output_view_type: str | None = None
+    schema_version: str | None = None
+    scenario_type: str | None = None
+    #: True when BW generated this view rather than a person modelling it. BW-generated definitions
+    #: are machine-produced projections whose interesting facts are base tables and consumers, which
+    #: ``bw_get_calc_view_lineage`` already answers.
+    is_bw_generated: bool = False
+    definition_bytes: int | None = None
+    parsed: bool = False
+    unparsed_reason: str | None = None
+    final_node: str | None = None
+    applies_analytic_privilege: bool = False
+    data_sources: list[CalcViewDataSourceRef] = Field(default_factory=list)
+    nodes: list[CalcViewNode] = Field(default_factory=list)
+    calculated_columns: list[CalcViewCalculatedColumn] = Field(default_factory=list)
+    semantic_columns: list[CalcViewSemanticColumn] = Field(default_factory=list)
+    input_parameters: list[CalcViewParameter] = Field(default_factory=list)
+    filters: list[str] = Field(default_factory=list)
+    #: Node counts by kind, so the shape is answerable without walking every node.
+    node_counts: dict[str, int] = Field(default_factory=dict)
+    #: Elements inside the semantic layer this grammar does not cover: a gap, not an absence.
+    unrecognised_elements: list[str] = Field(default_factory=list)
+    truncated: bool = False
+    caveats: list[str] = Field(default_factory=list)
+    evidence: Evidence | None = None
+    provenance: Provenance | list[Provenance]
+
+
 class HanaCrossingReport(BaseModel):
     """The bidirectional BW<->HANA crossing table for a scope."""
 

@@ -161,6 +161,16 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "the component is a query root (DEFTP='REP') rather than a structure or calculated key "
         "figure that also carries an assignment row.",
     ),
+    # CalcViewDefinition.evidence - the logic inside a calculation view. Read from the activated
+    # design-time definition, so the joins, filters and formulas are stated rather than inferred;
+    # what remains uncertain is whether an inactive change exists, which the caveats say.
+    ("calc_view_definition", "activated_repository"): (
+        "observed",
+        "activated_view_definition",
+        "Read from the activated calculation-view definition in _SYS_REPO, which is the document "
+        "the modeller saved: joins, join types, filters, calculated-column formulas, input "
+        "parameters and per-measure aggregation are stated there rather than derived.",
+    ),
     ("lineage_edge", "advisory"): (
         "inferred",
         "routine_select_parse",
