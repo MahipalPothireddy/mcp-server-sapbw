@@ -142,7 +142,7 @@ def test_query_components_are_not_reported_as_reports() -> None:
 
 
 def test_declared_query_edges_are_observed_not_inferred() -> None:
-    """Evidence has to say RSZCOMPIC, because that is what makes this answer better than the old one.
+    """Evidence has to say RSZCOMPIC: that is what makes this answer better than the old one.
 
     The calc-view route produced ``derived``/``generated_view_naming``. This route reads a declared
     assignment, so it is ``observed`` - and a caller sorting a mixed set by trust depends on the
@@ -191,7 +191,7 @@ def test_a_release_without_the_assignment_table_says_so() -> None:
 
 
 def test_a_release_without_the_element_directory_says_so() -> None:
-    """Without RSZELTDIR a query cannot be told from a structure, so the branch declines to guess."""
+    """Without RSZELTDIR a query cannot be told from a structure, so the branch will not guess."""
     graph = _graph(present={"transformation", "dtp", "query_provider", "query_dir"})
     assert _query_edges(graph) == []
     assert graph.completeness == "unsupported_branch"
