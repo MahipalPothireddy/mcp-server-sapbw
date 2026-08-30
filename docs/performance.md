@@ -23,11 +23,11 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | Tool | Growth | Fixture payload | Shaped | Bounds |
 |---|---|--:|:-:|---|
 | `bw_access_report` | `constant` | 10,097 B | — | 5000 statements / 300s per call |
-| `bw_analyze_object` | `per_graph_node` | 9,218 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_analyze_object` | `per_graph_node` | 9,380 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_process_chain` | `per_object` | 3,993 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_query` | `per_object` | 8,025 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_routine` | `per_object` | 1,118 B | — | 5000 statements / 300s per call |
-| `bw_assess_change_impact` | `per_graph_node` | 9,760 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_assess_change_impact` | `per_graph_node` | 9,922 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_assess_landscape` | `per_system` | 5,768 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
 | `bw_capability_report` | `constant` | 35,772 B | — | 5000 statements / 300s per call |
@@ -36,7 +36,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_compare_snapshots` | `per_system` | 380 B | — | 5000 statements / 300s per call |
 | `bw_compare_systems` | `per_system` | 1,574 B | — | 5000 statements / 300s per call |
 | `bw_create_snapshot` | `per_system` | 1,286 B | — | 5000 statements / 300s per call |
-| `bw_describe_object` | `per_object` | 1,205 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_describe_object` | `per_object` | 1,367 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_find_layer_violations` | `per_system` | 673 B | — | 5000 statements / 300s per call |
 | `bw_find_unused_providers` | `per_system` | 1,749 B | — | 5000 statements / 300s per call |
 | `bw_generate_docs` | `per_system` | not measured | — | 5,000 detail pages per section; 5000 statements / 300s per call |

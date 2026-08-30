@@ -89,6 +89,25 @@ class ProviderField(BaseModel):
     is_key: bool = False  # part of the semantic key (DSO/ADSO KEYFLAG)
     role: FieldRole = "unknown"
     description: str | None = None  # field-level text where the source provides one
+    #: Which naming layer ``name`` belongs to.
+    #:
+    #: The same object has two names and the response never said which one it was handing back. A
+    #: classic DSO or InfoCube field is an *InfoObject* (``0BILL_NUM``); an Advanced DSO or
+    #: CompositeProvider field is the *table column* BW generated for it, and the two differ by
+    #: convention - a standard InfoObject loses its leading ``0``, a customer one gains ``/BIC/``.
+    #: A reader comparing a key list against BW's own display sees two different strings and cannot
+    #: tell a naming layer from a wrong answer.
+    name_layer: Literal["infoobject", "hana_column"] = "infoobject"
+    #: The InfoObject behind a ``hana_column`` name, where one could be established.
+    #:
+    #: **Derived, never declared.** No table on the reference release records an Advanced
+    #: DSO field's InfoObject - checked against the dictionary rather than assumed - so this
+    #: is read back off the
+    #: column name by BW's generation convention and then looked up in the InfoObject catalogue.
+    #: ``infoobject_resolution`` says which of those happened, because "the catalogue confirms this
+    #: object exists" and "the convention suggests this name" are different claims.
+    infoobject: str | None = None
+    infoobject_resolution: Literal["confirmed", "inferred", "none"] = "none"
     # When the field is a navigation attribute, the characteristic it hangs off and the attribute
     # itself, resolved from RSDATRNAV. Without this a provider field list shows names like
     # ``0CUSTOMER__0COUNTRY`` with nothing saying where the value comes from - and on the reference

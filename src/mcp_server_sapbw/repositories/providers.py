@@ -16,7 +16,7 @@ saying so — never implying a CompositeProvider has no parts.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from ..models.aggregation import KeyFigureAggregation
 from ..models.description import Description
@@ -36,6 +36,7 @@ from ..services.descriptions import DescriptionService
 from ..services.table_resolver import (
     ResolvedKind,
     calc_view_patterns,
+    candidate_tables,
     is_hierarchy_view,
     resolve_table,
 )
@@ -44,6 +45,58 @@ from .texts import TextsRepository, TextTableSpec
 
 # HANA schema holding generated BW calc views.
 _CALC_SCHEMA = "_SYS_BIC"
+
+# InfoObject names confirmed per catalogue read when resolving generated column names back to
+# InfoObjects. A wide Advanced DSO has a few hundred columns, so this keeps it to a couple of reads.
+_IOBJ_CHUNK = 300
+
+#: ``(infoobject, resolution)`` for one generated column; see ``_infoobjects_for_columns``.
+_Resolution = tuple[str, Literal["confirmed", "inferred", "none"]]
+
+#: Generated-table namespaces whose prefix is *stripped* to recover the InfoObject name. Any other
+#: ``/NS/`` prefix belongs to the InfoObject itself and is kept - see ``_infoobject_candidates``.
+_GENERATED_NAMESPACES = ("/BIC/", "/BI0/")
+
+
+def _infoobject_candidates(column: str) -> list[str]:
+    """Plausible InfoObject names for a generated column, best first.
+
+    Every form is offered to the catalogue rather than one being chosen up front, because the column
+    name alone does not say which convention produced it.
+    """
+    upper = column.strip().upper()
+    if not upper:
+        return []
+    for namespace in _GENERATED_NAMESPACES:
+        if upper.startswith(namespace):
+            stripped = upper[len(namespace) :]
+            # The stripped name first (a customer InfoObject), then with a leading zero in case the
+            # generated column wrapped an SAP-delivered one.
+            return [form for form in (stripped, f"0{stripped}") if form]
+    if upper.startswith("/") and upper.count("/") >= _NAMESPACE_SLASHES:
+        # A namespace of its own: the column already is the InfoObject name on this release.
+        return [upper]
+    return [f"0{upper}", upper]
+
+
+#: A namespaced name is ``/NS/NAME`` - two slashes before the name itself.
+_NAMESPACE_SLASHES = 2
+
+
+def _first_text(texts: dict[str, str], *keys: str | None) -> str | None:
+    """The first maintained text found under any of ``keys``, case-insensitively."""
+    if not texts:
+        return None
+    folded = {key.strip().upper(): value for key, value in texts.items()}
+    for key in keys:
+        if not key:
+            continue
+        found = texts.get(key) or folded.get(key.strip().upper())
+        if found:
+            return found
+    return None
+
+
 # SYS.OBJECT_DEPENDENCIES.DEPENDENCY_TYPE: 1 = direct, 2 = transitive.
 #
 # Part-provider resolution needs TRANSITIVE. Verified live: BW layers a CompositeProvider's calc
@@ -318,7 +371,7 @@ class ProvidersRepository(Repository):
         spec = _TEXT_SPECS["adso"]
         field_desc = self._texts.field_texts(spec, name)
         key_names = self._adso_keys(name)
-        fields = self._fields_from_texts("adso_text", "ADSONM", name, field_desc, key_names)
+        fields, field_caveats = self._adso_fields(name, field_desc, key_names)
         description = self._describe(
             "adso",
             name,
@@ -326,7 +379,7 @@ class ProvidersRepository(Repository):
             key_names=key_names,
             field_count=len(fields),
             part_count=0,
-            evidence_tables=["adso_header", "adso_text"],
+            evidence_tables=["adso_header", "adso_text", "dict_columns"],
         )
         return Provider(
             name=name,
@@ -339,8 +392,183 @@ class ProvidersRepository(Repository):
             fields=fields,
             composition_source="none",
             description=description,
+            caveats=field_caveats,
             provenance=[self.provenance("adso_header", {"ADSONM": name, "OBJVERS": "A"})],
         )
+
+    def _adso_fields(
+        self, name: str, field_desc: dict[str, str], key_names: list[str]
+    ) -> tuple[list[ProviderField], list[str]]:
+        """An Advanced DSO's real field list, from its generated active table's dictionary columns.
+
+        Defect D14. This was previously built from ``RSOADSOT`` - the *text* table - as
+        "every column that happens to have a description, plus the key fields". Two failures
+        at once,
+        measured on a production ADSO whose active table has **332** columns:
+
+        * **missing fields.** 15 were reported. A field with no maintained description was invisible
+          unless it was part of the semantic key, so the field list was a description inventory
+          wearing a field list's name.
+        * **fields that are not fields.** ``RSOADSOT.COLNAME`` also holds BW's escape-encoded
+          internal identifiers, so entries like ``!23!2F!2F!2F0COUNTRY!2F0COUNTRY``
+          (``#///0COUNTRY``
+          encoded) and ``!23!2F!2F!2FDATA!C2!A7`` arrived as fields with provenance citing the text
+          table. Nothing downstream could tell them from real columns.
+
+        The dictionary is the authority: it carries every column, its position, and ``KEYFLAG`` -
+        which was verified to agree exactly with ``RSOADSOKEYFIELDS`` on the same object. Text rows
+        now *decorate* that list, so an encoded key simply matches no column and disappears.
+
+        Falls back to the previous reading when the dictionary or the generated table cannot be
+        reached, and says so, because a thin field list that admits it is thin beats a silent one.
+        """
+        caveats: list[str] = []
+        active = self._adso_active_table(name)
+        if active is None or not self.capability.is_available("dict_columns"):
+            caveats.append(
+                "field list derived from maintained field texts rather than the generated active "
+                "table's dictionary columns, because the dictionary could not be read here; fields "
+                "with no description are therefore absent"
+            )
+            return (
+                self._fields_from_texts("adso_text", "ADSONM", name, field_desc, key_names),
+                caveats,
+            )
+
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["FIELDNAME", "POSITION", "KEYFLAG"],
+                from_logical="dict_columns",
+                where=["TABNAME = ?", "TRIM(FIELDNAME) <> ''"],
+                params=[active],
+                order_by=["POSITION"],
+            )
+        )
+        if not rows:
+            caveats.append(
+                f"the generated active table {active} carries no dictionary columns, so the field "
+                "list falls back to maintained field texts and omits undescribed fields"
+            )
+            return (
+                self._fields_from_texts("adso_text", "ADSONM", name, field_desc, key_names),
+                caveats,
+            )
+
+        key_set = {k.strip().upper() for k in key_names}
+        columns = [
+            (str(field).strip(), _as_int(position), str(keyflag).strip().upper() == "X")
+            for field, position, keyflag in rows
+            if _clean(field)
+        ]
+        resolved = self._infoobjects_for_columns([column for column, _pos, _key in columns])
+        fields = [
+            ProviderField(
+                name=column,
+                position=position,
+                # Either source may know: KEYFLAG is the table's own key, RSOADSOKEYFIELDS is the
+                # ADSO's declared semantic key. They agreed on the object measured; a union means a
+                # disagreement understates neither.
+                is_key=is_key or column.upper() in key_set,
+                role="field",
+                # Looked up by InfoObject *first*. RSOADSOT.COLNAME holds InfoObject names, not
+                # column names - 52,949 rows on the reference system read like '0CALDAY' - so a
+                # column-keyed join finds nothing and every field comes back undescribed. The column
+                # form is still tried, since a release that keys it differently then still resolves.
+                description=_first_text(
+                    field_desc, resolved.get(column, (None, "none"))[0], column
+                ),
+                name_layer="hana_column",
+                infoobject=resolved.get(column, (None, "none"))[0],
+                infoobject_resolution=resolved.get(column, (None, "none"))[1],
+                provenance=self.provenance(
+                    "dict_columns", {"TABNAME": active, "FIELDNAME": column}
+                ),
+            )
+            for column, position, is_key in columns
+        ]
+        undescribed = sum(1 for f in fields if f.description is None)
+        if undescribed and field_desc and undescribed == len(fields):
+            # Rows exist for this object but none of them key to a field. Measured on the reference
+            # system: BW writes escape-encoded internal identifiers into COLNAME - '!23!2F...' for
+            # '#///...' - and for one production ADSO none of its 10 text rows matched a column of
+            # its active table. "Descriptions are unavailable here" and "nobody maintained them" are
+            # different answers and only one of them is about the object.
+            caveats.append(
+                f"{self.physical('adso_text')} holds {len(field_desc)} text row(s) for this "
+                "object, none of which key to a field of its active table - BW writes "
+                "escape-encoded "
+                "internal identifiers there - so per-field descriptions are unavailable on this "
+                "release rather than unmaintained"
+            )
+        elif undescribed:
+            caveats.append(
+                f"{undescribed} of {len(fields)} fields carry no maintained description in "
+                f"{self.physical('adso_text')}; the field itself is still declared by the "
+                "dictionary"
+            )
+        caveats.append(
+            "field names are generated table columns, not InfoObject names (name_layer="
+            "'hana_column'). The InfoObject is read back off the column by BW's generation "
+            "convention and confirmed against the InfoObject catalogue where possible - see "
+            "infoobject_resolution; no table on this release declares the mapping."
+        )
+        return fields, caveats
+
+    def _adso_active_table(self, name: str) -> str | None:
+        """The generated active table for an ADSO, using the shared naming convention."""
+        for table, role in candidate_tables(name, "adso").items():
+            if role == "active":
+                return table
+        return None
+
+    def _infoobjects_for_columns(self, columns: list[str]) -> dict[str, _Resolution]:
+        """``column -> (infoobject, resolution)``, confirmed against the catalogue in one read.
+
+        Reading BW's generation convention backwards, which is a guess until the catalogue agrees -
+        hence two outcomes rather than one. The candidate forms were established against the
+        reference system rather than assumed:
+
+        * ``/BIC/<NAME>`` -> ``<NAME>``. A customer InfoObject is generated with the ``/BIC/``
+          prefix and confirmed in the catalogue without it.
+        * ``BILL_NUM`` -> ``0BILL_NUM``. An SAP-delivered InfoObject loses its leading zero.
+        * ``/B299/S_IPNUM_CR`` -> itself. Other namespaces are *not* ``/BIC/``: 381 InfoObjects on
+          the reference system carry a namespace in their own name, so the column already is the
+          name. Prepending a zero here produced ``0/B299/S_IPNUM_CR``, which is not a name of
+          anything - the kind of confident nonsense the resolution flag exists to prevent.
+
+        Every plausible form is offered to the catalogue and the first *confirmed* one wins, so a
+        column is only reported as inferred when nothing in the catalogue matched any reading of it.
+        """
+        candidates: dict[str, list[str]] = {}
+        for column in columns:
+            forms = _infoobject_candidates(column)
+            if forms:
+                candidates[column] = forms
+        if not candidates:
+            return {}
+        if not self.capability.is_available("infoobject"):
+            return {column: (forms[0], "inferred") for column, forms in candidates.items()}
+
+        wanted = sorted({form for forms in candidates.values() for form in forms})
+        confirmed: set[str] = set()
+        for chunk in [wanted[i : i + _IOBJ_CHUNK] for i in range(0, len(wanted), _IOBJ_CHUNK)]:
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["IOBJNM"],
+                    from_logical="infoobject",
+                    where=[f"IOBJNM IN ({placeholders})"],
+                    params=list(chunk),
+                    order_by=["IOBJNM"],
+                )
+            )
+            confirmed.update(str(r[0]).strip().upper() for r in rows if _clean(r[0]))
+
+        resolved: dict[str, _Resolution] = {}
+        for column, forms in candidates.items():
+            match = next((form for form in forms if form in confirmed), None)
+            resolved[column] = (match, "confirmed") if match else (forms[0], "inferred")
+        return resolved
 
     def _adso_keys(self, name: str) -> list[str]:
         if not self.capability.is_available("adso_keyfields"):
