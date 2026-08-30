@@ -130,6 +130,14 @@ _PREFETCH_CHUNK = 200
 # Below this a batch is just the single-node query plus bookkeeping, so it is not worth issuing.
 _PREFETCH_MIN_FRONTIER = 2
 
+# Generated table names per batched OBJECT_DEPENDENCIES read. Each provider contributes several
+# candidate tables, so this bounds the bind-parameter count rather than the number of nodes.
+_PREFETCH_TABLE_CHUNK = 600
+# Whole-batch row bound for that read. Reaching it means the batch cannot be attributed to nodes
+# without possibly truncating one of them, so the batch is abandoned and every node in it falls back
+# to its own bounded, self-reporting read. Ten times the widest single-provider population measured.
+_PREFETCH_CONSUMER_MAX_ROWS = _CONSUMER_PAGE_ROWS * _MAX_CONSUMER_PAGES
+
 # (key column, other-endpoint name column, other-endpoint type column) per direction. Shared by the
 # single-node reads and their batched prefetch so the two cannot drift into reading different rows.
 _TRAN_COLUMNS: dict[bool, tuple[str, str, str]] = {
@@ -153,6 +161,56 @@ def _prefetch_directions(direction: LineageDirection) -> tuple[bool, ...]:
 
 def _chunks(items: list[str], size: int) -> list[list[str]]:
     return [items[start : start + size] for start in range(0, len(items), size)]
+
+
+def _consumer_tables(name: str) -> list[str]:
+    """Generated tables that would carry ``name``'s data, across the persisting provider kinds.
+
+    One place, because the batched prefetch has to ask exactly the question the single-node read
+    asks; a candidate present in one and not the other would silently change the answer.
+    """
+    tables: list[str] = []
+    for kind in ("dso", "adso", "infocube"):
+        tables.extend(candidate_tables(name, kind))
+    return tables
+
+
+def _owner_of_tables(chunk: list[tuple[str, list[str]]]) -> dict[str, str] | None:
+    """Generated table -> the provider it belongs to, or ``None`` if any table has two claimants.
+
+    Two providers claiming one generated table would make row attribution a guess. It is not
+    expected on a well-formed system, and it is not assumed either.
+    """
+    owner_of: dict[str, str] = {}
+    for name, candidates in chunk:
+        for table in candidates:
+            if owner_of.setdefault(table.strip().upper(), name) != name:
+                return None
+    return owner_of
+
+
+def _table_chunks(
+    eligible: list[tuple[str, list[str]]], size: int
+) -> list[list[tuple[str, list[str]]]]:
+    """Group ``(name, tables)`` pairs so no batch exceeds ``size`` bind parameters for tables.
+
+    Chunked on tables rather than on names because each provider contributes several, so a
+    name-based chunk would vary in width by provider kind. A single name whose candidate list
+    already exceeds the bound still gets its own batch: the alternative is to drop it.
+    """
+    batches: list[list[tuple[str, list[str]]]] = []
+    current: list[tuple[str, list[str]]] = []
+    width = 0
+    for pair in eligible:
+        count = len(pair[1])
+        if current and width + count > size:
+            batches.append(current)
+            current, width = [], 0
+        current.append(pair)
+        width += count
+    if current:
+        batches.append(current)
+    return batches
 
 
 _ROUTINE_CAVEAT = (
@@ -254,6 +312,9 @@ class LineageService(Repository):
         self._query_provider_memo: dict[str, tuple[str, str] | None] = {}
         #: provider -> [(query technical name, COMPUID)] from RSZCOMPIC, prefetched per BFS level.
         self._pf_queries: dict[str, list[tuple[str, str]]] = {}
+        #: provider -> dependent generated view names from OBJECT_DEPENDENCIES, per BFS level. Only
+        #: ever set from a batch that read its nodes to exhaustion, so a present entry is complete.
+        self._pf_consumers: dict[str, list[str]] = {}
 
     # --- public API ----------------------------------------------------------------------
 
@@ -445,6 +506,12 @@ class LineageService(Repository):
                 )
         if direction in ("downstream", "both") and self.capability.is_available("query_provider"):
             self._prefetch_declared_queries([n for n in pending if n not in self._pf_queries])
+        if (
+            direction in ("downstream", "both")
+            and self.capability.is_available("object_dependencies")
+            and self.capability.is_available("composite_header")
+        ):
+            self._prefetch_consumers([n for n in pending if n not in self._pf_consumers])
 
     def _prefetch_transformations(self, names: list[str], *, downstream: bool) -> None:
         key_col, other_name_col, other_type_col = _TRAN_COLUMNS[downstream]
@@ -884,39 +951,23 @@ class LineageService(Repository):
             and self.capability.is_available("composite_header")
         ):
             return []
-        tables: list[str] = []
-        for kind in ("dso", "adso", "infocube"):
-            tables.extend(candidate_tables(name, kind))
+        tables = _consumer_tables(name)
         if not tables:
             return []
 
-        placeholders = ", ".join("?" for _ in tables)
-        hier_segment = CALC_VIEW_HIER_MARKER.rstrip("/")
+        root_key = name.strip().upper()
+        cached = self._pf_consumers.get(name)
+        if cached is not None:
+            return self._consumer_hops_from(name, cached, root_key=root_key)
+
         base_query = self.dialect.build_select(
             columns=["DISTINCT DEPENDENT_OBJECT_NAME"],
             from_logical="object_dependencies",
-            where=[
-                "DEPENDENT_SCHEMA_NAME = ?",
-                f"BASE_OBJECT_NAME IN ({placeholders})",
-                "DEPENDENCY_TYPE = ?",
-                "DEPENDENT_OBJECT_NAME LIKE ?",
-                # Hierarchy views are excluded as a path *segment*, not as a bare substring, so a
-                # provider genuinely named '/HIERARCHY_X' is not caught by its own name.
-                "DEPENDENT_OBJECT_NAME NOT LIKE ?",
-                "DEPENDENT_OBJECT_NAME NOT LIKE ?",
-            ],
-            params=[
-                _CALC_SCHEMA,
-                *tables,
-                _TRANSITIVE_DEPENDENCY,
-                f"{CALC_VIEW_PACKAGE}%",
-                f"%{hier_segment}/%",
-                f"%{hier_segment}",
-            ],
+            where=self._consumer_where(tables),
+            params=self._consumer_params(tables),
             order_by=["DEPENDENT_OBJECT_NAME"],
         )
 
-        root_key = name.strip().upper()
         hops: list[_Hop] = []
         # Keyed by (type, name): a provider and a query may legitimately share a name.
         seen: set[tuple[str, str]] = set()
@@ -924,31 +975,151 @@ class LineageService(Repository):
             stopped = self._budget_stop()
             if stopped is not None:
                 self._walk_incomplete.add(stopped)
-                return hops
+                break
             rows = self.select(
                 self.dialect.paginate(
                     base_query, limit=_CONSUMER_PAGE_ROWS, offset=page * _CONSUMER_PAGE_ROWS
                 )
             )
-            for (view_name,) in rows:
-                raw = str(view_name).strip()
-                hop = self._consumer_hop(name, raw, root_key=root_key)
-                if hop is None:
-                    continue
-                key = (hop.node_type, hop.name.strip().upper())
-                if key in seen:
-                    continue
-                seen.add(key)
-                hops.append(hop)
-                if len(seen) >= _MAX_COMPOSITE_CONSUMERS:
-                    # Stopped on the stated cap. Whether more existed is unknown, so the walk is
-                    # reported as bounded rather than complete.
-                    self._walk_incomplete.add("semantic_limit")
-                    return hops
-            if len(rows) < _CONSUMER_PAGE_ROWS:
-                return hops  # a short page means the source is exhausted: a complete reading
-        self._walk_incomplete.add("semantic_limit")
+            capped = self._absorb_consumers(
+                name, [str(r[0]).strip() for r in rows], root_key=root_key, hops=hops, seen=seen
+            )
+            if capped or len(rows) < _CONSUMER_PAGE_ROWS:
+                break  # a short page means the source is exhausted: a complete reading
+        else:
+            # Ran out of pages with rows still coming, so this is a bounded reading.
+            self._walk_incomplete.add("semantic_limit")
         return hops
+
+    def _consumer_where(self, tables: list[str]) -> list[str]:
+        """Predicates shared by the single-node read and its batched prefetch.
+
+        Built in one place because the two paths must prune identically: a predicate added to one
+        and not the other would make the graph depend on whether a level happened to be batched.
+        """
+        placeholders = ", ".join("?" for _ in tables)
+        return [
+            "DEPENDENT_SCHEMA_NAME = ?",
+            f"BASE_OBJECT_NAME IN ({placeholders})",
+            "DEPENDENCY_TYPE = ?",
+            "DEPENDENT_OBJECT_NAME LIKE ?",
+            # Hierarchy views are excluded as a path *segment*, not as a bare substring, so a
+            # provider genuinely named '/HIERARCHY_X' is not caught by its own name.
+            "DEPENDENT_OBJECT_NAME NOT LIKE ?",
+            "DEPENDENT_OBJECT_NAME NOT LIKE ?",
+        ]
+
+    def _consumer_params(self, tables: list[str]) -> list[Any]:
+        hier_segment = CALC_VIEW_HIER_MARKER.rstrip("/")
+        return [
+            _CALC_SCHEMA,
+            *tables,
+            _TRANSITIVE_DEPENDENCY,
+            f"{CALC_VIEW_PACKAGE}%",
+            f"%{hier_segment}/%",
+            f"%{hier_segment}",
+        ]
+
+    def _consumer_hops_from(self, name: str, view_names: list[str], *, root_key: str) -> list[_Hop]:
+        """Resolve prefetched dependent view names, applying the same cap as the paged read."""
+        hops: list[_Hop] = []
+        seen: set[tuple[str, str]] = set()
+        self._absorb_consumers(name, view_names, root_key=root_key, hops=hops, seen=seen)
+        return hops
+
+    def _absorb_consumers(
+        self,
+        name: str,
+        view_names: list[str],
+        *,
+        root_key: str,
+        hops: list[_Hop],
+        seen: set[tuple[str, str]],
+    ) -> bool:
+        """Resolve view names into ``hops``, returning whether the consumer cap stopped it.
+
+        One implementation, used by both the paged read and the prefetched list, so a cap that
+        binds selects the same subset and reports the same bound either way.
+        """
+        for raw in view_names:
+            hop = self._consumer_hop(name, raw, root_key=root_key)
+            if hop is None:
+                continue
+            key = (hop.node_type, hop.name.strip().upper())
+            if key in seen:
+                continue
+            seen.add(key)
+            hops.append(hop)
+            if len(seen) >= _MAX_COMPOSITE_CONSUMERS:
+                # Stopped on the stated cap. Whether more existed is unknown, so the walk is
+                # reported as bounded rather than complete.
+                self._walk_incomplete.add("semantic_limit")
+                return True
+        return False
+
+    def _prefetch_consumers(self, names: list[str]) -> None:
+        """One OBJECT_DEPENDENCIES read per BFS level instead of one paged read per node.
+
+        The costliest branch of the walk by a wide margin: measured on a production system this
+        read answered in 667ms against a ~110ms floor for every other statement, and 166 of them
+        accounted for 34% of a depth-3 both-directions walk. The rows are the same either way -
+        ``BASE_OBJECT_NAME`` is added to the projection so each row can be attributed back to the
+        provider whose generated table it names.
+
+        Abandoned rather than truncated. If the whole-batch row bound binds, or a table cannot be
+        attributed to exactly one node, nothing is cached and every node falls back to its own
+        paged read, which reports its own bound. A prefetch may cost speed, never correctness.
+        """
+        eligible = [(name, _consumer_tables(name)) for name in names]
+        eligible = [(name, tables) for name, tables in eligible if tables]
+        for chunk in _table_chunks(eligible, _PREFETCH_TABLE_CHUNK):
+            owner_of = _owner_of_tables(chunk)
+            if owner_of is None:
+                continue  # ambiguous attribution - abandon the chunk
+            buckets = self._read_consumer_batch(chunk, owner_of)
+            if buckets is None:
+                continue  # abandon the chunk - see the docstring
+            for name, collected in buckets.items():
+                # Re-sorted on the dependent name alone. The batched read groups by base table
+                # first, and a provider owns several, so without this a node's cached order would
+                # differ from the order its own paged read produces - and where the consumer cap
+                # binds, a different order is a different subset.
+                self._pf_consumers[name] = sorted(set(collected))
+
+    def _read_consumer_batch(
+        self, chunk: list[tuple[str, list[str]]], owner_of: dict[str, str]
+    ) -> dict[str, list[str]] | None:
+        """Read one batch to exhaustion, or ``None`` if it must not be cached.
+
+        ``None`` covers three cases that all mean the same thing for the caller: a row whose base
+        table belongs to no node in the batch, the whole-batch row bound binding, and the call
+        budget running low. In each, what was read cannot be relied on as a node's complete list.
+        """
+        tables = [table for _, candidates in chunk for table in candidates]
+        buckets: dict[str, list[str]] = {name: [] for name, _ in chunk}
+        base_query = self.dialect.build_select(
+            columns=["DISTINCT BASE_OBJECT_NAME", "DEPENDENT_OBJECT_NAME"],
+            from_logical="object_dependencies",
+            where=self._consumer_where(tables),
+            params=self._consumer_params(tables),
+            order_by=["BASE_OBJECT_NAME", "DEPENDENT_OBJECT_NAME"],
+        )
+        fetched = 0
+        while fetched < _PREFETCH_CONSUMER_MAX_ROWS:
+            if self._budget_stop() is not None:
+                return None  # leave the allowance to the expansions themselves
+            rows = self.select(
+                self.dialect.paginate(base_query, limit=_CONSUMER_PAGE_ROWS, offset=fetched)
+            )
+            for base_object, view_name in rows:
+                owner = owner_of.get(str(base_object).strip().upper())
+                if owner is None:
+                    return None
+                buckets[owner].append(str(view_name).strip())
+            fetched += len(rows)
+            if len(rows) < _CONSUMER_PAGE_ROWS:
+                return buckets  # a short page means the batch is exhausted
+        return None
 
     def _consumer_hop(self, name: str, view_name: str, *, root_key: str) -> _Hop | None:
         """One dependent calc view read as the object that owns it, or ``None`` if it owns nothing.

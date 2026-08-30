@@ -157,7 +157,7 @@ Pick **one** upstream path and **one** downstream path of at least two hops, and
 | Engine value — downstream path | Full graph produced: 3 downstream levels, including the chain the verifier named |
 | Verdict | `unverifiable` |
 | Source / tool | Not stated by the verifier |
-| Notes | The engine's depth-3 both-directions graph contains the downstream chain the verifier described. It is left `unverifiable` because no ordered path was recorded by hand for comparison — the engine agreeing with itself is not a check. Producing that graph did surface a production failure worth recording: at the shipped default budget the call returned **no graph at all**, which is covered under REQ-19 and now fixed. |
+| Notes | The engine's depth-3 both-directions graph contains the downstream chain the verifier described. It is left `unverifiable` because no ordered path was recorded by hand for comparison — the engine agreeing with itself is not a check. Producing that graph did surface a production failure worth recording: at the shipped default budget the call returned **no graph at all**. That took two rounds to close, because fixing D12 grew the graph from 552 to 692 edges and put the call back over the budget; it now returns `complete` in 233.8 s of 300 s. Covered under REQ-19. |
 
 ---
 

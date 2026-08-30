@@ -88,6 +88,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 
 - `bw_analyze_object`: 20.4s at depth 2 (lineage 11s, calc-view consumers 4.4s)
 - `bw_create_snapshot`: 1.9s for 4,542 objects and 1,269 edges
+- `bw_get_lineage`: 233.8s for depth 3 both directions on a production hub object (308 nodes, 692 edges, 1,624 statements), inside the 300s default. The widest call measured; a leaf object at the same depth costs a small fraction of it
 - `bw_get_query`: 37-67 KiB via the bw:// resource (unshaped by design)
 - `bw_get_transformation`: 80 KiB via the bw:// resource (unshaped by design)
 
