@@ -135,6 +135,10 @@ _CALL_SITE_COVERED: dict[str, tuple[str, ...]] = {
     # services/lineage.py: a consumer discovered through a generated calc view, which is either a
     # CompositeProvider's view or a BEx query's. Neither was parsed out of ABAP.
     "calc_view_consumer": ("provider", "query"),
+    # services/lineage.py: a BEx query assigned to a provider by RSZCOMPIC. Deliberately distinct
+    # from calc_view_consumer='query' - that one notices a generated view touching a table, this one
+    # reads BW's own assignment - and the two are not interchangeable (D12).
+    "declared_query_provider": ("rszcompic",),
 }
 
 

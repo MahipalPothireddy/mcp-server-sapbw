@@ -48,6 +48,15 @@ _TABLES = {
     "dtp": "RSBKDTP",
     "object_dependencies": "OBJECT_DEPENDENCIES",
     "composite_header": "RSOHCPR",
+    # Present but empty. The declared-query branch (D12) reports itself unsupported when RSZCOMPIC
+    # cannot be read, which is correct on a release that lacks it - but it would make every
+    # assertion about `completeness` in this file a statement about the missing tables rather than
+    # about consumer paging. Declaring them present, with the connection returning no rows, keeps
+    # these tests about what they are about and additionally pins that a provider with no queries
+    # reads as complete rather than as bounded.
+    "query_provider": "RSZCOMPIC",
+    "query_dir": "RSZCOMPDIR",
+    "element_dir": "RSZELTDIR",
 }
 
 ROOT = "PART_DSO"

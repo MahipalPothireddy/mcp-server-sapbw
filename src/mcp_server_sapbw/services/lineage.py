@@ -91,6 +91,13 @@ _TRANSITIVE_DEPENDENCY = 2
 # provider - so an unordered cap over raw rows sampled roughly 0.2 usable providers per execution
 # against a true answer of 35, and drew a different arbitrary subset every time it ran.
 _MAX_COMPOSITE_CONSUMERS = 50
+# BEx queries BW *declares* against one provider (RSZCOMPIC, filtered to query roots). Bounded by
+# construction rather than by expectation: the widest provider measured on a production system
+# declares 73, so this leaves headroom while still capping. Note the filter is load-bearing, not a
+# tidy-up - RSZCOMPIC holds a row per query *component*, and the widest CompositeProvider measured
+# had 267 of them for 48 actual queries; without the root-element filter a provider would contribute
+# its structures and calculated key figures to the graph as though they were reports.
+_MAX_DECLARED_QUERY_CONSUMERS = 250
 # Rows per deterministic page. Comfortably larger than the pruned population measured on a real
 # system (36 rows for the widest provider seen), so the common case stays a single statement.
 _CONSUMER_PAGE_ROWS = 500
@@ -245,6 +252,8 @@ class LineageService(Repository):
         #: name -> (provider, compuid) or None. ``None`` is a cached answer, not a miss, so the
         #: `in` test rather than `.get` is what makes "this is not a query" cost one lookup.
         self._query_provider_memo: dict[str, tuple[str, str] | None] = {}
+        #: provider -> [(query technical name, COMPUID)] from RSZCOMPIC, prefetched per BFS level.
+        self._pf_queries: dict[str, list[tuple[str, str]]] = {}
 
     # --- public API ----------------------------------------------------------------------
 
@@ -434,6 +443,8 @@ class LineageService(Repository):
                     [n for n in pending if (n, downstream) not in self._pf_dtp],
                     downstream=downstream,
                 )
+        if direction in ("downstream", "both") and self.capability.is_available("query_provider"):
+            self._prefetch_declared_queries([n for n in pending if n not in self._pf_queries])
 
     def _prefetch_transformations(self, names: list[str], *, downstream: bool) -> None:
         key_col, other_name_col, other_type_col = _TRAN_COLUMNS[downstream]
@@ -538,6 +549,10 @@ class LineageService(Repository):
         hops: list[_Hop] = []
         if direction in ("downstream", "both"):
             hops.extend(self._declared_hops(name, downstream=True))
+            # Before the calc-view branch deliberately: both can produce the same provider->query
+            # edge, the walk keeps the first of a duplicate, and this one is declared metadata where
+            # the other is a naming convention. The order decides which evidence a caller sees.
+            hops.extend(self._declared_query_hops(name))
             hops.extend(self._composite_consumer_hops(name))
             hops.extend(self._query_provider_hops(name, downstream=True))
         if direction in ("upstream", "both"):
@@ -662,6 +677,141 @@ class LineageService(Repository):
                 resolved = (providers[0], compuid)
         self._query_provider_memo[name] = resolved
         return resolved
+
+    # --- declared BEx query consumers (RSZCOMPIC) ----------------------------------------
+
+    def _declared_query_hops(self, name: str) -> list[_Hop]:
+        """BEx queries BW declares against ``name``, from RSZCOMPIC. Defect D12.
+
+        This is the authoritative answer to "which reports read this provider", and it was missing
+        entirely. Query consumers were discovered only by noticing that the calc view BW generates
+        for a query depends on an object's active table - a real fact, but a different one. The two
+        diverge exactly where it matters: measured on a production ADSO, the calc-view route found
+        23 queries reading the object's own table and none of the 48 queries defined on the
+        CompositeProvider above it, because nothing ever asked a CompositeProvider what reports it
+        carries. The walk then reported ``completeness="complete"``.
+
+        The root-element filter is a correctness requirement rather than tidiness: RSZCOMPIC carries
+        a row per query *component*, so a structure or a calculated key figure is assigned to the
+        provider too. Without ``DEFTP='REP'`` the widest measured CompositeProvider would contribute
+        267 nodes for its 48 reports. When the filter cannot be built the branch reports itself
+        unsupported instead of returning components as though they were reports.
+        """
+        if not (
+            self.capability.is_available("query_provider")
+            and self.capability.is_available("query_dir")
+        ):
+            self._walk_incomplete.add("unsupported_branch")
+            return []
+        if self._root_element_filter() is None:
+            # element_dir absent: queries cannot be told apart from their components here.
+            self._walk_incomplete.add("unsupported_branch")
+            return []
+        rows = self._declared_query_rows(name)
+        if len(rows) > _MAX_DECLARED_QUERY_CONSUMERS:
+            self._walk_incomplete.add("semantic_limit")
+        hops: list[_Hop] = []
+        for compid, compuid in rows[:_MAX_DECLARED_QUERY_CONSUMERS]:
+            hops.append(
+                _Hop(
+                    compid,
+                    "query",
+                    LineageEdge(
+                        src=name,
+                        dst=compid,
+                        kind="query_provider",
+                        derivation="declared",
+                        confidence="exact",
+                        note="BEx query defined on this InfoProvider (declared in RSZCOMPIC)",
+                        evidence=evidence_for("declared_query_provider", "rszcompic"),
+                        provenance=self.provenance(
+                            "query_provider", {"INFOCUBE": name, "COMPUID": compuid}
+                        ),
+                    ),
+                )
+            )
+        return hops
+
+    def _root_element_filter(self) -> str | None:
+        """``COMPUID IN (<query roots>)``, or ``None`` when this release cannot express it."""
+        return cast("str | None", self._query_repo()._query_only_filter())
+
+    def _declared_query_rows(self, name: str) -> list[tuple[str, str]]:
+        """``(compid, compuid)`` per declared query, prefetched for the level or read now."""
+        cached = self._pf_queries.get(name)
+        if cached is not None:
+            return cached
+        root_filter = self._root_element_filter()
+        if root_filter is None:
+            return []
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["COMPUID"],
+                    from_logical="query_provider",
+                    where=["INFOCUBE = ?", root_filter],
+                    params=[name],
+                    order_by=["COMPUID"],
+                ),
+                limit=_MAX_DECLARED_QUERY_CONSUMERS + 1,
+            )
+        )
+        compuids = [str(r[0]).strip() for r in rows if str(r[0]).strip()]
+        names_by_uid = self._compids_for(compuids)
+        return [(names_by_uid[uid], uid) for uid in compuids if uid in names_by_uid]
+
+    def _compids_for(self, compuids: list[str]) -> dict[str, str]:
+        """COMPUID -> technical query name, so a graph node carries the name a user recognises."""
+        resolved: dict[str, str] = {}
+        for chunk in _chunks(sorted(set(compuids)), _PREFETCH_CHUNK):
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["COMPUID", "COMPID"],
+                    from_logical="query_dir",
+                    where=[f"COMPUID IN ({placeholders})"],
+                    params=list(chunk),
+                )
+            )
+            for compuid, compid in rows:
+                uid, name = str(compuid).strip(), str(compid).strip()
+                if uid and name:
+                    resolved[uid] = name
+        return resolved
+
+    def _prefetch_declared_queries(self, names: list[str]) -> None:
+        """One RSZCOMPIC read per BFS level instead of two statements per provider node."""
+        root_filter = self._root_element_filter()
+        if root_filter is None:
+            return
+        for chunk in _chunks(names, _PREFETCH_CHUNK):
+            owner_of = {name.strip().upper(): name for name in chunk}
+            buckets: dict[str, list[tuple[str, str]]] = {name: [] for name in chunk}
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["INFOCUBE", "COMPUID"],
+                    from_logical="query_provider",
+                    where=[f"INFOCUBE IN ({placeholders})", root_filter],
+                    params=list(chunk),
+                    order_by=["INFOCUBE", "COMPUID"],
+                )
+            )
+            names_by_uid = self._compids_for([str(r[1]).strip() for r in rows])
+            attributed = True
+            for infocube, compuid in rows:
+                owner = owner_of.get(str(infocube).strip().upper())
+                if owner is None:
+                    attributed = False
+                    break
+                uid = str(compuid).strip()
+                compid = names_by_uid.get(uid)
+                if compid is not None:
+                    buckets[owner].append((compid, uid))
+            if not attributed:
+                continue  # abandon the chunk - see _prefetch_transformations
+            for name, collected in buckets.items():
+                self._pf_queries[name] = collected
 
     # --- CompositeProvider part edges (via the generated HANA calc view) ------------------
 

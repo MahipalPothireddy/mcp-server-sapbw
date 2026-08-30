@@ -63,7 +63,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_get_chain_runtimes` | `unverified` | `verified` | `unverified` | `integration_tested` | `log_chain` |
 | `bw_get_extractor_exit_code` | `needs_connector` | `needs_connector` | `needs_connector` | `not_validated` | - |
 | `bw_get_hana_crossings` | `unverified` | `verified` | `unverified` | `integration_tested` | `object_dependencies` |
-| `bw_get_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `routine_source`, `transformation`, `transformation_step_rout` |
+| `bw_get_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_get_load_closure` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_edges` |
 | `bw_get_provider_health` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_query` | `unverified` | `verified` | `unverified` | `integration_tested` | `element_dir`, `element_range`, `element_text`, `element_xref`, `query_dir`, `query_provider` |
@@ -76,7 +76,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_get_source_systems` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_transfer_rules` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_transformation` | `unverified` | `expected` | `unverified` | `unit_tested` | `transformation`, `transformation_field`, `transformation_rule`, `transformation_step_rout`, `transformation_text` |
-| `bw_impact_analysis` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `routine_source`, `transformation`, `transformation_step_rout` |
+| `bw_impact_analysis` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_list_3x_flows` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_list_analysis_auths` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_list_business_areas` | `unverified` | `verified` | `unverified` | `not_validated` | - |
@@ -91,7 +91,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_performance_profile` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_refresh_cache` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_refresh_capabilities` | `unverified` | `verified` | `unverified` | `not_validated` | - |
-| `bw_render_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `routine_source`, `transformation`, `transformation_step_rout` |
+| `bw_render_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_review_scenario` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_header`, `element_text`, `query_dir`, `query_provider`, `transformation` |
 | `bw_search_objects` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_text`, `dso_header`, `dso_text` |
 | `bw_security_overview` | `unverified` | `verified` | `unverified` | `not_validated` | - |

@@ -518,6 +518,7 @@
         "dso_text",
         "dtp",
         "query_dir",
+        "query_provider",
         "routine_source",
         "transformation",
         "transformation_step_rout"
@@ -745,6 +746,7 @@
         "dso_text",
         "dtp",
         "query_dir",
+        "query_provider",
         "routine_source",
         "transformation",
         "transformation_step_rout"
@@ -978,6 +980,7 @@
         "dso_text",
         "dtp",
         "query_dir",
+        "query_provider",
         "routine_source",
         "transformation",
         "transformation_step_rout"

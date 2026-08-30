@@ -149,6 +149,18 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "on the object's table. The query and its provider come from the view's package name by "
         "BW's generation convention.",
     ),
+    # How a BEx query was connected to the provider it reads. RSZCOMPIC *declares* this, which is a
+    # stronger basis than the generated-calc-view reading above and answers a different question:
+    # the declared link says which queries are defined on a provider, the calc-view reading says
+    # whose generated view happens to read its table. Defect D12 was having only the second, so a
+    # provider's own reports were missing from its consumers while the answer claimed completeness.
+    ("declared_query_provider", "rszcompic"): (
+        "observed",
+        "declared_query_assignment",
+        "RSZCOMPIC assigns this BEx query to this InfoProvider directly, and RSZELTDIR confirms "
+        "the component is a query root (DEFTP='REP') rather than a structure or calculated key "
+        "figure that also carries an assignment row.",
+    ),
     ("lineage_edge", "advisory"): (
         "inferred",
         "routine_select_parse",
