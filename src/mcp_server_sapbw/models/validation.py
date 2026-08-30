@@ -93,6 +93,51 @@ PASSING: frozenset[str] = frozenset({"correct", "correct_but_incomplete"})
 #: and the two failures need different fixes.
 EvidenceQuality = Literal["cited", "partial", "absent", "misattributed"]
 
+#: Evidence qualities that disqualify a verified state however right the answer was.
+#:
+#: ``misattributed`` is the pointed one, and it is defect D10's exact shape: an edge read out of
+#: SYS.OBJECT_DEPENDENCIES that described itself as parsed out of ABAP. The *answer* was correct.
+#: What was wrong was the account of how it was obtained - and REQ-18 makes that account the thing
+#: the product's trustworthiness rests on, so a scenario cannot be held up as validating the server
+#: while recording that the server misdescribed its own reasoning. ``absent`` fails for the weaker
+#: reason that there is nothing to have checked.
+_DISQUALIFYING_EVIDENCE: frozenset[str] = frozenset({"absent", "misattributed"})
+
+#: Names that are not a human verifier. A verified state asserts a *person* checked the answer, and
+#: the one thing that cannot do the checking is the thing under test. Matched on the whole
+#: normalised name, not as a substring, so a real person is not caught by coincidence.
+_NOT_A_HUMAN: frozenset[str] = frozenset(
+    {
+        "mcp-server-sapbw",
+        "mcp server sapbw",
+        "sapbw",
+        "the server",
+        "this server",
+        "this project",
+        "the project",
+        "kiro",
+        "ai",
+        "the ai",
+        "assistant",
+        "the assistant",
+        "agent",
+        "the agent",
+        "self",
+        "n/a",
+        "na",
+        "none",
+        "unknown",
+        "tbd",
+        "-",
+    }
+)
+
+
+def _is_human_name(value: str | None) -> bool:
+    """Whether ``value`` plausibly names a person rather than this software or a placeholder."""
+    normalised = " ".join((value or "").strip().lower().split())
+    return bool(normalised) and normalised not in _NOT_A_HUMAN
+
 
 class GroundTruth(BaseModel):
     """What a human established independently, and how — the thing the MCP is measured against.
@@ -120,6 +165,17 @@ class GroundTruth(BaseModel):
     #: with every transport. Kept here rather than on the scenario so it stays attached to the thing
     #: it dates.
     established_at: datetime | None = None
+    #: Whether the human wrote their reading down **before** being shown this server's answer.
+    #:
+    #: A second axis of independence, and not the same as ``independent``. That one is about
+    #: *method* - whether the truth came from the same tables the server reads. This one is about
+    #: *order*: a verifier who sees our answer first is no longer checking it blind, they are
+    #: agreeing with it, and the two failure modes are unrelated. A ground truth can be
+    #: method-independent and still not blind.
+    #:
+    #: Recorded explicitly rather than inferred, because the timestamps can be absent - but where
+    #: both are present the model checks the claim against them rather than taking it on trust.
+    established_before_answer: bool | None = None
     notes: str | None = None
 
 
@@ -131,7 +187,8 @@ class ScenarioMeasurement(BoundedResult):
     sap_queries_executed: int | None = None
     response_time_ms: int | None = None
     payload_bytes: int | None = None
-    #: From ``Analysis.budget.truncated``: whether a bound stopped the answer short.
+    # ``truncated`` and ``completeness`` come from BoundedResult: whether a bound stopped the answer
+    # short, and which one. Copied from ``Analysis.budget``.
 
 
 class ValidationScenario(BaseModel):
@@ -247,6 +304,62 @@ class ValidationScenario(BaseModel):
                 "round-tripped; it cannot catch a wrong assumption about what a table means, "
                 "because it shares the assumption. Record an independent method, or keep the "
                 "scenario at INTEGRATION_TESTED."
+            )
+        self._require_blind_verification(truth)
+        if not _is_human_name(self.human_expert):
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} with human_expert "
+                f"{self.human_expert!r}, which does not name a person. The one thing that cannot "
+                "verify this server's answer is this server, and a placeholder is not a verifier."
+            )
+        if self.evidence_quality in _DISQUALIFYING_EVIDENCE:
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} with evidence_quality "
+                f"{self.evidence_quality!r}. A correct answer that misdescribes how it was "
+                "obtained "
+                "is defect D10's shape, and REQ-18 makes that account the thing the product rests "
+                "on - so it cannot be cited as validating the server. Record the evidence defect "
+                "and keep the scenario at INTEGRATION_TESTED."
+            )
+
+    def _require_blind_verification(self, truth: GroundTruth) -> None:
+        """The verifier must have written their reading down before seeing ours.
+
+        The second axis of independence, and the one the form asks about in words but nothing
+        checked: someone shown our answer first is agreeing with it, not checking it. Method
+        independence does not cover this - a truth can come from RSA1 and still be recorded after
+        reading our output.
+
+        Where both timestamps exist the claim is checked *against* them, so a record cannot assert
+        blindness the dates contradict. That is the part worth having: a flag on its own is only as
+        good as the author's memory.
+        """
+        if truth.established_before_answer is None:
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} without recording whether the ground "
+                "truth was established before this server's answer was shown "
+                "(ground_truth.established_before_answer). A verifier who saw our answer first is "
+                "agreeing with it rather than checking it, and that has to be on the record."
+            )
+        if not truth.established_before_answer:
+            raise ValueError(
+                f"{self.scenario_id} claims {self.state} on a ground truth established *after* the "
+                "answer was shown. The comparison still has value, but it is not blind, so it "
+                "cannot support a verified state. Keep the scenario at INTEGRATION_TESTED and say "
+                "so in the notes."
+            )
+        if (
+            self.executed_at is not None
+            and truth.established_at is not None
+            and truth.established_at > self.executed_at
+        ):
+            raise ValueError(
+                f"{self.scenario_id} records the ground truth as established before the "
+                "answer, but "
+                f"its timestamps say otherwise: established_at {truth.established_at.isoformat()} "
+                f"is after executed_at {self.executed_at.isoformat()}. One of the two is "
+                "wrong, and "
+                "the model will not pick which."
             )
 
     @property

@@ -32,6 +32,7 @@ def truth(**kwargs: object) -> GroundTruth:
         "expected": "three transformations feed the target",
         "established_by": "BW developer",
         "established_at": _VERIFIED_AT,
+        "established_before_answer": True,
     }
     base.update(kwargs)
     return GroundTruth(**base)  # type: ignore[arg-type]
@@ -43,7 +44,8 @@ def verified(**kwargs: object) -> ValidationScenario:
         "state": "REAL_BW_VALIDATED",
         "correctness": "correct",
         "ground_truth": truth(),
-        "human_expert": "BW developer, platform team",
+        "human_expert": "A. Verifier, BW developer",
+        "evidence_quality": "cited",
     }
     base.update(kwargs)
     return scenario(**base)
@@ -289,3 +291,144 @@ def test_an_empty_suite_claims_nothing() -> None:
     assert suite.executed == 0
     assert suite.real_bw_validated == 0
     assert suite.capability_states() == {}
+
+
+# --- V1: the conditions the model did not previously enforce -------------------------------
+
+
+def test_a_verified_state_requires_the_verification_to_have_been_blind() -> None:
+    """Whether the truth was written down before our answer was shown has to be on the record.
+
+    The second axis of independence, and the one nothing checked. ``independent`` is about
+    *method* - did the truth come from the same tables the server reads. This is about
+    *order*: a verifier shown
+    our answer first is agreeing with it, not checking it, and a ground truth can be
+    method-independent while still not being blind.
+    """
+    with pytest.raises(ValidationError, match="established before this server's answer"):
+        verified(ground_truth=truth(established_before_answer=None))
+
+
+def test_a_verification_made_after_seeing_our_answer_is_not_a_verified_state() -> None:
+    """It still has value. It just cannot support the rung that asserts the answer was checked."""
+    with pytest.raises(ValidationError, match="not blind"):
+        verified(ground_truth=truth(established_before_answer=False))
+
+
+def test_the_blindness_claim_is_checked_against_the_timestamps() -> None:
+    """A flag on its own is only as good as the author's memory, so the dates get a vote.
+
+    This is the part worth having over a bare checkbox: a record cannot assert it was blind
+    while its
+    own timestamps say the truth was established after the call ran.
+    """
+    with pytest.raises(ValidationError, match="timestamps say otherwise"):
+        verified(
+            ground_truth=truth(established_at=datetime(2026, 8, 21, 12, 0, tzinfo=UTC)),
+            executed_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_consistent_timestamps_are_accepted() -> None:
+    """The positive case, so the rule is satisfiable rather than merely strict."""
+    entry = verified(
+        ground_truth=truth(established_at=datetime(2026, 8, 20, 9, 0, tzinfo=UTC)),
+        executed_at=datetime(2026, 8, 20, 11, 0, tzinfo=UTC),
+    )
+    assert entry.state == "REAL_BW_VALIDATED"
+
+
+def test_missing_timestamps_do_not_block_a_declared_blind_verification() -> None:
+    """``executed_at`` is optional, and absence must not be read as a contradiction."""
+    entry = verified(executed_at=None)
+    assert entry.state == "REAL_BW_VALIDATED"
+
+
+@pytest.mark.parametrize(
+    "impostor",
+    [
+        "mcp-server-sapbw",
+        "Kiro",
+        "the server",
+        "THIS PROJECT",
+        "assistant",
+        "AI",
+        "n/a",
+        "TBD",
+        "-",
+    ],
+)
+def test_the_thing_under_test_cannot_be_its_own_verifier(impostor: str) -> None:
+    """A verified state asserts a person checked the answer. Software cannot, nor can a placeholder.
+
+    The name was previously only required to be non-blank, so ``human_expert="the server"``
+    satisfied
+    it - which is the claim this rung exists to make impossible.
+    """
+    with pytest.raises(ValidationError, match="does not name a person"):
+        verified(human_expert=impostor)
+
+
+def test_a_real_name_is_accepted_even_when_it_contains_a_reserved_word() -> None:
+    """Matched on the whole name, not as a substring, so a person is not caught by coincidence."""
+    entry = verified(human_expert="Ai Nguyen, BW developer")
+    assert entry.human_expert is not None
+
+
+@pytest.mark.parametrize("quality", ["absent", "misattributed"])
+def test_a_verified_state_is_rejected_on_disqualifying_evidence(quality: str) -> None:
+    """``misattributed`` is defect D10's shape, and disqualifies however right the answer was.
+
+    D10 was an edge read out of SYS.OBJECT_DEPENDENCIES that described itself as parsed out of ABAP.
+    The answer was correct; the account of how it was obtained was not. REQ-18 makes that account
+    the thing the product's trustworthiness rests on, so a scenario recording it cannot at the same
+    time be cited as validating the server.
+    """
+    with pytest.raises(ValidationError, match="evidence_quality"):
+        verified(evidence_quality=quality)
+
+
+@pytest.mark.parametrize("quality", ["cited", "partial"])
+def test_evidence_that_was_actually_checked_is_accepted(quality: str) -> None:
+    entry = verified(evidence_quality=quality)
+    assert entry.state == "REAL_BW_VALIDATED"
+
+
+def test_none_of_the_new_rules_apply_below_a_verified_state() -> None:
+    """They gate the *claim*, not the recording. An in-progress scenario stays writable."""
+    entry = scenario(
+        state="INTEGRATION_TESTED",
+        correctness="correct",
+        human_expert="the server",
+        evidence_quality="misattributed",
+        ground_truth=truth(established_before_answer=False),
+    )
+    assert entry.state == "INTEGRATION_TESTED"
+    assert entry.passed is True
+
+
+def test_every_verified_condition_has_its_own_message() -> None:
+    """A rejection has to say which condition failed, or the author is left guessing.
+
+    Asserted rather than assumed: one shared message across six conditions would make the model
+    strict and unhelpful at the same time.
+    """
+    cases: dict[str, dict[str, object]] = {
+        "no ground truth": {"ground_truth": None},
+        "no named human_expert": {"human_expert": None},
+        "no verification date": {"ground_truth": truth(established_at=None)},
+        "NOT independent": {"ground_truth": truth(independent=False)},
+        "established before this server's answer": {
+            "ground_truth": truth(established_before_answer=None)
+        },
+        "does not name a person": {"human_expert": "kiro"},
+        "evidence_quality": {"evidence_quality": "absent"},
+    }
+    seen: set[str] = set()
+    for expected, override in cases.items():
+        # `match=` already pins that this condition produced its own wording; the set then pins that
+        # no two conditions produced the *same* wording.
+        with pytest.raises(ValidationError, match=expected) as excinfo:
+            verified(**override)
+        seen.add(str(excinfo.value))
+    assert len(seen) == len(cases), "two conditions share a rejection message"
