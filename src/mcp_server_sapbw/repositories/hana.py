@@ -197,51 +197,11 @@ class HanaRepository(Repository):
         unsupported = self.require("object_dependencies")
         if unsupported is not None:
             return unsupported
-        rows = self.select(
-            self.dialect.paginate(
-                self.dialect.build_select(
-                    columns=["BASE_SCHEMA_NAME", "BASE_OBJECT_NAME", "BASE_OBJECT_TYPE"],
-                    from_logical="object_dependencies",
-                    # Ordered because the read is capped: an unordered LIMIT returns an arbitrary
-                    # subset, and possibly a different one per call (D8).
-                    order_by=["BASE_SCHEMA_NAME", "BASE_OBJECT_NAME"],
-                    where=[
-                        "DEPENDENT_SCHEMA_NAME = ?",
-                        "DEPENDENT_OBJECT_NAME = ?",
-                        "DEPENDENCY_TYPE = ?",
-                    ],
-                    params=[_CALC_SCHEMA, view_name, _DIRECT],
-                ),
-                limit=_MAX_BASE_TABLES + 1,
-            )
-        )
-        truncated = len(rows) > _MAX_BASE_TABLES
-        base_tables: list[BaseTableRef] = []
+        base_tables, truncated = self._base_tables(view_name)
         resolved: list[str] = []
-        seen: set[str] = set()
-        for base_schema, base_object, base_type in rows[:_MAX_BASE_TABLES]:
-            table = _clean(base_object)
-            if table is None or table in seen:
-                continue
-            seen.add(table)
-            is_bw = _is_bw_generated(table)
-            obj, kind, _confidence = _resolve_bw_table(table) if is_bw else (None, None, None)
-            if obj and obj not in resolved:
-                resolved.append(obj)
-            base_tables.append(
-                BaseTableRef(
-                    table=table,
-                    schema_name=_clean(base_schema),
-                    object_type=_clean(base_type),
-                    is_bw_generated=is_bw,
-                    resolved_object=obj,
-                    resolved_kind=kind,
-                    provenance=self.provenance(
-                        "object_dependencies",
-                        {"DEPENDENT_OBJECT_NAME": view_name, "BASE_OBJECT_NAME": table},
-                    ),
-                )
-            )
+        for entry in base_tables:
+            if entry.resolved_object and entry.resolved_object not in resolved:
+                resolved.append(entry.resolved_object)
         consumers, consumers_truncated = self._consuming_bw_providers(view_name)
         # Which cap bound, not merely that one did (D6). The two mean different things to a caller:
         # a capped base-table list understates what the view reads, a capped consumer list
@@ -280,6 +240,52 @@ class HanaRepository(Repository):
                 {"DEPENDENT_SCHEMA_NAME": _CALC_SCHEMA, "DEPENDENT_OBJECT_NAME": view_name},
             ),
         )
+
+    def _base_tables(self, view_name: str) -> tuple[list[BaseTableRef], bool]:
+        """``(base tables, whether the row cap bound)`` for one calc view."""
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["BASE_SCHEMA_NAME", "BASE_OBJECT_NAME", "BASE_OBJECT_TYPE"],
+                    from_logical="object_dependencies",
+                    # Ordered because the read is capped: an unordered LIMIT returns an arbitrary
+                    # subset, and possibly a different one per call (D8).
+                    order_by=["BASE_SCHEMA_NAME", "BASE_OBJECT_NAME"],
+                    where=[
+                        "DEPENDENT_SCHEMA_NAME = ?",
+                        "DEPENDENT_OBJECT_NAME = ?",
+                        "DEPENDENCY_TYPE = ?",
+                    ],
+                    params=[_CALC_SCHEMA, view_name, _DIRECT],
+                ),
+                limit=_MAX_BASE_TABLES + 1,
+            )
+        )
+        truncated = len(rows) > _MAX_BASE_TABLES
+        base_tables: list[BaseTableRef] = []
+        seen: set[str] = set()
+        for base_schema, base_object, base_type in rows[:_MAX_BASE_TABLES]:
+            table = _clean(base_object)
+            if table is None or table in seen:
+                continue
+            seen.add(table)
+            is_bw = _is_bw_generated(table)
+            obj, kind, _confidence = _resolve_bw_table(table) if is_bw else (None, None, None)
+            base_tables.append(
+                BaseTableRef(
+                    table=table,
+                    schema_name=_clean(base_schema),
+                    object_type=_clean(base_type),
+                    is_bw_generated=is_bw,
+                    resolved_object=obj,
+                    resolved_kind=kind,
+                    provenance=self.provenance(
+                        "object_dependencies",
+                        {"DEPENDENT_OBJECT_NAME": view_name, "BASE_OBJECT_NAME": table},
+                    ),
+                )
+            )
+        return base_tables, truncated
 
     # --- calc-view logic (the activated definition) ---------------------------------------
 

@@ -37,6 +37,9 @@ _TABLES = {
     "global_variable": "RSZGLOBV",
     "transformation": "RSTRAN",
     "dtp": "RSBKDTP",
+    # The source-system boundary: RSDS names the extract structure, RSDSSEGFD proves an enhancement.
+    "datasource": "RSDS",
+    "datasource_field": "RSDSSEGFD",
 }
 
 # COMPUID, COMPID, OWNER, TSTPNM, LASTUSED, OBJSTAT
@@ -115,6 +118,11 @@ _TRANS_BY_TARGET = {
     "SALES_CUBE": [("SALES_DSO", "ODSO", "TR1")],
     "SALES_DSO": [("DS_SALES", "RSDS", "TR0")],
 }
+# RSDS, keyed by DataSource: (EXSTRUCTURE, TYPE, DELTA). The extract structure the source system
+# fills is what takes the walk one hop past the DataSource.
+_RSDS = {"DS_SALES": ("EXTSTRU_SALES", "D", "ABR")}
+#: Customer-namespace fields on the extract structure: metadata-confirmed enhancement evidence.
+_RSDS_CUSTOM_FIELDS = {"DS_SALES": 4}
 
 
 def _in_params(sql: str, params: list[Any]) -> set[str]:
@@ -157,6 +165,11 @@ class ScriptedConnection:
             return [(k, *v) for k, v in _GLOBV.items() if k in ids]
         if "RSBKDTP" in sql:
             return []
+        if "RSDSSEGFD" in sql:  # customer-namespace field count for one DataSource
+            return [(_RSDS_CUSTOM_FIELDS.get(str(params[-1]), 0),)]
+        if "RSDS" in sql:  # the DataSource header: extract structure, type, delta
+            row = _RSDS.get(str(params[0]))
+            return [row] if row else []
         if "RSTRAN" in sql:  # lineage trace: upstream by TARGETNAME
             return [(s, ty, tr) for s, ty, tr in _TRANS_BY_TARGET.get(str(params[-1]), [])]
         return []
@@ -269,8 +282,32 @@ def test_get_query_lineage_reaches_datasource_and_flags_exit_var() -> None:
     assert {"MATERIAL", "AMOUNT", "CURRENCY"} <= iobjs
     material = next(p for p in lineage.paths if p.iobjnm == "MATERIAL")
     assert material.reaches_datasource is True
-    ds_hops = [h for h in material.hops if h.via == "datasource"]
-    assert any(h.object_name == "DS_SALES" for h in ds_hops)
+    assert [h.via for h in material.hops][-1] == "datasource"
+    # The provider's boundary set is carried once on the result rather than restated per field.
+    assert "DS_SALES" in lineage.provider_datasources
+
+
+def test_the_provider_boundary_is_named_once_not_repeated_per_field() -> None:
+    """The 6,500-hop defect: the fallback used to append every DataSource to every field's path.
+
+    Two properties together are the fix. A fallback path carries *one* boundary hop rather than one
+    per DataSource, and the names live on the result. Asserting only the first would pass on a
+    version that dropped the names entirely, which is a different kind of wrong answer.
+    """
+    lineage = _repo().get_query_lineage("QUERY_SALES")
+    assert not isinstance(lineage, UnsupportedResult)
+    fallbacks = [p for p in lineage.paths if p.resolution == "provider"]
+    assert fallbacks, "the fixture must exercise the fallback for this test to mean anything"
+    for path in fallbacks:
+        boundary = [h for h in path.hops if h.via == "datasource"]
+        assert len(boundary) == 1, (
+            "the provider's DataSources are alternatives, not a chain: one boundary hop, not one "
+            f"hop each. {path.iobjnm} carried {len(boundary)}"
+        )
+        assert boundary[0].advisory is True, (
+            "the provider's boundary is not this field's derivation"
+        )
+    assert lineage.provider_datasources, "the boundary set must still be reachable"
 
 
 def test_lineage_service_resolves_query_to_provider_and_datasource() -> None:
@@ -282,6 +319,152 @@ def test_lineage_service_resolves_query_to_provider_and_datasource() -> None:
     assert "SALES_CUBE" in names
     assert "DS_SALES" in names
     assert any(e.kind == "query_provider" for e in graph.edges)
+
+
+# --- past the DataSource: the source-system boundary --------------------------------------------
+#
+# The DataSource used to be a hard stop. ``source_extract`` and ``source_object`` were defined in
+# the model and never produced, so an upstream walk answered "this came from a DataSource" and left
+# the next question - extracted by what? - unanswered.
+
+
+def test_the_walk_continues_past_the_datasource_to_its_extract_structure() -> None:
+    service = LineageService(ScriptedConnection(), _capability())
+    graph = service.get_lineage("QUERY_SALES", direction="upstream", depth=4)
+    assert not isinstance(graph, UnsupportedResult)
+    by_type = {n.name: n.object_type for n in graph.nodes}
+    assert by_type.get("EXTSTRU_SALES") == "source_object"
+    edge = next(e for e in graph.edges if e.kind == "source_extract")
+    assert (edge.src, edge.dst) == ("EXTSTRU_SALES", "DS_SALES")
+    assert edge.confidence == "exact", "RSDS declares this; it is not a naming-convention reading"
+
+
+def test_the_boundary_node_stops_claiming_its_upstream_is_unresolved() -> None:
+    """A node with a resolved parent in the same graph must not also say the graph ends there."""
+    service = LineageService(ScriptedConnection(), _capability())
+    graph = service.get_lineage("QUERY_SALES", direction="upstream", depth=4)
+    assert not isinstance(graph, UnsupportedResult)
+    boundary = next(n for n in graph.nodes if n.name == "DS_SALES")
+    assert boundary.upstream_resolved is True
+    assert boundary.source_system is not None
+    assert boundary.source_system.object_name == "EXTSTRU_SALES"
+
+
+def test_trace_to_source_reports_a_resolved_boundary_as_resolved() -> None:
+    service = LineageService(ScriptedConnection(), _capability())
+    trace = service.trace_to_source("QUERY_SALES", depth=4)
+    assert not isinstance(trace, UnsupportedResult)
+    assert "DS_SALES" in trace.datasources_reached
+    assert "DS_SALES" not in trace.unresolved_boundaries, (
+        "the extract structure was resolved, so listing the DataSource as an open boundary would "
+        "leave a caller no way to tell which boundaries really are still open"
+    )
+    assert any("extract structure" in c for c in trace.caveats)
+
+
+def test_the_boundary_edge_reports_enhancement_evidence_and_names_the_gap() -> None:
+    """Customer-namespace fields prove an enhancement exists; the code itself is not in BW."""
+    service = LineageService(ScriptedConnection(), _capability())
+    graph = service.get_lineage("QUERY_SALES", direction="upstream", depth=4)
+    assert not isinstance(graph, UnsupportedResult)
+    edge = next(e for e in graph.edges if e.kind == "source_extract")
+    assert edge.note is not None
+    assert "4 customer-namespace field(s)" in edge.note
+    assert "bw_get_extractor_exit_code" in edge.note, "the gap must name the tool that closes it"
+    assert "delta method ABR" in edge.note
+
+
+def test_no_extract_structure_means_no_invented_boundary_node() -> None:
+    """An unresolved boundary is a better answer than a synthesized extractor name."""
+
+    class NoRsds(ScriptedConnection):
+        def execute_select(
+            self, sql: str, parameters: Sequence[Any] | None = None
+        ) -> list[tuple[Any, ...]]:
+            if "RSDSSEGFD" not in sql and "RSDS" in sql:
+                return []
+            return super().execute_select(sql, parameters)
+
+    graph = LineageService(NoRsds(), _capability()).get_lineage(
+        "QUERY_SALES", direction="upstream", depth=4
+    )
+    assert not isinstance(graph, UnsupportedResult)
+    assert not any(e.kind == "source_extract" for e in graph.edges)
+    assert not any(n.object_type == "source_object" for n in graph.nodes)
+    boundary = next(n for n in graph.nodes if n.name == "DS_SALES")
+    assert boundary.upstream_resolved is False
+
+
+def test_an_absent_datasource_table_leaves_the_boundary_where_it_was() -> None:
+    service = LineageService(
+        ScriptedConnection(), _capability(present=set(_TABLES) - {"datasource"})
+    )
+    graph = service.get_lineage("QUERY_SALES", direction="upstream", depth=4)
+    assert not isinstance(graph, UnsupportedResult)
+    assert not any(e.kind == "source_extract" for e in graph.edges)
+
+
+# --- a node that is not a BW object is not asked BW questions ------------------------------------
+
+
+def test_an_extract_structure_is_terminal_rather_than_expanded_as_a_provider() -> None:
+    """It is source-system ABAP: no transformation targets it and no query reads it.
+
+    Asked anyway, each boundary node cost a full provider expansion to conclude nothing - measured,
+    about 200 statements on a production walk. It still belongs in the graph; only its expansion is
+    meaningless.
+    """
+
+    class Counting(ScriptedConnection):
+        def __init__(self) -> None:
+            self.seen: list[str] = []
+
+        def execute_select(
+            self, sql: str, parameters: Sequence[Any] | None = None
+        ) -> list[tuple[Any, ...]]:
+            self.seen.append(str(list(parameters or [])))
+            return super().execute_select(sql, parameters)
+
+    connection = Counting()
+    graph = LineageService(connection, _capability()).get_lineage(
+        "QUERY_SALES", direction="upstream", depth=6
+    )
+    assert not isinstance(graph, UnsupportedResult)
+    assert any(n.name == "EXTSTRU_SALES" for n in graph.nodes), "the node must still be present"
+    asked_about_it = [s for s in connection.seen if "EXTSTRU_SALES" in s]
+    assert asked_about_it == [], (
+        f"the extract structure was expanded as a BW object: {asked_about_it}"
+    )
+
+
+# --- depth counts load layers, not hops ---------------------------------------------------------
+
+
+def test_resolving_the_query_to_its_provider_does_not_spend_a_depth_level() -> None:
+    """From a query root, ``depth`` must mean what it means from the provider it reads.
+
+    Charged a level, ``depth=2`` from the query reached only the DSO where the same request on the
+    provider reached the DataSource - so the same number meant different things depending on which
+    object the caller happened to name.
+    """
+    service = LineageService(ScriptedConnection(), _capability())
+    from_query = service.get_lineage("QUERY_SALES", direction="upstream", depth=2)
+    from_provider = service.get_lineage("SALES_CUBE", direction="upstream", depth=2)
+    assert not isinstance(from_query, UnsupportedResult)
+    assert not isinstance(from_provider, UnsupportedResult)
+    reached_from_query = {n.name for n in from_query.nodes} - {"QUERY_SALES"}
+    assert reached_from_query >= {n.name for n in from_provider.nodes}
+
+
+def test_crossing_the_source_boundary_does_not_spend_a_depth_level_either() -> None:
+    """Charged, the extractor appeared only for DataSources that had a level left over."""
+    service = LineageService(ScriptedConnection(), _capability())
+    # Exactly enough depth to reach the DataSource: the extract structure must come with it.
+    graph = service.get_lineage("SALES_CUBE", direction="upstream", depth=2)
+    assert not isinstance(graph, UnsupportedResult)
+    names = {n.name for n in graph.nodes}
+    assert "DS_SALES" in names
+    assert "EXTSTRU_SALES" in names
 
 
 def test_list_queries_and_provider_filter() -> None:

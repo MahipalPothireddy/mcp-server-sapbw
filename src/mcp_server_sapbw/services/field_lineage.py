@@ -10,12 +10,22 @@ The walk, per field:
 .. code-block:: text
 
     InfoObject in the query
-      -> the transformation whose TARGET is the provider and which maps this field
+      -> if the object is a CompositeProvider: the declared model on RSOHCPR names the part that
+         supplies this element, and the field it supplies it from
+      -> otherwise the transformation whose TARGET is the object and which maps this field
       -> the rule populating it (RSTRANRULE): direct / constant / formula / routine / master-data
          read / time conversion
       -> that rule's source field(s) (RSTRANFIELD PARAMTYPE='0')
       -> repeat from the transformation's source object, now tracking the source field
       -> stop at a DataSource
+
+**The CompositeProvider hop is not an extra; it is the one that made this reader work at all.** A
+CompositeProvider has no transformation, so the transformation route finds nothing and the walk used
+to end at hop zero for every field of every CompositeProvider-based query - measured on a production
+query, 100 of 100 InfoObjects. Since a CompositeProvider is what a BEx query normally reads on
+BW-on-HANA, that was most of the subject matter. The mapping is declared metadata (mission Section 6
+asks for it by name: "for CompositeProviders: which part-provider supplies it"), so this hop is
+``observed`` rather than advisory.
 
 Two honesty properties matter more than coverage:
 
@@ -36,15 +46,25 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..models.composite import CompositeFieldOrigin, composite_mapping_evidence
 from ..models.provenance import UnsupportedResult
 from ..models.queries import FieldLineageHop, FieldLineagePath
 from ..models.transformations import FieldMapping, Transformation
 from ..repositories.base import Repository
+from ..repositories.providers import ProvidersRepository
 from ..repositories.transformations import TransformationsRepository
 
 # Endpoint kinds that end the walk: a DataSource is the warehouse boundary.
 _BOUNDARY_KINDS = frozenset({"datasource"})
-_MAX_DEPTH = 8
+#: A calculation-view part is a boundary of a different kind: the field really does come from there,
+#: but its own lineage is in the HANA catalogue, not in BW's transformation graph. Reported as a
+#: named stop carrying the tool that continues it, not as a failure to resolve.
+_HANA_BOUNDARY_KINDS = frozenset({"calcview"})
+#: Depth is per *layer*, and a CompositeProvider hop consumes one without moving through a
+#: transformation, so the stack a CompositeProvider sits on needs headroom above the DSO layers.
+#: Measured: query -> CompositeProvider -> ADSO -> DSO -> DSO -> DataSource is five, and a stacked
+#: model adds one per internal node.
+_MAX_DEPTH = 12
 _MAX_INBOUND_PER_LAYER = 12  # a provider fed by more than this is a merge; sampling is enough
 _ROUTINE_RULES = frozenset({"routine", "formula"})
 
@@ -62,10 +82,15 @@ class FieldLineageService(Repository):
     def __init__(self, connection: Any, capability: Any, cache: Any = None) -> None:
         super().__init__(connection, capability, cache)
         self._transformations = TransformationsRepository(connection, capability, cache)
+        self._providers = ProvidersRepository(connection, capability, cache)
         # Per-instance memos: every field of a provider shares its inbound transformations.
         self._inbound: dict[str, list[str]] = {}
         self._mappings: dict[str, dict[str, FieldMapping]] = {}
         self._headers: dict[str, Transformation | None] = {}
+        #: object -> its declared CompositeProvider model, or None when it is not one. ``None`` is a
+        #: cached answer rather than a miss, so "this is not a CompositeProvider" costs one lookup
+        #: for the whole query instead of one LOB probe per field.
+        self._composite: dict[str, Any] = {}
 
     # --- public -------------------------------------------------------------------------
 
@@ -88,10 +113,15 @@ class FieldLineageService(Repository):
             if step is None:
                 if resolution == "none":
                     reason = (
-                        f"no transformation rule populating '{current_field}' in "
-                        f"'{current_object}' was found; the field may be a navigation "
-                        "attribute, come from a CompositeProvider mapping, or be filled by "
-                        "a start/end routine rather than a field rule"
+                        f"no rule or CompositeProvider mapping populating '{current_field}' in "
+                        f"'{current_object}' was found; the field may be a navigation attribute, "
+                        "or be filled by a start/end routine rather than by a field rule"
+                    )
+                else:
+                    reason = (
+                        f"the walk reached '{current_object}' but found no rule populating "
+                        f"'{current_field}' there, so the chain above this point is complete and "
+                        "below it is unknown"
                     )
                 break
             hop, next_object, next_field, is_boundary = step
@@ -100,6 +130,15 @@ class FieldLineageService(Repository):
             advisory = advisory or hop.advisory
             if is_boundary:
                 reached = True
+                break
+            if hop.via == "calc_view":
+                # A real answer, not a dead end: the field comes from this calculation view, whose
+                # own lineage is in the HANA catalogue rather than in BW's transformation graph.
+                reason = (
+                    f"the field comes from calculation view '{hop.object_name}', which is outside "
+                    "BW's transformation graph; continue with bw_get_calc_view_lineage or "
+                    "bw_get_calc_view_logic for its base tables and its logic"
+                )
                 break
             if next_object is None or next_field is None:
                 reason = (
@@ -130,7 +169,92 @@ class FieldLineageService(Repository):
     def _one_hop(
         self, target_object: str, target_field: str
     ) -> tuple[FieldLineageHop, str | None, str | None, bool] | None:
-        """The rule that populates ``target_field`` in ``target_object``, and where it leads."""
+        """One layer up from ``target_field`` in ``target_object``, however BW declares it.
+
+        The transformation route is tried first because it is the one carrying a *rule* - how the
+        field was derived, not only where it came from. A CompositeProvider has no transformation at
+        all, so the declared model is its only route; trying it second costs nothing on the common
+        path, since the memo answers "not a CompositeProvider" once per object.
+        """
+        rule_hop = self._transformation_hop(target_object, target_field)
+        if rule_hop is not None:
+            return rule_hop
+        return self._composite_hop(target_object, target_field)
+
+    def _composite_hop(
+        self, target_object: str, target_field: str
+    ) -> tuple[FieldLineageHop, str | None, str | None, bool] | None:
+        """The CompositeProvider part that supplies ``target_field``, from the declared model.
+
+        Fans out by nature: a union is normally fed the same element by several parts. Every one is
+        reported in ``source_objects`` and the chain follows the first in sorted order - a
+        deterministic choice, stated as a choice, rather than whichever part the model happened to
+        list first. Following one branch and *not* saying so is what would make this misleading.
+        """
+        model = self._composite_model(target_object)
+        if model is None:
+            return None
+        origins = model.resolve_field(target_field)
+        if not origins:
+            return None
+        ordered = sorted(origins, key=lambda o: (o.part_name, o.source_field or ""))
+        chosen = ordered[0]
+        others = sorted({o.part_name for o in ordered})
+        is_boundary = chosen.part_kind in _BOUNDARY_KINDS
+        is_hana = chosen.part_kind in _HANA_BOUNDARY_KINDS
+        hop = FieldLineageHop(
+            object_name=chosen.runtime_view_name or chosen.part_name,
+            object_type=chosen.part_kind,
+            via="calc_view" if is_hana else "composite_part",
+            advisory=False,  # BW's own stored model, read whole
+            target_field=target_field,
+            rule_type=(
+                "composite_constant" if chosen.mapping_kind == "constant" else "composite_mapping"
+            ),
+            source_fields=[chosen.source_field] if chosen.source_field else [],
+            source_objects=others if len(others) > 1 else [],
+            via_aliases=list(chosen.via_aliases),
+            evidence=composite_mapping_evidence(chosen.part_kind),
+            note=self._composite_note(model.node_type, ordered, chosen),
+        )
+        if is_hana:
+            return hop, None, None, False
+        return hop, chosen.part_name, chosen.source_field, is_boundary
+
+    @staticmethod
+    def _composite_note(
+        node_type: str | None, ordered: list[CompositeFieldOrigin], chosen: CompositeFieldOrigin
+    ) -> str:
+        """Say what the fan-out means, in the terms the node type makes true."""
+        combine = "union" if (node_type or "").lower().endswith("union") else "node"
+        if chosen.mapping_kind == "constant":
+            return (
+                "the CompositeProvider model fixes this element as a constant for this part, so "
+                "there is no source field above it to follow"
+            )
+        if len(ordered) <= 1:
+            return "declared in the CompositeProvider's stored model; a single part supplies it"
+        names = ", ".join(o.part_name for o in ordered)
+        return (
+            f"{len(ordered)} parts supply this element through the CompositeProvider's {combine}, "
+            f"each equally the source of some of its rows ({names}). This chain follows "
+            f"{chosen.part_name}; source_objects lists them all, and the others are traced by "
+            "asking for the same field on each part."
+        )
+
+    def _composite_model(self, name: str) -> Any:
+        """The object's declared CompositeProvider model, or ``None`` when it is not one."""
+        if name in self._composite:
+            return self._composite[name]
+        model = self._providers.composite_model(name)
+        resolved = model if (model is not None and model.parsed and model.inputs) else None
+        self._composite[name] = resolved
+        return resolved
+
+    def _transformation_hop(
+        self, target_object: str, target_field: str
+    ) -> tuple[FieldLineageHop, str | None, str | None, bool] | None:
+        """The transformation rule that populates ``target_field`` in ``target_object``."""
         for tran_id in self._inbound_transformations(target_object):
             mapping = self._mappings_for(tran_id).get(target_field.upper())
             if mapping is None:

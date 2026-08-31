@@ -336,7 +336,7 @@ def test_describe_multiprovider_parts_and_generated_description() -> None:
 
 
 def test_describe_compositeprovider_resolves_parts_via_calc_view() -> None:
-    """XML_DEF is empty, so parts must come from the generated calc view's base tables."""
+    """No stored model, so parts must fall back to the generated calc view's base tables."""
     provider = _repo().describe("SALES_CP")
     assert not isinstance(provider, (ObjectNotFound, UnsupportedResult))
     assert provider.object_type == "compositeprovider"
@@ -347,8 +347,10 @@ def test_describe_compositeprovider_resolves_parts_via_calc_view() -> None:
     assert all(p.via_table for p in provider.part_providers)
     # Confirmed against the provider catalogue, so not a naming-convention guess.
     assert {p.confidence for p in provider.part_providers} == {"confirmed"}
-    # The empty XML_DEF is reported as a finding rather than passed over silently.
-    assert any("XML_DEF is empty" in c for c in provider.caveats)
+    # The absent model is reported as a finding rather than passed over silently, and the caveat
+    # names the fallback so a reader knows the parts are a convention reading.
+    assert any("declared composition is unavailable" in c for c in provider.caveats)
+    assert any("generated calc view" in c for c in provider.caveats)
     assert {f.name for f in provider.fields} == {"MATERIAL"}
 
 

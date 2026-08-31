@@ -25,7 +25,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_access_report` | `constant` | 10,097 B | — | 5000 statements / 300s per call |
 | `bw_analyze_object` | `per_graph_node` | 9,380 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_process_chain` | `per_object` | 3,993 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_analyze_query` | `per_object` | 8,025 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_analyze_query` | `per_object` | 9,254 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_routine` | `per_object` | 1,118 B | — | 5000 statements / 300s per call |
 | `bw_assess_change_impact` | `per_graph_node` | 9,922 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_assess_landscape` | `per_system` | 5,768 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
@@ -52,7 +52,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_get_provider_health` | `per_object` | 437 B | — | 5000 statements / 300s per call |
 | `bw_get_query` | `per_object` | 1,018 B | — | 5000 statements / 300s per call |
 | `bw_get_query_auth_exposure` | `per_object` | 587 B | — | 5000 statements / 300s per call |
-| `bw_get_query_lineage` | `per_object` | 674 B | — | 5000 statements / 300s per call |
+| `bw_get_query_lineage` | `per_object` | 1,268 B | — | 5000 statements / 300s per call |
 | `bw_get_query_usage` | `per_object` | 244 B | — | 5000 statements / 300s per call |
 | `bw_get_routine_code` | `per_object` | 302 B | — | 5000 statements / 300s per call |
 | `bw_get_routine_register` | `per_system` | 1,170 B | — | 500 routines parsed (default 100); 5000 statements / 300s per call |
@@ -82,7 +82,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_support_matrix` | `constant` | 22,566 B | — | 5000 statements / 300s per call |
 | `bw_system_profile` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
 | `bw_trace_to_source` | `per_graph_node` | 1,790 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
-| `bw_troubleshoot_missing_data` | `per_graph_node` | 8,369 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_troubleshoot_missing_data` | `per_graph_node` | 9,598 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 
 ## Observed on the reference system
 

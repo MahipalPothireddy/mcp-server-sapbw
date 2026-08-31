@@ -320,15 +320,28 @@ class FieldLineageHop(BaseModel):
     (direct, constant, formula, routine, master-data read, time conversion), and ``source_fields``
     are the inputs the rule reads. A ``routine`` rule carries ``routine_code_id`` and is marked
     advisory, because what the ABAP actually reads is a heuristic lower bound.
+
+    A ``composite_part`` hop crosses a CompositeProvider, which has no transformation at all: its
+    mapping is declared in the model BW stores on ``RSOHCPR``. That hop routinely **fans out** - a
+    union is normally fed the same element by several parts - so ``source_objects`` carries every
+    object that supplies the field while ``object_name`` names the one this chain follows. The two
+    stand in the same relation as ``LineageEdge.update_mode`` to ``update_modes``: a scalar for
+    readers that want one value, the full set beside it so nothing is hidden by the choice.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     object_name: str
     object_type: str
-    via: Literal["provider", "transformation", "dtp", "routine_lookup", "datasource"] = (
-        "transformation"
-    )
+    via: Literal[
+        "provider",
+        "transformation",
+        "dtp",
+        "routine_lookup",
+        "datasource",
+        "composite_part",
+        "calc_view",
+    ] = "transformation"
     advisory: bool = False
     evidence: Evidence | None = None
     # Rule-level detail, populated for transformation hops.
@@ -337,6 +350,13 @@ class FieldLineageHop(BaseModel):
     source_fields: list[str] = Field(default_factory=list)
     transformation_id: str | None = None
     routine_code_id: str | None = None
+    #: Every object that supplies ``target_field`` at this hop, when more than one does. Empty when
+    #: the hop has a single source, so its presence is itself the signal that a choice was made.
+    #: Sorted, so which object ``object_name`` names is reproducible and not row-order dependent.
+    source_objects: list[str] = Field(default_factory=list)
+    #: The CompositeProvider input aliases traversed to reach this part, outermost first. More than
+    #: one entry means the field came through a stacked model's internal node.
+    via_aliases: list[str] = Field(default_factory=list)
     note: str | None = None
 
     @model_validator(mode="after")
@@ -418,6 +438,11 @@ class QueryLineage(BaseModel):
     compid: str | None = None
     providers: list[str] = Field(default_factory=list)
     paths: list[FieldLineagePath] = Field(default_factory=list)
+    #: Every DataSource the query's provider reaches upstream. A property of the *provider*, carried
+    #: once here rather than repeated on every path that falls back to it - it is identical for
+    #: each, and on a measured production query repeating it cost 6,500 hops asserting a shape that
+    #: does not exist. A path with ``resolution='provider'`` points here instead of restating it.
+    provider_datasources: list[str] = Field(default_factory=list)
     customer_exit_variables: list[str] = Field(default_factory=list)  # lineage dead ends
     caveats: list[str] = Field(default_factory=list)
     provenance: Provenance | list[Provenance]

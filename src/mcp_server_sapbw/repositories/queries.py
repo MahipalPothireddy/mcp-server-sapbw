@@ -95,6 +95,13 @@ _VARTYP_TO_KIND: dict[str, VariableKind] = {
 _VARIABLE_FLAG = "3"  # RSZTYPEFLAG: LOW/HIGH holds a variable reference
 _MAX_ELEMENTS = 500
 _MAX_DEPTH = 10
+#: Upstream depth for the provider-boundary fallback. A BEx query's provider normally sits on a
+#: CompositeProvider over an ADSO over one or more DSO layers, so 6 stopped short of the DataSource
+#: on the measured system (12 of 65 reached) while 8 matches ``bw_trace_to_source``'s own default.
+_PROVIDER_TRACE_DEPTH = 8
+#: DataSources named in the boundary hop. The set is a summary rather than a path, so this bounds
+#: the reply without losing the count - which is reported in full alongside.
+_MAX_BOUNDARY_DATASOURCES = 25
 _TS_DIGITS = 8  # leading YYYYMMDD of an RSTIMESTMP decimal
 _LANGUAGE = "E"
 
@@ -593,17 +600,37 @@ class QueriesRepository(Repository):
         )
 
         master = providers[0] if providers else None
-        paths = self._field_paths(master, sorted(infoobjects)[:_MAX_LINEAGE_IOBJ])
+        paths, boundary = self._field_paths(master, sorted(infoobjects)[:_MAX_LINEAGE_IOBJ])
         field_level = sum(1 for path in paths if path.resolution == "field")
+        own_reach = sum(
+            1 for path in paths if path.resolution == "field" and path.reaches_datasource
+        )
         caveats = [
             f"{field_level} of {len(paths)} InfoObjects resolved to field level (followed rule by "
-            "rule through RSTRANFIELD/RSTRANRULE). The remainder show the provider's upstream "
-            "objects with resolution='provider' and a reason - those are NOT that field's own "
-            "derivation.",
+            "rule through RSTRANFIELD/RSTRANRULE, and through the CompositeProvider's declared "
+            "model where the provider is one). The remainder show the provider's DataSource "
+            "boundary with resolution='provider' and a reason - that boundary is a set of "
+            "alternatives, NOT that field's own derivation.",
+            f"{own_reach} of {len(paths)} InfoObjects were traced to a DataSource as their own "
+            "derivation. Count only these as field lineage: a provider-level path also reports "
+            "reaches_datasource=true, but that is the provider's boundary. A field-level path that "
+            "stops short says where and why in unresolved_reason - the honest stops are a "
+            "constant, a start/end routine rather than a field rule, and a calculation-view part "
+            "whose lineage continues outside BW (bw_get_calc_view_lineage).",
             "a hop whose rule is a routine is marked advisory: BW records the rule, but what the "
             "ABAP reads is a heuristic lower bound",
             "customer-exit variable values resolve in ABAP at runtime and are not derivable",
         ]
+        fanned = [
+            p for p in paths if any(h.source_objects for h in p.hops if h.via != "datasource")
+        ]
+        if fanned:
+            caveats.append(
+                f"{len(fanned)} field(s) are supplied by more than one object at some hop - a "
+                "CompositeProvider union feeds the same element from several parts, and each is "
+                "equally the source of some of its rows. The chain follows one part, chosen by "
+                "sorted name so it is reproducible, and that hop's source_objects names them all."
+            )
         if truncated:
             caveats.append("element tree capped")
         return QueryLineage(
@@ -611,14 +638,18 @@ class QueriesRepository(Repository):
             compid=_clean(compid),
             providers=providers,
             paths=paths,
+            provider_datasources=boundary,
             customer_exit_variables=customer_exit,
             caveats=caveats,
             provenance=self.provenance("query_dir", {"COMPUID": compuid, "OBJVERS": "A"}),
         )
 
-    def _field_paths(self, master: str | None, infoobjects: list[str]) -> list[FieldLineagePath]:
-        """One path per InfoObject: field-level where a rule was found, provider-level otherwise.
+    def _field_paths(
+        self, master: str | None, infoobjects: list[str]
+    ) -> tuple[list[FieldLineagePath], list[str]]:
+        """One path per InfoObject, plus the provider's DataSource boundary set.
 
+        Field-level where a rule or a CompositeProvider mapping was found, provider-level otherwise.
         The two are labelled differently on purpose. Returning the provider's upstream objects for
         every InfoObject makes distinct fields look identically traced, which is how a reader ends
         up believing a specific source field was identified when it was not.
@@ -633,11 +664,12 @@ class QueriesRepository(Repository):
                     provenance=self.provenance("query_provider", {"IOBJNM": iobj}),
                 )
                 for iobj in infoobjects
-            ]
+            ], []
 
         service = FieldLineageService(self._connection, self.capability, self._cache)
-        fallback: tuple[list[FieldLineageHop], bool, bool] | None = None
+        fallback: tuple[list[FieldLineageHop], list[str], bool] | None = None
         paths: list[FieldLineagePath] = []
+        boundary: list[str] = []
         for iobj in infoobjects:
             traced = service.trace_field(master, iobj)
             if traced.resolution == "field":
@@ -646,20 +678,21 @@ class QueriesRepository(Repository):
             # No rule populates this field: fall back to the provider's upstream, but label it.
             if fallback is None:
                 fallback = self._provider_hops(master)
-            hops, reaches, advisory = fallback
+                boundary = fallback[1]
+            hops, reached, advisory = fallback
             paths.append(
                 FieldLineagePath(
                     iobjnm=iobj,
                     provider=master,
                     hops=list(hops),
-                    reaches_datasource=reaches,
+                    reaches_datasource=bool(reached),
                     has_routine_hop=advisory,
                     resolution="provider",
                     unresolved_reason=traced.unresolved_reason,
                     provenance=self.provenance("element_range", {"IOBJNM": iobj}),
                 )
             )
-        return paths
+        return paths, boundary
 
     def _referenced_infoobjects(
         self, eltuids: list[str], restrictions: dict[str, list[Restriction]]
@@ -678,27 +711,53 @@ class QueriesRepository(Repository):
             objs.update(str(r[0]).strip() for r in rows if _clean(r[0]))
         return {o for o in objs if o}
 
-    def _provider_hops(self, provider: str | None) -> tuple[list[FieldLineageHop], bool, bool]:
-        """Compact provider->DataSource summary from the lineage trace (full chain via bw_trace)."""
+    def _provider_hops(self, provider: str | None) -> tuple[list[FieldLineageHop], list[str], bool]:
+        """The provider's DataSource boundary, as a boundary rather than as a path.
+
+        This is the fallback for a field whose own derivation could not be found, and its shape was
+        a defect in its own right. It used to append every DataSource the provider reaches as a
+        *separate sequential hop*, so a reader saw ``provider -> DS1 -> DS2 -> ... -> DS65`` and had
+        every reason to read it as a chain the field flows along. It is not a chain: those 65
+        DataSources are alternatives, none of them established as this field's source. Measured on a
+        production query the same 65 were repeated for each of 100 unresolved fields - 6,500 hops
+        asserting a shape that does not exist, and 217 seconds to say nothing per field.
+
+        Now one hop that says so, and the set itself is carried once on
+        ``QueryLineage.provider_datasources`` rather than restated per field - it is a property of
+        the provider, identical for every field that falls back to it.
+
+        Returns ``(hops, datasources reached, advisory)``.
+        """
         if provider is None:
-            return [], False, False
+            return [], [], False
         hops: list[FieldLineageHop] = [
             FieldLineageHop(object_name=provider, object_type="provider", via="provider")
         ]
-        trace = self._lineage.trace_to_source(provider, depth=6)
+        trace = self._lineage.trace_to_source(provider, depth=_PROVIDER_TRACE_DEPTH)
         if isinstance(trace, UnsupportedResult):
-            return hops, False, False
+            return hops, [], False
         advisory = any(e.kind == "routine_lookup" for e in trace.graph.edges)
-        for datasource in trace.datasources_reached:
-            hops.append(
-                FieldLineageHop(
-                    object_name=datasource,
-                    object_type="datasource",
-                    via="datasource",
-                    advisory=advisory,
-                )
+        reached = sorted(trace.datasources_reached)
+        if not reached:
+            return hops, [], advisory
+        hops.append(
+            FieldLineageHop(
+                object_name=f"{len(reached)} DataSource(s) upstream of {provider}",
+                object_type="datasource",
+                via="datasource",
+                # Always advisory: this is the provider's boundary, not a derivation of this field,
+                # whatever the confidence of the edges that reached it.
+                advisory=True,
+                note=(
+                    f"the provider reaches {len(reached)} DataSource(s), named once in "
+                    "provider_datasources. They are alternatives rather than a chain, and none is "
+                    "established as this field's source - this hop is the provider's boundary "
+                    "because no rule for the field was found (resolution='provider'). "
+                    "bw_trace_to_source on the provider gives the graph."
+                ),
             )
-        return hops, bool(trace.datasources_reached), advisory
+        )
+        return hops, reached, advisory
 
     # --- shared helpers ------------------------------------------------------------------
 

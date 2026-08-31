@@ -108,6 +108,27 @@ def split_namespace(name: str) -> tuple[str, str]:
     return _DEFAULT_NAMESPACE, name
 
 
+def split_datasource_endpoint(endpoint: str) -> tuple[str, str | None]:
+    """Split a DataSource endpoint into ``(datasource, logical system)``.
+
+    BW writes a DataSource endpoint as ``<DATASOURCE><padding><LOGSYS>`` - one column holding two
+    facts - so ``"2LIS_11_VAITM                 SRCCLNT100"`` is the DataSource ``2LIS_11_VAITM``
+    extracted from logical system ``SRCCLNT100``. Anything keyed by DataSource name (``RSDS``,
+    ``ROOSOURCE``, ``RSDSSEGFD``) matches nothing until the pair is separated.
+
+    The logical system is ``None`` when the endpoint carries no padding, which is how a plain object
+    name arrives. A logical system containing a space is preserved: ``FLAT FILE`` is a real value on
+    the reference system, so splitting on the *first* run of whitespace and keeping the remainder
+    whole is the correct rule rather than a convenience.
+    """
+    cleaned = endpoint.strip()
+    head, separator, tail = cleaned.partition(" ")
+    if not separator:
+        return cleaned, None
+    system = tail.strip()
+    return head, system or None
+
+
 def candidate_tables(name: str, kind: str) -> dict[str, TableRole]:
     """Physical tables BW would generate for a provider, mapped to each table's role.
 

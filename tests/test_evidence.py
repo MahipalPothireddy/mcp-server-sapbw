@@ -141,6 +141,11 @@ _CALL_SITE_COVERED: dict[str, tuple[str, ...]] = {
     "declared_query_provider": ("rszcompic",),
     # repositories/hana.py: the logic inside a calculation view, read from its activated definition.
     "calc_view_definition": ("activated_repository",),
+    # services/composite_parser.py: a CompositeProvider's part, and its field mapping, read from
+    # BW's own stored model. Deliberately distinct from part_provider='confirmed', which reaches the
+    # same conclusion from a generated table's name - the mechanisms differ and so does the trust.
+    "composite_part": ("declared_model",),
+    "composite_field_mapping": ("declared",),
 }
 
 

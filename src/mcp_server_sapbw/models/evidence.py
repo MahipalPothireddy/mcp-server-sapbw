@@ -161,6 +161,25 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "the component is a query root (DEFTP='REP') rather than a structure or calculated key "
         "figure that also carries an assignment row.",
     ),
+    # How a CompositeProvider's composition and field mapping were obtained. BW keeps both in one
+    # XML column on RSOHCPR and nowhere else, so reading it is the difference between an observed
+    # fact and the inference below it. Both codes exist because the *same* question - which object
+    # supplies this - has two very different answers depending on which route reached it:
+    # ``declared_model`` read BW's stored model, ``part_provider=advisory`` read a generated table's
+    # name. Keeping one vocabulary for both would flatten exactly the distinction a caller needs.
+    ("composite_part", "declared_model"): (
+        "observed",
+        "declared_composite_model",
+        "Read from the CompositeProvider's own stored model on RSOHCPR, which names this object as "
+        "an input of the view node directly. Not derived from a generated table's name.",
+    ),
+    ("composite_field_mapping", "declared"): (
+        "observed",
+        "declared_composite_model",
+        "The CompositeProvider's stored model on RSOHCPR maps this element to the named part's "
+        "field. A CompositeProvider has no transformation, so this hop exists nowhere else - "
+        "without it a field-level trace stops at the CompositeProvider.",
+    ),
     # CalcViewDefinition.evidence - the logic inside a calculation view. Read from the activated
     # design-time definition, so the joins, filters and formulas are stated rather than inferred;
     # what remains uncertain is whether an inactive change exists, which the caveats say.

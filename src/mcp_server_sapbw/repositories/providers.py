@@ -7,11 +7,17 @@ lists its fields, resolves MultiProvider parts, and attaches a labelled descript
 generated). Each variant is capability-gated: an absent table yields ``UnsupportedResult`` rather
 than a guess. Objects whose tables exist but that are not found yield ``ObjectNotFound``.
 
-CompositeProvider part-provider composition has no relational part table. It is resolved here by two
-routes: ``RSOHCPR.XML_DEF`` when populated, else the base tables of the HANA calc view BW generates
-for the provider (the route that works when XML_DEF is empty, which is common). An empty XML_DEF is
-reported as a finding, and a composition that could not be derived at all stays empty with a caveat
-saying so — never implying a CompositeProvider has no parts.
+CompositeProvider part-provider composition has no relational part table. BW stores the whole model
+as XML on the header row of ``RSOHCPR``, so it is resolved here by two routes: the **declared
+model** (:meth:`ProvidersRepository.composite_model`), else the base tables of the HANA calc view BW
+generates for the provider. The second is a naming-convention reading and is labelled advisory.
+
+The declared route reads ``XML_UI`` as well as ``XML_DEF``, which is what made it usable. Only
+``XML_DEF`` was probed before, and on the reference production system it is empty for *all* 108
+active CompositeProviders while ``XML_UI`` holds the complete model for all 108 — so every part of
+every CompositeProvider was being reported as an inference from a generated table name when BW's own
+declaration was one column away. A composition that could not be derived at all stays empty with a
+caveat saying so — never implying a CompositeProvider has no parts.
 """
 
 from __future__ import annotations
@@ -19,7 +25,17 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from ..models.aggregation import KeyFigureAggregation
+from ..models.completeness import BoundHit, Completeness, bounded
+from ..models.composite import (
+    CompositeFieldMapping,
+    CompositeInput,
+    CompositeModel,
+    CompositePartKind,
+    CompositeViewNode,
+    composite_mapping_evidence,
+)
 from ..models.description import Description
+from ..models.evidence import evidence_for
 from ..models.provenance import UnsupportedResult
 from ..models.providers import (
     AttributeRef,
@@ -32,6 +48,11 @@ from ..models.providers import (
     classify_cube_type,
 )
 from ..services.aggregation import build_key_figure_aggregation
+from ..services.composite_parser import (
+    MAX_DEFINITION_BYTES,
+    CompositeParseError,
+    parse_composite_model,
+)
 from ..services.descriptions import DescriptionService
 from ..services.table_resolver import (
     ResolvedKind,
@@ -56,6 +77,19 @@ _Resolution = tuple[str, Literal["confirmed", "inferred", "none"]]
 #: Generated-table namespaces whose prefix is *stripped* to recover the InfoObject name. Any other
 #: ``/NS/`` prefix belongs to the InfoObject itself and is kept - see ``_infoobject_candidates``.
 _GENERATED_NAMESPACES = ("/BIC/", "/BI0/")
+
+#: A declared CompositeProvider part kind -> the provider vocabulary. A calc view is not a BW
+#: InfoProvider and an undecoded kind is not a type, so both map to ``None`` and the part carries no
+#: ``part_type`` rather than a wrong one; ``CompositeInput.part_kind`` keeps the finer answer.
+_COMPOSITE_PART_TYPE: dict[CompositePartKind, ProviderType | None] = {
+    "adso": "adso",
+    "infocube": "infocube",
+    "dso": "dso",
+    "infoobject": "infoobject",
+    "compositeprovider": "compositeprovider",
+    "calcview": None,
+    "unknown": None,
+}
 
 
 def _infoobject_candidates(column: str) -> list[str]:
@@ -1073,27 +1107,38 @@ class ProvidersRepository(Repository):
 
         Two routes, tried in order:
 
-        1. **XML** — ``RSOHCPR.XML_DEF``. Probed first because when it *is* populated it is the
-           authoritative, declared composition.
+        1. **Declared model** — the XML BW stores on ``RSOHCPR``, which names each input of each
+           view node directly. This is BW's own declaration, so a part resolved here is observed
+           rather than inferred, and it is the only route that also yields the field mapping.
         2. **Generated calc view** — every activated CompositeProvider generates a calc view in
            ``_SYS_BIC``; its base tables (from ``SYS.OBJECT_DEPENDENCIES``) resolve back to the part
-           providers by BW's table-naming convention. This is the route that works on systems where
-           ``XML_DEF`` is empty, which is common (confirmed live: empty on the reference system,
-           with no CompositeProvider rows in ``RSDCUBEMULTI`` either).
+           providers by BW's table-naming convention. Kept as the fallback for a release or a
+           provider whose model cannot be read, and labelled advisory because a naming convention
+           can be wrong even when every row was read correctly.
 
-        Returns ``(parts, composition_source, caveats)``. An empty XML_DEF is reported as a finding
-        in the caveats rather than silently ignored.
+        Returns ``(parts, composition_source, caveats)``. A model that could not be read is reported
+        as a finding rather than silently falling through.
         """
         caveats: list[str] = []
-        xml_present = self._composite_xml_present(name)
-        if xml_present is False:
-            caveats.append(
-                "RSOHCPR.XML_DEF is empty for this CompositeProvider, so the declared XML "
-                "composition is unavailable; parts were resolved from the generated HANA calc "
-                "view's base tables instead"
+        model = self.composite_model(name)
+        if model is not None and model.parsed and model.inputs:
+            parts = self._parts_from_model(model)
+            caveats.extend(model.caveats)
+            unknown = sorted(
+                {i.alias_kind or "?" for i in model.part_inputs if i.part_kind == "unknown"}
             )
-        elif xml_present is None:
-            caveats.append("RSOHCPR.XML_DEF could not be read; XML composition not attempted")
+            if unknown:
+                caveats.append(
+                    "these inputs carry a kind code this release does not decode, so their part "
+                    f"type is reported as unknown rather than guessed: {', '.join(unknown)}"
+                )
+            if parts:
+                return parts, "declared_model", caveats
+        if model is not None and not model.parsed and model.unparsed_reason:
+            caveats.append(
+                "the declared CompositeProvider model could not be read, so parts fall back to the "
+                f"generated calc view's base tables: {model.unparsed_reason}"
+            )
 
         parts, view_caveats = self._composite_parts_via_calc_view(name)
         caveats.extend(view_caveats)
@@ -1106,33 +1151,220 @@ class ProvidersRepository(Repository):
             return parts, "calc_view", caveats
 
         caveats.append(
-            "part-provider composition could not be derived from RSOHCPR.XML_DEF or from a "
-            "generated calc view; part_providers is empty but the CompositeProvider almost "
+            "part-provider composition could not be derived from the CompositeProvider's stored "
+            "model or from a generated calc view; part_providers is empty but the provider almost "
             "certainly has parts (treat as a gap, not as 'no parts')"
         )
         return [], "none", caveats
 
-    def _composite_xml_present(self, name: str) -> bool | None:
-        """Whether ``RSOHCPR.XML_DEF`` holds a definition (``None`` when it cannot be read)."""
+    def _parts_from_model(self, model: CompositeModel) -> list[PartProviderRef]:
+        """The declared inputs as part references, deduplicated and ordered by name.
+
+        A part can appear more than once — the same object joined to itself under two aliases is a
+        legitimate model — so the first occurrence wins and the rest are dropped rather than
+        producing two identical entries a caller would count twice.
+        """
+        parts: list[PartProviderRef] = []
+        seen: set[str] = set()
+        for index, candidate in enumerate(model.part_inputs, start=1):
+            if not candidate.part_name or candidate.part_name in seen:
+                continue
+            seen.add(candidate.part_name)
+            parts.append(
+                PartProviderRef(
+                    name=candidate.part_name,
+                    part_type=_COMPOSITE_PART_TYPE.get(candidate.part_kind),
+                    position=index,
+                    confidence="confirmed",
+                    evidence=evidence_for(
+                        "composite_part",
+                        "declared_model",
+                        detail=(
+                            f"The CompositeProvider's stored model declares input "
+                            f"{candidate.alias!r} as {candidate.entity_ref!r}, which decodes to "
+                            f"this object. Not read from a generated table's name."
+                        ),
+                    ),
+                    provenance=self.provenance(
+                        "composite_header", {"HCPRNM": model.provider, "OBJVERS": "A"}
+                    ),
+                )
+            )
+        parts.sort(key=lambda p: p.name)
+        return parts
+
+    # --- the declared CompositeProvider model --------------------------------------------
+
+    def composite_model(self, name: str) -> CompositeModel | None:
+        """The CompositeProvider's stored model: its inputs and their field mappings.
+
+        ``None`` when this release has no ``RSOHCPR`` at all, which is a different answer from a
+        model that could not be parsed — that comes back as a ``CompositeModel`` with
+        ``parsed=False`` and a reason, because "we could not read it" must never look like "it has
+        no parts".
+
+        Cached: the model is a large LOB, the parse is pure, and field-level lineage asks for the
+        same provider once per field of a query.
+        """
         if not self.capability.is_available("composite_header"):
             return None
+        return self.cached_model(
+            "composite_model",
+            name,
+            model=CompositeModel,
+            build=lambda: self._composite_model_uncached(name),
+            cache_when=lambda built: built.parsed,
+        )
+
+    def _composite_model_uncached(self, name: str) -> CompositeModel:
+        provenance = self.provenance("composite_header", {"HCPRNM": name, "OBJVERS": "A"})
+        base = CompositeModel(provider=name, provenance=provenance)
+        sizes = self._composite_definition_sizes(name)
+        if sizes is None:
+            base.unparsed_reason = (
+                "neither XML_UI nor XML_DEF could be read on RSOHCPR for this release, so the "
+                "declared composition is unavailable here"
+            )
+            return base
+        # XML_UI first, deliberately. It is the column populated on the measured release (108 of 108
+        # active CompositeProviders, against 0 for XML_DEF), and reading the empty one first is how
+        # the declared composition came to look absent.
+        for column in ("XML_UI", "XML_DEF"):
+            size = sizes.get(column, 0)
+            if size <= 0:
+                continue
+            if size > MAX_DEFINITION_BYTES:
+                base.unparsed_reason = (
+                    f"the stored model is {size:,} bytes in {column}, above the "
+                    f"{MAX_DEFINITION_BYTES:,} bound this server fetches; it was not read, so "
+                    "nothing here is a statement about its composition"
+                )
+                base.completeness = bounded(
+                    "row_cap", scope="definition_bytes", limit=MAX_DEFINITION_BYTES
+                )
+                base.caveats.append(f"model not read: {size:,} bytes exceeds the bound")
+                return base
+            definition = self._composite_definition_body(name, column)
+            if definition is None:
+                continue
+            try:
+                parsed = parse_composite_model(definition)
+            except CompositeParseError as exc:
+                base.unparsed_reason = exc.reason
+                return base
+            return self._to_composite_model(base, parsed, column=column)
+        base.unparsed_reason = (
+            "RSOHCPR holds no stored model for this CompositeProvider in either XML_UI or XML_DEF, "
+            "so its declared composition is unavailable; parts can still be resolved from the "
+            "generated calc view's base tables, which is a naming-convention reading"
+        )
+        return base
+
+    def _composite_definition_sizes(self, name: str) -> dict[str, int] | None:
+        """Byte length of each model column, without fetching either LOB.
+
+        Read first and always: the size is what decides whether the definition can be fetched, and
+        asking afterwards would mean the LOB had already crossed the wire. ``None`` when neither
+        column exists on this release — which is a capability fact, not an empty model.
+        """
+        sizes: dict[str, int] = {}
+        for column in ("XML_UI", "XML_DEF"):
+            try:
+                rows = self.select(
+                    self.dialect.build_select(
+                        columns=[f"LENGTH({column})"],
+                        from_logical="composite_header",
+                        where=["HCPRNM = ?"],
+                        params=[name],
+                    )
+                )
+            except Exception:
+                continue  # column absent on this release; the other one may still be there
+            if rows and rows[0][0] is not None:
+                try:
+                    sizes[column] = int(rows[0][0])
+                except (TypeError, ValueError):
+                    continue
+            elif rows:
+                sizes[column] = 0
+        return sizes or None
+
+    def _composite_definition_body(self, name: str, column: str) -> str | None:
+        """Fetch and decode one model column. ``None`` when it cannot be read as text."""
         try:
             rows = self.select(
                 self.dialect.build_select(
-                    columns=["LENGTH(XML_DEF)"],
+                    columns=[column],
                     from_logical="composite_header",
                     where=["HCPRNM = ?"],
                     params=[name],
                 )
             )
         except Exception:
-            return None  # column absent on this release, or LOB not readable this way
+            return None
         if not rows or rows[0][0] is None:
-            return False
+            return None
+        raw = rows[0][0]
+        if isinstance(raw, str):
+            return raw
         try:
-            return int(rows[0][0]) > 0
+            # errors="replace" rather than strict: a single undecodable byte in a 273 KB model must
+            # not discard the whole composition, and the parser only reads ASCII names and codes.
+            return bytes(raw).decode("utf-8", errors="replace")
         except (TypeError, ValueError):
-            return None  # unexpected shape; report "unknown" rather than guessing
+            return None
+
+    def _to_composite_model(
+        self, base: CompositeModel, parsed: Any, *, column: str
+    ) -> CompositeModel:
+        """Map the parser's carrier onto the model, keeping every count exact."""
+        base.parsed = True
+        base.source_column = "XML_UI" if column == "XML_UI" else "XML_DEF"
+        base.node_type = parsed.node_type
+        base.node_name = parsed.node_name
+        base.nodes = [CompositeViewNode(**node) for node in parsed.nodes]
+        base.schema_version = parsed.root.get("schema_version")
+        base.with_hana_model = bool(parsed.root.get("with_hana_model"))
+        base.element_count = parsed.element_count
+        base.completeness = Completeness(
+            bounds=[
+                BoundHit(bound="row_cap", scope=scope, limit=limit)
+                for scope, limit in parsed.bounds
+            ]
+        )
+        base.input_count = len(parsed.inputs)
+        for entry in parsed.inputs:
+            base.inputs.append(
+                CompositeInput(
+                    alias=entry["alias"],
+                    node_name=entry["node_name"],
+                    part_name=entry["part_name"],
+                    part_kind=entry["part_kind"],
+                    alias_kind=entry["alias_kind"],
+                    entity_ref=entry["entity_ref"],
+                    internal_node=entry["internal_node"],
+                    runtime_view_name=entry["runtime_view_name"],
+                    select_all=entry["select_all"],
+                    mappings=[CompositeFieldMapping(**m) for m in entry["mappings"]],
+                    mapping_count=entry["mapping_count"],
+                    evidence=composite_mapping_evidence(entry["part_kind"]),
+                )
+            )
+        # Only inputs that name neither an object nor an internal node are a gap. An input reading
+        # another node of the same model is a fact about the model, not a missing part, and counting
+        # it as one reported 40 non-existent objects on the measured system.
+        nameless = [i.alias for i in base.inputs if not i.part_name and not i.internal_node]
+        if nameless:
+            base.caveats.append(
+                "these inputs name no object this parser could decode, so their part is unresolved "
+                f"rather than absent: {', '.join(sorted(nameless)[:8])}"
+            )
+        for hit in base.completeness.bounds:
+            base.caveats.append(
+                f"the {hit.scope} list stopped at this reader's bound of {hit.limit}, so it is a "
+                "deterministic prefix rather than the whole set"
+            )
+        return base
 
     def _composite_parts_via_calc_view(self, name: str) -> tuple[list[PartProviderRef], list[str]]:
         """Resolve parts from the base tables of the CompositeProvider's generated calc view."""
@@ -1147,7 +1379,27 @@ class ProvidersRepository(Repository):
         view = self._generated_calc_view(name)
         if view is None:
             return [], [f"no generated calc view was found for CompositeProvider {name}"]
+        return self.providers_under_calc_view(view), []
 
+    def providers_under_calc_view(self, view: str) -> list[PartProviderRef]:
+        """The BW objects a calculation view sits on, from its generated base tables.
+
+        **Transitive** dependencies, not direct ones, which is the whole reason this exists as its
+        own reader. BW layers intermediate views between a calc view and a provider's active table,
+        so the table is never a *direct* dependency of the view - a direct-dependency read of a
+        modelled view over BW data returns its intermediate views and no provider at all. Verified
+        live: the direct route found nothing for a CompositeProvider's declared calc-view part,
+        where the transitive route found the four ADSOs beneath it.
+
+        Public because the lineage walk needs it for a calc view it reached through a declared
+        CompositeProvider input, not only for the view BW generated for a provider. Resolution is
+        by table name, so a part is advisory unless the provider catalogue confirmed it.
+        """
+        if not (
+            self.capability.is_available("hana_views")
+            and self.capability.is_available("object_dependencies")
+        ):
+            return []
         rows = self.select(
             self.dialect.paginate(
                 self.dialect.build_select(
@@ -1198,7 +1450,7 @@ class ProvidersRepository(Repository):
                 )
             )
         parts.sort(key=lambda p: p.name)
-        return parts, []
+        return parts
 
     def _generated_calc_view(self, provider: str) -> str | None:
         """Find the ``_SYS_BIC`` calc view BW generated for a provider (shortest match wins)."""

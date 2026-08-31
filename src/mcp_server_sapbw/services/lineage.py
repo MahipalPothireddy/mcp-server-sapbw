@@ -29,6 +29,7 @@ from ..models.lineage import (
     LineageGraph,
     LineageNode,
     LineageNodeType,
+    SourceSystemRef,
     TraceToSource,
     UpdateMode,
 )
@@ -44,6 +45,7 @@ from .table_resolver import (
     candidate_tables,
     provider_from_calc_view,
     query_from_calc_view,
+    split_datasource_endpoint,
 )
 
 
@@ -269,15 +271,58 @@ def _evidence_caveats(edges: list[LineageEdge]) -> list[str]:
     ]
 
 
+def _drain_level(queue: deque[tuple[str, int]], visited: set[str]) -> tuple[int, list[str]]:
+    """Take every unvisited entry of the queue's lowest level, as ``(level, names)``.
+
+    A whole level is drained before any of it is expanded, so the level's declared edges can be read
+    in a few batched statements instead of about five per node. The queue is non-decreasing in level
+    - expanding level N only ever appends level N or N+1 - so every entry of the lowest level is
+    contiguous at the front. Expansion order within the level, and therefore edge order, is
+    identical to popping one at a time.
+    """
+    level = queue[0][1]
+    frontier: list[str] = []
+    queued: set[str] = set()
+    while queue and queue[0][1] == level:
+        candidate, _ = queue.popleft()
+        if candidate in visited or candidate in queued:
+            continue
+        queued.add(candidate)
+        frontier.append(candidate)
+    return level, frontier
+
+
 class _Hop:
-    """One resolved neighbour: the other object's name/type and the edge connecting it."""
+    """One resolved neighbour: the other object's name/type and the edge connecting it.
 
-    __slots__ = ("edge", "name", "node_type")
+    ``free`` marks a hop that does **not** consume a depth level. ``depth`` is a count of *load
+    layers* - how many times data is moved and reshaped between the root and here - and two hops in
+    this graph cross a boundary without any load happening:
 
-    def __init__(self, name: str, node_type: LineageNodeType, edge: LineageEdge) -> None:
+    * a BEx query resolving to the InfoProvider it reads (a reporting-layer hop), and
+    * a DataSource resolving to the extract structure the source system fills (the boundary hop).
+
+    Charging them a level made the same ``depth`` mean different things depending on what the caller
+    named. From a query root, ``depth=3`` reached 12 of 65 DataSources where the same request on
+    its provider reached far more, purely because a level went on establishing which provider the
+    query reads - and the extract structure was then reached only for whichever DataSources happened
+    to have a level left over, so one graph showed the boundary for some and not for others.
+
+    Deliberately *not* applied to the downstream provider -> query fan-out. That hop is also a
+    reporting-layer hop, but one provider declares up to 250 queries, so making it free would
+    multiply a downstream walk's node count against a fixed node cap - trading a consistent depth
+    for a truncated graph. The asymmetry is a bound, not a principle.
+    """
+
+    __slots__ = ("edge", "free", "name", "node_type")
+
+    def __init__(
+        self, name: str, node_type: LineageNodeType, edge: LineageEdge, *, free: bool = False
+    ) -> None:
         self.name = name
         self.node_type = node_type
         self.edge = edge
+        self.free = free
 
 
 class LineageService(Repository):
@@ -315,6 +360,14 @@ class LineageService(Repository):
         #: provider -> dependent generated view names from OBJECT_DEPENDENCIES, per BFS level. Only
         #: ever set from a batch that read its nodes to exhaustion, so a present entry is complete.
         self._pf_consumers: dict[str, list[str]] = {}
+        #: (datasource, logsys) -> (extract structure, type, delta) or None. ``None`` is a cached
+        #: answer - "RSDS has no row for this" - not a miss, so a flat-file source costs one read.
+        self._extract_memo: dict[tuple[str, str], tuple[str, str, str] | None] = {}
+        #: datasource -> customer-namespace field count, or None when it could not be established.
+        self._enhancement_memo: dict[str, int | None] = {}
+        #: calc view -> the BW objects under it. Per-instance rather than on disk: it is one
+        #: statement plus a catalogue lookup, and a stale entry would outlive a re-activated view.
+        self._calc_base_memo: dict[str, list[Any]] = {}
 
     # --- public API ----------------------------------------------------------------------
 
@@ -349,17 +402,34 @@ class LineageService(Repository):
     def _trace_uncached(self, name: str, depth: int) -> TraceToSource:
         nodes, edges, completeness = self._bfs(name, "upstream", depth, include_routine=True)
         graph = self._graph(name, "upstream", depth, nodes, edges, completeness=completeness)
-        datasources = [n.name for n in nodes.values() if n.object_type == "datasource"]
+        boundaries = [n for n in nodes.values() if n.object_type == "datasource"]
+        datasources = [n.name for n in boundaries]
+        # A DataSource whose extract structure was resolved is no longer an unresolved boundary. The
+        # list used to be every DataSource unconditionally, on the assumption that a BW-only build
+        # can never see past one - true until the source-extract hop, and now simply wrong for the
+        # ones it resolves. Reporting a resolved parent *and* calling the node unresolved leaves a
+        # caller no way to tell which boundaries are actually still open.
+        unresolved = [n.name for n in boundaries if not n.upstream_resolved]
+        resolved = len(boundaries) - len(unresolved)
         caveats = [_ROUTINE_CAVEAT]
         if completeness != "complete":
             caveats.append(_COMPLETENESS_CAVEATS[completeness])
         if not datasources:
             caveats.append("no DataSource boundary reached within the depth limit")
+        elif resolved:
+            caveats.append(
+                f"{resolved} of {len(boundaries)} DataSource boundaries resolved one hop further, "
+                "to the extract structure the source system fills (RSDS.EXSTRUCTURE), reported as "
+                "source_object nodes. The extractor's own ABAP is in the source system, not in BW: "
+                "an edge whose note reports customer-namespace fields is evidence that an "
+                "enhancement exists, and bw_get_extractor_exit_code reads the code itself when an "
+                "ecc_systems profile is configured."
+            )
         return TraceToSource(
             root_id=name,
             graph=graph,
             datasources_reached=sorted(datasources),
-            unresolved_boundaries=sorted(datasources),  # BW-only: all datasources are unresolved
+            unresolved_boundaries=sorted(unresolved),
             caveats=caveats,
         )
 
@@ -430,27 +500,35 @@ class LineageService(Repository):
         hit_node_cap = False
 
         while queue:
-            # Drain a whole BFS level before expanding any of it, so the level's declared edges can
-            # be read in a few batched statements instead of ~5 per node. The queue is
-            # non-decreasing in level (expanding level N only ever appends level N+1), so every
-            # entry of the lowest level is contiguous at the front. Expansion order within the
-            # level, and therefore edge order, is unchanged from popping one at a time.
-            level = queue[0][1]
-            frontier: list[str] = []
-            queued_in_level: set[str] = set()
-            while queue and queue[0][1] == level:
-                candidate, _ = queue.popleft()
-                if candidate in visited or candidate in queued_in_level:
-                    continue
-                queued_in_level.add(candidate)
-                frontier.append(candidate)
-            if level >= depth:
-                break  # levels only increase, so nothing left to expand
-            self._prefetch_frontier(frontier, direction, include_routine=include_routine)
+            level, frontier = _drain_level(queue, visited)
+            at_limit = level >= depth
+            if at_limit and direction == "downstream":
+                break  # no free hop exists downstream, so there is nothing left to add
+            if not at_limit:
+                self._prefetch_frontier(frontier, direction, include_routine=include_routine)
             for current in frontier:
                 visited.add(current)
-                for hop in self._expand(current, direction, include_routine=include_routine):
+                # At the limit the node is not expanded - only its free hops are taken, and only
+                # the branch that can produce one is asked. Without this a DataSource reached
+                # *exactly* at the limit kept its extractor hidden, so one graph showed the source
+                # boundary for some of its DataSources and not for others: whether the annotation
+                # appeared depended on how many layers happened to sit above each one.
+                expansion = (
+                    self._boundary_expand(current, direction)
+                    if at_limit
+                    else self._expand(current, direction, include_routine=include_routine)
+                )
+                for hop in expansion:
                     self._ensure_node(nodes, hop.name, hop.node_type, hop.edge.provenance)
+                    # Remember what the hop taught us about the neighbour's type, before that
+                    # neighbour is expanded. Its own expansion then knows what it is without asking
+                    # the database - which is what lets the DataSource branch fire on a DataSource
+                    # whose name carries no logical-system suffix, rather than only on one whose
+                    # name happens to look like an endpoint.
+                    if hop.node_type != "unknown":
+                        self._node_type_memo.setdefault(hop.name, hop.node_type)
+                    if hop.edge.kind == "source_extract":
+                        self._resolve_boundary(nodes, hop)
                     key = (hop.edge.src, hop.edge.dst, hop.edge.kind)
                     if key not in edge_keys:
                         edge_keys.add(key)
@@ -459,7 +537,11 @@ class LineageService(Repository):
                         hit_node_cap = True
                         break
                     if hop.name not in visited:
-                        queue.append((hop.name, level + 1))
+                        # A free hop re-enters the *same* level, so it is expanded in a further pass
+                        # over this level rather than costing one. Termination is unaffected: the
+                        # visited set still grows by one per expansion, and every free hop's own
+                        # neighbours are charged normally.
+                        queue.append((hop.name, level if hop.free else level + 1))
                 if hit_node_cap:
                     break
             if hit_node_cap:
@@ -610,9 +692,59 @@ class LineageService(Repository):
         self._expand_memo[memo_key] = (hops, frozenset(self._walk_incomplete) - before)
         return hops
 
+    def _foreign_expand(self, name: str, direction: LineageDirection) -> list[_Hop] | None:
+        """Expansion for a node that is not a BW object, or ``None`` when the node is one.
+
+        The BW branches ask BW questions - is this a transformation endpoint, does a query read it,
+        does a generated view depend on its table - and two node types in this graph cannot answer
+        any of them:
+
+        ``source_object``
+            an extract structure in the source system's ABAP dictionary. It is terminal here by
+            construction: what fills it is source-system code, which is the gap the
+            ``source_extract`` edge names rather than a hop this server can take.
+        ``calcview``
+            a ``_SYS_BIC`` runtime name, not a BW object name, so every BW branch matches nothing.
+            Its one meaningful upstream hop is the objects it reads; downstream, the provider that
+            consumes it is already the ``composite_part`` edge that brought the walk here.
+
+        Asking anyway was not merely wasteful, it was measurable: the boundary hops added 33 such
+        nodes to a production depth-3 walk and each was expanded like a provider, which is around
+        200 statements spent to conclude nothing. This is also why they cannot simply be left out of
+        the graph - they are real objects and the answer needs them; it is their *expansion* that is
+        meaningless.
+        """
+        node_type = self._node_type_memo.get(name)
+        if node_type == "source_object":
+            return []
+        if node_type == "calcview":
+            return self._calc_view_base_hops(name) if direction != "downstream" else []
+        return None
+
+    def _boundary_expand(self, name: str, direction: LineageDirection) -> list[_Hop]:
+        """Only the hops that do not consume a depth level, for a node sitting at the limit.
+
+        Deliberately narrow rather than "expand and filter". A full expansion costs several
+        statements per node plus a routine parse, and at the limit every one of those results would
+        be discarded - so on a wide frontier filtering would pay the whole cost of the walk again to
+        add nothing. Asking only the branch that can produce a free hop keeps the limit cheap.
+
+        Not written to ``_expand_memo``: that memo's key does not record *which* expansion produced
+        its hops, so caching a partial answer under it would let a later full walk read this narrow
+        result as complete.
+        """
+        if direction == "downstream":
+            return []
+        if not self._is_datasource(name):
+            return []
+        return self._source_extract_hops(name)
+
     def _expand_uncached(
         self, name: str, direction: LineageDirection, *, include_routine: bool
     ) -> list[_Hop]:
+        foreign = self._foreign_expand(name, direction)
+        if foreign is not None:
+            return foreign
         hops: list[_Hop] = []
         if direction in ("downstream", "both"):
             hops.extend(self._declared_hops(name, downstream=True))
@@ -628,7 +760,27 @@ class LineageService(Repository):
             if include_routine:
                 hops.extend(self._routine_lookup_hops(name))
             hops.extend(self._query_provider_hops(name, downstream=False))
+            # Last, and type-gated: only a DataSource has one, and this is the hop that takes the
+            # walk past what BW itself treats as the edge of the warehouse.
+            if self._is_datasource(name):
+                hops.extend(self._source_extract_hops(name))
         return hops
+
+    def _is_datasource(self, name: str) -> bool:
+        """Whether a node is a DataSource, without paying for a type lookup on every node.
+
+        Answered from the type the walk already knows: the hop that discovered the node recorded it,
+        and in a breadth-first walk that always happens before the node is expanded. Only a *root*
+        arrives untyped, and for that the endpoint's shape decides whether the lookup is worth a
+        statement - deliberately not the answer, since a plainly named DataSource is legitimate and
+        is covered by the memo above.
+        """
+        cached = self._node_type_memo.get(name)
+        if cached is not None:
+            return cached == "datasource"
+        if " " not in name.strip():
+            return False
+        return self._node_type_of(name) == "datasource"
 
     def _node_type_of(self, name: str) -> LineageNodeType:
         """The root's own object type, so the graph's centre is never labelled 'unknown'.
@@ -725,7 +877,9 @@ class LineageService(Repository):
             note="provider resolved from the BEx query metadata",
             provenance=self.provenance("query_provider", {"COMPUID": compuid}),
         )
-        return [_Hop(provider, "unknown", edge)]
+        # Free: establishing which provider a query reads is not a load layer, so it must not spend
+        # one. See _Hop for what charging it did to `depth` from a query root.
+        return [_Hop(provider, "unknown", edge, free=True)]
 
     def _query_provider_of(self, name: str) -> tuple[str, str] | None:
         """``(provider, compuid)`` if ``name`` is a BEx query, else ``None``. Memoised per name.
@@ -890,11 +1044,15 @@ class LineageService(Repository):
         """If ``name`` is a CompositeProvider, the part providers that feed it.
 
         A CompositeProvider persists nothing and has no inbound transformation, so without this its
-        upstream lineage is a dead end. Parts come from the base tables of its generated calc view
-        (RSOHCPR.XML_DEF is commonly empty). Resolution is naming-convention based -> advisory.
+        upstream lineage is a dead end. Parts come from the model BW stores on ``RSOHCPR``, which
+        declares them; where that cannot be read they fall back to the base tables of the generated
+        calc view, which is a naming-convention reading and is labelled advisory.
         """
         if not self.capability.is_available("composite_header"):
             return []
+        declared = self._declared_part_hops(name)
+        if declared is not None:
+            return declared
         parts = self._providers.composite_parts(name)[0]
         root_key = name.strip().upper()
         hops: list[_Hop] = []
@@ -928,6 +1086,276 @@ class LineageService(Repository):
                         # one claimed it came from parsing ABAP. Neither happened (D10).
                         evidence=evidence_for("part_provider", part.confidence),
                         provenance=part.provenance,
+                    ),
+                )
+            )
+        return hops
+
+    # --- a calculation view's own base objects --------------------------------------------
+
+    def _calc_view_base_hops(self, name: str) -> list[_Hop]:
+        """The BW objects behind a calculation view the walk has reached.
+
+        Needed because reading the CompositeProvider's *declared* model made the graph shorter as
+        well as more accurate. 44 of 108 CompositeProviders on the measured system declare a
+        calc-view input, and the model names the view - correctly, that is what BW declares - where
+        the previous route named the ``/BIC/`` tables the view reads and resolved those back to
+        providers. So the declared route gained 81 objects the old one never saw and lost 87 that
+        sat *under* a view, and neither route alone is the answer.
+
+        Both are kept, distinguished by mechanism rather than blended: the CompositeProvider -> view
+        edge is declared metadata, and the view -> BW object edge below it is a ``/BIC/`` name
+        resolved by convention, so it is advisory and says so. Blending them would let a convention
+        reading inherit the declaration's confidence.
+        """
+        if not (
+            self.capability.is_available("object_dependencies")
+            and self.capability.is_available("hana_views")
+        ):
+            self._walk_incomplete.add("unsupported_branch")
+            return []
+        parts: list[Any] | None = self._calc_base_memo.get(name)
+        if parts is None:
+            parts = self._providers.providers_under_calc_view(name)
+            self._calc_base_memo[name] = parts
+        hops: list[_Hop] = []
+        for part in parts:
+            if part.name == name:
+                continue
+            hops.append(
+                _Hop(
+                    part.name,
+                    _node_type(part.part_type),
+                    LineageEdge(
+                        src=part.name,
+                        dst=name,
+                        kind="calcview_base",
+                        derivation="declared",
+                        # The *dependency* is declared in the HANA catalogue; the BW object behind
+                        # the generated table is not recorded anywhere, so the reading is advisory.
+                        confidence="advisory",
+                        note=(
+                            f"the calculation view reads generated table {part.via_table}, whose "
+                            "name resolves to this BW object by convention"
+                        ),
+                        evidence=evidence_for("table_resolution", part.confidence),
+                        provenance=part.provenance,
+                    ),
+                )
+            )
+        return hops
+
+    # --- the source-system boundary (DataSource -> its extractor) --------------------------
+
+    def _source_extract_hops(self, name: str) -> list[_Hop]:
+        """The extract structure behind a DataSource - one hop past what BW usually calls the edge.
+
+        The DataSource was a hard stop: ``source_extract`` and ``source_object`` were defined in the
+        model and never produced, so an upstream walk ended saying "this came from a DataSource" and
+        left the obvious next question - *extracted by what?* - unanswered.
+
+        The answer is on the BW side. ``RSDS.EXSTRUCTURE`` names the extract structure the source
+        system fills, per DataSource and logical system, and it is populated for essentially every
+        DataSource: measured, 53 of 54 reached from one production CompositeProvider. ``ROOSOURCE``
+        looks like the better source and is not - it holds only the *replicated* extractor
+        definitions, which on the same measurement covered 1 of those 54, because an ECC
+        DataSource's definition normally stays in ECC. So RSDS is the route, not ROOSOURCE.
+
+        The node is the extract structure, not a guess at the exit. What the extractor's ABAP *does*
+        lives in the source system and needs the ECC connector; where customer-namespace fields
+        prove an enhancement exists, the edge says so and names the tool that reads it. That keeps
+        the boundary honest: the structure is declared metadata, the logic is a stated gap.
+        """
+        if not self.capability.is_available("datasource"):
+            return []
+        datasource, logsys = split_datasource_endpoint(name)
+        if not datasource:
+            return []
+        detail = self._datasource_extract(datasource, logsys)
+        if detail is None:
+            return []
+        structure, ds_type, delta = detail
+        if not structure:
+            # No extract structure recorded. Reported by its absence rather than by a synthesized
+            # node: an invented extractor name is worse than an unresolved boundary.
+            return []
+        enhanced = self._extract_enhancement_count(datasource)
+        note = self._extract_note(datasource, logsys, ds_type, delta, enhanced)
+        return [
+            _Hop(
+                structure,
+                "source_object",
+                LineageEdge(
+                    src=structure,
+                    dst=name,
+                    kind="source_extract",
+                    derivation="declared",
+                    confidence="exact",
+                    note=note,
+                    provenance=self.provenance(
+                        "datasource",
+                        {"DATASOURCE": datasource, "LOGSYS": logsys or "", "OBJVERS": "A"},
+                    ),
+                ),
+                # Free: crossing the warehouse boundary is not a load layer. Charged, the extractor
+                # appeared only for whichever DataSources had a level left, so one graph showed the
+                # boundary for some of its DataSources and not for others.
+                free=True,
+            )
+        ]
+
+    def _datasource_extract(
+        self, datasource: str, logsys: str | None
+    ) -> tuple[str, str, str] | None:
+        """``(extract structure, DataSource type, delta method)`` from RSDS. Memoised per name.
+
+        Keyed on the DataSource alone rather than on the pair: the same DataSource replicated from
+        two logical systems fills the same extract structure, and keying on the pair would re-read
+        for each. Where a system was named it is still used to pick the row, so the answer is the
+        one for that endpoint.
+        """
+        cache_key = (datasource, logsys or "")
+        if cache_key in self._extract_memo:
+            return self._extract_memo[cache_key]
+        where = ["DATASOURCE = ?"]
+        params: list[Any] = [datasource]
+        if logsys:
+            where.append("LOGSYS = ?")
+            params.append(logsys)
+        try:
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=["EXSTRUCTURE", "TYPE", "DELTA"],
+                        from_logical="datasource",
+                        where=where,
+                        params=params,
+                        # Several rows can match when no logical system was given; ordered so the
+                        # chosen one is reproducible rather than whichever the database returned.
+                        order_by=["EXSTRUCTURE", "TYPE"],
+                    ),
+                    limit=1,
+                )
+            )
+        except Exception:
+            # Column names on RSDS vary across releases. Degrade to "no extractor resolved" rather
+            # than failing the whole walk over one branch.
+            self._walk_incomplete.add("unsupported_branch")
+            self._extract_memo[cache_key] = None
+            return None
+        resolved: tuple[str, str, str] | None = None
+        if rows:
+            resolved = (
+                str(rows[0][0] or "").strip(),
+                str(rows[0][1] or "").strip(),
+                str(rows[0][2] or "").strip(),
+            )
+        self._extract_memo[cache_key] = resolved
+        return resolved
+
+    def _extract_enhancement_count(self, datasource: str) -> int | None:
+        """Customer-namespace fields on the extract structure: that an enhancement exists.
+
+        ``None`` when it could not be established, which is not the same as zero. The count is
+        metadata-confirmed evidence; what the enhancement *does* is source-system ABAP.
+        """
+        if not self.capability.is_available("datasource_field"):
+            return None
+        if datasource in self._enhancement_memo:
+            return self._enhancement_memo[datasource]
+        try:
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["COUNT(*)"],
+                    from_logical="datasource_field",
+                    where=[
+                        "DATASOURCE = ?",
+                        "OBJVERS = 'A'",
+                        "(FIELDNM LIKE 'Z%' OR FIELDNM LIKE 'Y%' OR FIELDNM LIKE '/BIC/%')",
+                    ],
+                    params=[datasource],
+                )
+            )
+        except Exception:
+            self._enhancement_memo[datasource] = None
+            return None
+        count = int(rows[0][0]) if rows and rows[0][0] is not None else 0
+        self._enhancement_memo[datasource] = count
+        return count
+
+    @staticmethod
+    def _extract_note(
+        datasource: str, logsys: str | None, ds_type: str, delta: str, enhanced: int | None
+    ) -> str:
+        """State what was read, and name the gap where the logic itself is out of reach."""
+        parts = [f"extract structure filled by the source system for DataSource {datasource}"]
+        if logsys:
+            parts.append(f"in logical system {logsys}")
+        if ds_type:
+            parts.append(f"DataSource type {ds_type}")
+        if delta:
+            parts.append(f"delta method {delta}")
+        head = ", ".join(parts) + "."
+        if enhanced:
+            return (
+                f"{head} The structure carries {enhanced} customer-namespace field(s), which is "
+                "metadata-confirmed evidence that the extractor was enhanced. What the enhancement "
+                "code does is ABAP in the source system, not in BW: bw_get_extractor_exit_code "
+                "reads it when an ecc_systems profile is configured."
+            )
+        if enhanced == 0:
+            return (
+                f"{head} No customer-namespace fields on the structure, so BW holds no evidence of "
+                "an extractor enhancement. That is evidence of absence for *appended fields* only: "
+                "an exit that changes existing values leaves no trace in BW metadata."
+            )
+        return (
+            f"{head} Whether the extractor is enhanced could not be established here, so treat it "
+            "as unknown rather than as unenhanced."
+        )
+
+    def _declared_part_hops(self, name: str) -> list[_Hop] | None:
+        """Part hops from the stored model, or ``None`` when it could not be read.
+
+        ``None`` rather than an empty list, because the two mean opposite things: no model is a
+        reason to fall back to the calc-view route, while a model naming no part is an answer.
+
+        A calc-view part is emitted under its ``_SYS_BIC`` runtime name, not the model's own form.
+        That is the name the HANA catalogue holds, and it is what lets the walk continue through the
+        view to the objects beneath it - joined on the model's form it would find nothing and the
+        graph would stop at the view.
+        """
+        model = self._providers.composite_model(name)
+        if model is None or not model.parsed or not model.inputs:
+            return None
+        root_key = name.strip().upper()
+        hops: list[_Hop] = []
+        seen: set[str] = set()
+        for part in model.part_inputs:
+            part_name = (part.runtime_view_name or part.part_name).strip()
+            # A CompositeProvider is not its own part; see the calc-view route below for why that
+            # exclusion is scoped to this edge kind rather than applied to declared transformations.
+            if not part_name or part_name.upper() == root_key or part_name in seen:
+                continue
+            seen.add(part_name)
+            hops.append(
+                _Hop(
+                    part_name,
+                    _node_type(part.part_kind),
+                    LineageEdge(
+                        src=part_name,
+                        dst=name,
+                        kind="composite_part",
+                        derivation="declared",
+                        confidence="exact",
+                        note=(
+                            f"declared as input {part.alias!r} of the CompositeProvider's stored "
+                            f"model ({part.entity_ref})"
+                        ),
+                        evidence=evidence_for("composite_part", "declared_model"),
+                        provenance=self.provenance(
+                            "composite_header", {"HCPRNM": name, "OBJVERS": "A"}
+                        ),
                     ),
                 )
             )
@@ -1489,6 +1917,26 @@ class LineageService(Repository):
             existing.object_type = node_type
             existing.ref = BwObjectRef(object_type=normalise_object_type(node_type), name=name)
             existing.upstream_resolved = node_type != "datasource"
+
+    def _resolve_boundary(self, nodes: dict[str, LineageNode], hop: _Hop) -> None:
+        """Record on the DataSource node that its source-system parent was resolved.
+
+        ``upstream_resolved`` is what a caller reads to decide whether the graph really ends there.
+        Leaving it ``False`` on a DataSource that now *has* a parent in the same graph would put the
+        node and the edge in contradiction, and the flag is the one a client is documented to trust.
+        """
+        boundary = nodes.get(hop.edge.dst)
+        if boundary is None or boundary.object_type != "datasource":
+            return
+        _datasource, logsys = split_datasource_endpoint(boundary.name)
+        boundary.upstream_resolved = True
+        boundary.source_system = SourceSystemRef(
+            # The *kind* of source system is a separate decode (bw_get_source_systems owns it); this
+            # names the system and the object without claiming to have classified it.
+            system_type="unknown",
+            system_id=logsys,
+            object_name=hop.name,
+        )
 
     def _graph(
         self,

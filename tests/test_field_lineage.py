@@ -31,9 +31,35 @@ _TABLES = {
     "transformation_field": "RSTRANFIELD",
     "transformation_step_rout": "RSTRANSTEPROUT",
     "routine_source": "RSAABAP",
+    # The CompositeProvider's stored model. Without this hop a field of a CompositeProvider resolves
+    # nothing at all - there is no transformation targeting one - and on BW-on-HANA that is what a
+    # BEx query normally reads.
+    "composite_header": "RSOHCPR",
 }
 
 _PADDED_DS = "DS_SALES".ljust(30) + "SRC100"
+
+# A CompositeProvider unioning the mart with a second ADSO. AMOUNT is fed by both, which is the
+# normal shape and the one a single-answer reader gets wrong.
+_CP_MODEL = """<?xml version="1.0" encoding="utf-8"?>
+<Composite:compositeView xmlns:Composite="urn:c" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    name="SALES_CP" withHanaModel="true" defaultNode="#///U1">
+  <viewNode xsi:type="View:Union" name="U1">
+    <element xsi:type="BwCore:BwElement" name="AMOUNT" infoObjectName="AMOUNT"/>
+    <element xsi:type="BwCore:BwElement" name="FIXED" infoObjectName="FIXED"/>
+    <input xsi:type="Composite:CompositeInput" alias="U1.ODSO.1" selectAll="false">
+      <entity>MART_DSO.composite#//</entity>
+      <mapping xsi:type="Type:ElementMapping" targetName="AMOUNT" sourceName="AMOUNT"/>
+      <mapping xsi:type="Type:ConstantElementMapping" targetName="FIXED" sourceName="X"/>
+    </input>
+    <input xsi:type="Composite:CompositeInput" alias="U1.CALC.2" selectAll="false">
+      <entity>PKG/SUB/CV_EXTRA.calculationview#/</entity>
+      <mapping xsi:type="Type:ElementMapping" targetName="AMOUNT" sourceName="EXTRA_VALUE"/>
+    </input>
+  </viewNode>
+</Composite:compositeView>
+"""
+_COMPOSITE_MODELS = {"SALES_CP": _CP_MODEL}
 
 # OBJSTAT, SRCTYPE, SRCSUB, SRCNAME, TGTTYPE, TGTSUB, TGTNAME, START, END, EXPERT, GLB, GLB2
 _HEADER: dict[str, tuple[Any, ...]] = {
@@ -74,6 +100,15 @@ class ScriptedConnection:
     ) -> list[tuple[Any, ...]]:
         params = list(parameters or [])
         name = str(params[0]).strip() if params else ""
+        if "RSOHCPR" in sql:
+            model = _COMPOSITE_MODELS.get(name)
+            if "LENGTH(XML_UI)" in sql:
+                return [(len(model.encode()) if model else 0,)]
+            if "LENGTH(XML_DEF)" in sql:
+                return [(0,)]  # empty, as on the release measured
+            if "XML_UI" in sql:
+                return [(model.encode(),)] if model else []
+            return []
         if "RSTRANSTEPROUT" in sql:
             rows = _STEPROUT.get(name, [])
             return (
@@ -194,7 +229,7 @@ def test_field_with_no_rule_is_reported_not_guessed() -> None:
     assert path.resolution == "none"
     assert path.reaches_datasource is False
     assert path.unresolved_reason is not None
-    assert "no transformation rule" in path.unresolved_reason
+    assert "no rule or CompositeProvider mapping" in path.unresolved_reason
 
 
 def test_unavailable_transformation_table_yields_no_hops() -> None:
@@ -233,3 +268,102 @@ def test_tracing_many_fields_reuses_the_transformation_reads() -> None:
     for field in ("MARGIN", "REGION", "AMOUNT"):
         service.trace_field("MART_DSO", field)
     assert connection.count < after_first * 4, "memoisation is not reducing repeat reads"
+
+
+# --- crossing a CompositeProvider ----------------------------------------------------------
+#
+# A CompositeProvider has no transformation, so before this hop existed the walk found nothing for
+# any of its fields and every one fell back to provider level. Measured on a production query: 100
+# of 100 InfoObjects. The mapping is declared in BW's stored model, so the hop is exact.
+
+
+def test_a_composite_field_resolves_through_the_declared_model_to_the_part() -> None:
+    path = _service().trace_field("SALES_CP", "AMOUNT")
+    assert path.resolution == "field", "a CompositeProvider field used to resolve nothing at all"
+    hop = path.hops[1]
+    assert hop.via == "composite_part"
+    assert hop.rule_type == "composite_mapping"
+    assert hop.advisory is False, "BW's own stored model is read whole, not inferred"
+    assert hop.evidence is not None and hop.evidence.basis == "observed"
+
+
+def test_the_walk_continues_through_the_part_to_the_datasource() -> None:
+    """The point of the hop: the chain does not stop at the CompositeProvider's part."""
+    path = _service().trace_field("SALES_CP", "AMOUNT")
+    assert [h.object_name for h in path.hops] == [
+        "SALES_CP",
+        "MART_DSO",
+        "STAGE_DSO",
+        _PADDED_DS.strip(),
+    ]
+    assert path.reaches_datasource is True
+
+
+def test_a_union_field_names_every_part_that_supplies_it() -> None:
+    """Following one branch quietly names an arbitrary source for a figure that has several."""
+    path = _service().trace_field("SALES_CP", "AMOUNT")
+    hop = path.hops[1]
+    assert hop.source_objects == ["MART_DSO", "PKG/SUB/CV_EXTRA"]
+    assert hop.note is not None and "2 parts supply this element" in hop.note
+    assert "source_objects lists them all" in hop.note
+
+
+def test_the_chain_follows_a_reproducible_branch_not_document_order() -> None:
+    service = _service()
+    first = service.trace_field("SALES_CP", "AMOUNT")
+    second = FieldLineageService(ScriptedConnection(), _capability()).trace_field(
+        "SALES_CP", "AMOUNT"
+    )
+    assert [h.object_name for h in first.hops] == [h.object_name for h in second.hops]
+
+
+def test_a_constant_in_the_composite_model_stops_and_says_so() -> None:
+    path = _service().trace_field("SALES_CP", "FIXED")
+    assert path.resolution == "field"
+    hop = path.hops[1]
+    assert hop.rule_type == "composite_constant"
+    assert hop.source_fields == []
+    assert path.reaches_datasource is False
+    assert path.unresolved_reason is not None and "no source field" in path.unresolved_reason
+
+
+def test_a_calc_view_part_is_a_named_stop_not_a_failure() -> None:
+    """The field really comes from there; its lineage is in the HANA catalogue, not in BW."""
+
+    class CalcOnly(ScriptedConnection):
+        def execute_select(
+            self, sql: str, parameters: Sequence[Any] | None = None
+        ) -> list[tuple[Any, ...]]:
+            if "RSOHCPR" in sql and "XML_UI" in sql and "LENGTH" not in sql:
+                only_calc = _CP_MODEL.replace(
+                    '<mapping xsi:type="Type:ElementMapping" targetName="AMOUNT" '
+                    'sourceName="AMOUNT"/>',
+                    "",
+                )
+                return [(only_calc.encode(),)]
+            return super().execute_select(sql, parameters)
+
+    path = FieldLineageService(CalcOnly(), _capability()).trace_field("SALES_CP", "AMOUNT")
+    assert path.resolution == "field"
+    hop = path.hops[1]
+    assert hop.via == "calc_view"
+    assert hop.object_name == "PKG.SUB/CV_EXTRA", "the runtime name is what the catalogue holds"
+    assert path.reaches_datasource is False
+    assert path.unresolved_reason is not None
+    assert "bw_get_calc_view_lineage" in path.unresolved_reason
+
+
+def test_a_transformation_rule_still_wins_over_the_composite_route() -> None:
+    """The rule route carries *how* the field was derived, so it is tried first."""
+    path = _service().trace_field("MART_DSO", "AMOUNT")
+    assert path.hops[1].via == "transformation"
+    assert path.hops[1].rule_type == "direct"
+
+
+def test_an_absent_composite_table_leaves_the_field_unresolved_not_wrong() -> None:
+    service = FieldLineageService(
+        ScriptedConnection(), _capability(present=set(_TABLES) - {"composite_header"})
+    )
+    path = service.trace_field("SALES_CP", "AMOUNT")
+    assert path.resolution == "none"
+    assert path.unresolved_reason is not None

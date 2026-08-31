@@ -1424,7 +1424,8 @@ def bw_refresh_cache(system: str, scope: str = "all") -> RefreshResult:
 
     ``scope`` is ``all``, one object type, or a single object id. Cached object types:
     ``transformation``, ``routine_code``, ``routine_analysis``, ``query``, ``query_lineage``,
-    ``provider``, ``chain``, ``chain_runtimes``, ``calc_view``.
+    ``provider``, ``composite_model``, ``chain``, ``chain_runtimes``, ``calc_view``,
+    ``calc_view_logic``.
 
     Only needed after a transport: structural extracts carry a 24h TTL, runtime statistics one hour,
     and everything is dropped automatically when capability discovery re-runs.
