@@ -6,6 +6,8 @@ layering, edge styling) rather than pixel output.
 
 from __future__ import annotations
 
+from xml.etree import ElementTree
+
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.services.diagram import (
@@ -169,3 +171,132 @@ def test_png_renders_when_the_viz_extra_is_installed() -> None:
     assert png is not None
     assert png[:4] == bytes([137, 80, 78, 71])  # PNG magic number
     assert len(png) > 1000
+
+
+# --- the SVG carries object identity, not only a picture -----------------------------------
+
+
+def test_each_node_group_carries_the_full_object_name_and_type() -> None:
+    """The visible label is clipped, so the box alone does not say which object it is.
+
+    Without identity in the markup the SVG is a picture and nothing more: a consumer wanting to
+    attach a click, a tooltip or a link has to re-derive a layout of its own, and the two then
+    disagree about everything except which objects exist.
+    """
+    svg = render_svg(build_layout(_chain_graph()))
+    root = ElementTree.fromstring(svg)  # well-formedness is part of the assertion
+    groups = [g for g in root.iter() if g.get("class") == "bw-node"]
+    assert len(groups) == len(_chain_graph().nodes)
+    identified = {g.get("data-node-id"): g.get("data-node-type") for g in groups}
+    assert identified == {
+        "DS": "datasource",
+        "STG": "dso",
+        "EDW": "adso",
+        "CP": "compositeprovider",
+        "QUERY": "query",
+        "LOOKUP": "dso",
+    }
+
+
+def test_a_long_name_survives_in_the_data_attribute_even_when_the_label_is_clipped() -> None:
+    long_name = "VERY_LONG_OBJECT_NAME_" + ("X" * 60)
+    graph = LineageGraph(
+        root_id=long_name,
+        direction="upstream",
+        depth=1,
+        nodes=[
+            LineageNode(
+                id=long_name,
+                object_type="adso",
+                name=long_name,
+                provenance=Provenance(source_table="RSOADSO", source_key={"ADSONM": long_name}),
+            )
+        ],
+        node_count=1,
+    )
+    svg = render_svg(build_layout(graph))
+    root = ElementTree.fromstring(svg)
+    group = next(g for g in root.iter() if g.get("class") == "bw-node")
+    assert group.get("data-node-id") == long_name, "the clipped label must not become the identity"
+    drawn = "".join(t.text or "" for t in group.iter() if t.tag.endswith("text"))
+    assert long_name not in drawn, "the fixture must actually exercise clipping"
+
+
+def test_the_root_is_marked_so_a_consumer_can_find_it() -> None:
+    svg = render_svg(build_layout(_chain_graph()))
+    root = ElementTree.fromstring(svg)
+    marked = [
+        g.get("data-node-id")
+        for g in root.iter()
+        if g.get("class") == "bw-node" and g.get("data-node-root")
+    ]
+    assert marked == ["EDW"], "the root is what the caller asked about, not the leftmost node"
+
+
+def test_each_edge_names_its_endpoints_and_kind() -> None:
+    svg = render_svg(build_layout(_chain_graph()))
+    root = ElementTree.fromstring(svg)
+    edges = {
+        (p.get("data-edge-src"), p.get("data-edge-dst"), p.get("data-edge-kind"))
+        for p in root.iter()
+        if p.get("class") == "bw-edge"
+    }
+    assert ("STG", "EDW", "transformation") in edges
+    assert ("EDW", "CP", "composite_part") in edges
+    assert ("LOOKUP", "EDW", "routine_lookup") in edges, "an advisory edge is identified too"
+
+
+def test_a_self_loop_is_identified_like_any_other_edge() -> None:
+    """The edge a reader most wants to interrogate: source and target are the same object.
+
+    It is drawn by a separate branch, which is how it came to be the one edge with no identity.
+    """
+    graph = LineageGraph(
+        root_id="LOOP_DSO",
+        direction="both",
+        depth=1,
+        nodes=[_node("LOOP_DSO", "dso")],
+        edges=[_edge("LOOP_DSO", "LOOP_DSO")],
+        node_count=1,
+        edge_count=1,
+    )
+    svg = render_svg(build_layout(graph))
+    root = ElementTree.fromstring(svg)
+    edges = [p for p in root.iter() if p.get("class") == "bw-edge"]
+    assert len(edges) == 1
+    assert edges[0].get("data-edge-src") == "LOOP_DSO"
+    assert edges[0].get("data-edge-dst") == "LOOP_DSO"
+
+
+def test_the_hover_title_gives_the_untruncated_name() -> None:
+    svg = render_svg(build_layout(_chain_graph()))
+    root = ElementTree.fromstring(svg)
+    group = next(
+        g for g in root.iter() if g.get("class") == "bw-node" and g.get("data-node-id") == "DS"
+    )
+    title = next(t for t in group if t.tag.endswith("title"))
+    assert title.text is not None
+    assert "DS" in title.text and "DataSource" in title.text
+
+
+def test_identity_attributes_are_escaped_so_a_hostile_name_cannot_break_the_document() -> None:
+    hostile = 'A"><script>x</script>'
+    graph = LineageGraph(
+        root_id=hostile,
+        direction="upstream",
+        depth=1,
+        nodes=[
+            LineageNode(
+                id=hostile,
+                object_type="dso",
+                name=hostile,
+                provenance=Provenance(source_table="RSDODSO", source_key={"ODSOBJECT": hostile}),
+            )
+        ],
+        node_count=1,
+    )
+    svg = render_svg(build_layout(graph))
+    assert "<script>" not in svg
+    root = ElementTree.fromstring(svg)  # would raise if the attribute broke the markup
+    group = next(g for g in root.iter() if g.get("class") == "bw-node")
+    assert group.get("data-node-id") == hostile

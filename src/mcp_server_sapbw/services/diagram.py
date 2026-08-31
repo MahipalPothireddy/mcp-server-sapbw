@@ -320,11 +320,20 @@ def render_svg(layout: DiagramLayout) -> str:
         stroke = "#94a3b8" if advisory else "#475569"
         dash = ' stroke-dasharray="6 4"' if advisory else ""
         marker = "b" if advisory else "a"
+        identity = (
+            f'class="bw-edge" data-edge-src="{html.escape(edge.src, quote=True)}" '
+            f'data-edge-dst="{html.escape(edge.dst, quote=True)}" '
+            f'data-edge-kind="{html.escape(edge.kind, quote=True)}"'
+        )
         if src.id == dst.id:  # self-loop: the object derives from itself
             cx, cy = src.x + _NODE_W, src.y + _NODE_H / 2
             path = f"M{cx},{cy - 10} C{cx + 44},{cy - 34} {cx + 44},{cy + 34} {cx},{cy + 10}"
+            # Identified like any other edge. It was not, and a self-loop is exactly the edge a
+            # reader most wants to interrogate: a transformation whose source and target are the
+            # same object makes the loaded result depend on load order.
             out.append(
-                f'<path d="{path}" fill="none" stroke="{stroke}" stroke-width="1.6"{dash} '
+                f"<path {identity} "
+                f'd="{path}" fill="none" stroke="{stroke}" stroke-width="1.6"{dash} '
                 f'marker-end="url(#{marker})"/>'
             )
             out.append(
@@ -339,7 +348,8 @@ def render_svg(layout: DiagramLayout) -> str:
         mid = (x1 + x2) / 2
         path = f"M{x1},{y1} C{mid},{y1} {mid},{y2} {x2},{y2}"
         out.append(
-            f'<path d="{path}" fill="none" stroke="{stroke}" stroke-width="1.6"{dash} '
+            f"<path {identity} "
+            f'd="{path}" fill="none" stroke="{stroke}" stroke-width="1.6"{dash} '
             f'marker-end="url(#{marker})"/>'
         )
         label = _edge_label(edge)
@@ -353,6 +363,22 @@ def render_svg(layout: DiagramLayout) -> str:
     for node in layout.nodes:
         fill, border = _style_for(node.node_type)
         width = 2.4 if node.is_root else 1.3
+        # Grouped, and carrying the object's *full* name and type as data attributes. The visible
+        # label is clipped for legibility, so without this the rendered box does not say which
+        # object it is - which makes the SVG unusable as anything but a picture. A consumer that
+        # wants to attach behaviour (a click, a tooltip, a link into a report) can now do it against
+        # the same layout the PNG and the Mermaid come from, rather than re-deriving one that would
+        # disagree. Nothing external is referenced, so the file stays self-contained.
+        out.append(
+            f'<g class="bw-node" data-node-id="{html.escape(node.id, quote=True)}" '
+            f'data-node-type="{html.escape(node.node_type, quote=True)}"'
+            + (' data-node-root="1"' if node.is_root else "")
+            + ">"
+        )
+        out.append(
+            f"<title>{html.escape(node.id)} "
+            f"({html.escape(_TYPE_LABEL.get(node.node_type, 'object'))})</title>"
+        )
         out.append(
             f'<rect x="{node.x}" y="{node.y}" width="{_NODE_W}" height="{_NODE_H}" rx="7" '
             f'fill="{fill}" stroke="{border}" stroke-width="{width}"/>'
@@ -366,6 +392,7 @@ def render_svg(layout: DiagramLayout) -> str:
             f'<text x="{node.x + _NODE_W / 2}" y="{node.y + 35}" font-size="9.5" fill="#475569" '
             f'text-anchor="middle">{html.escape(_TYPE_LABEL.get(node.node_type, "object"))}</text>'
         )
+        out.append("</g>")
 
     out.append(_svg_legend(layout))
     out.append("</svg>")
