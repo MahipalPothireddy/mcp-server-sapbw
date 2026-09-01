@@ -118,6 +118,9 @@ _TRANS_BY_TARGET = {
     "SALES_CUBE": [("SALES_DSO", "ODSO", "TR1")],
     "SALES_DSO": [("DS_SALES", "RSDS", "TR0")],
 }
+#: Each object's own RSTLOGO code, for the type probe. SALES_CUBE appears only as a *target*, which
+#: is exactly why a query's provider was reaching callers untyped.
+_TYPE_CODE = {"SALES_CUBE": "CUBE", "SALES_DSO": "ODSO", "DS_SALES": "RSDS"}
 # RSDS, keyed by DataSource: (EXSTRUCTURE, TYPE, DELTA). The extract structure the source system
 # fills is what takes the walk one hop past the DataSource.
 _RSDS = {"DS_SALES": ("EXTSTRU_SALES", "D", "ABR")}
@@ -170,8 +173,36 @@ class ScriptedConnection:
         if "RSDS" in sql:  # the DataSource header: extract structure, type, delta
             row = _RSDS.get(str(params[0]))
             return [row] if row else []
-        if "RSTRAN" in sql:  # lineage trace: upstream by TARGETNAME
+        if "RSTRAN" in sql:
+            # Two different reads hit RSTRAN and they return different shapes. The type probe asks
+            # for one column and no TRANID; the lineage walk asks for the other endpoint plus the
+            # TRANID. Serving one shape for both is how a fixture passes while the real system
+            # behaves differently - the type probe would read a *name* out of the type column.
+            if "TRANID" not in sql:
+                return self._own_type(sql, params)
             return [(s, ty, tr) for s, ty, tr in _TRANS_BY_TARGET.get(str(params[-1]), [])]
+        return []
+
+    @staticmethod
+    def _own_type(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        """``SELECT SOURCETYPE WHERE SOURCENAME = ?`` / the TARGET pair: an object's own TLOGO code.
+
+        Answers only for the side the object really appears on, so an object that is never a source
+        returns nothing for the SOURCETYPE probe - which is what makes the fallback order in
+        ``_node_type_uncached`` meaningful rather than incidental.
+        """
+        # params[0], not params[-1]: this read is paginated, so the trailing bound values are the
+        # LIMIT and OFFSET. Keying on the last one silently probed for the object named "0".
+        name = str(params[0]).strip()
+        code = _TYPE_CODE.get(name)
+        if code is None:
+            return []
+        as_source = any(name == s for rows in _TRANS_BY_TARGET.values() for s, _t, _tr in rows)
+        as_target = name in _TRANS_BY_TARGET
+        if "SOURCETYPE" in sql:
+            return [(code,)] if as_source else []
+        if "TARGETTYPE" in sql:
+            return [(code,)] if as_target else []
         return []
 
     @staticmethod
@@ -326,6 +357,25 @@ def test_lineage_service_resolves_query_to_provider_and_datasource() -> None:
 # The DataSource used to be a hard stop. ``source_extract`` and ``source_object`` were defined in
 # the model and never produced, so an upstream walk answered "this came from a DataSource" and left
 # the next question - extracted by what? - unanswered.
+
+
+def test_the_querys_own_provider_is_typed_not_left_unknown() -> None:
+    """RSZCOMPIC names the provider but carries no type, and no hop types it either.
+
+    Every other node learns its type from the hop that discovered it, because RSTRAN carries the
+    other endpoint's type code. A query's provider is the *target* of its inbound transformations,
+    so it is never on the naming side - and it was reaching callers as ``unknown``, which on a
+    diagram is the one grey box labelled "object" sitting where the subject of the whole graph
+    should be.
+    """
+    service = LineageService(ScriptedConnection(), _capability())
+    graph = service.get_lineage("QUERY_SALES", direction="upstream", depth=3)
+    assert not isinstance(graph, UnsupportedResult)
+    provider = next(n for n in graph.nodes if n.name == "SALES_CUBE")
+    assert provider.object_type != "unknown"
+    assert provider.object_type == "infocube"
+    # And the canonical ref agrees, so a caller can join it against bw_describe_object.
+    assert provider.ref is not None and provider.ref.object_type == "infocube"
 
 
 def test_the_walk_continues_past_the_datasource_to_its_extract_structure() -> None:

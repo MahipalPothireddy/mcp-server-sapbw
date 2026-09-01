@@ -879,7 +879,15 @@ class LineageService(Repository):
         )
         # Free: establishing which provider a query reads is not a load layer, so it must not spend
         # one. See _Hop for what charging it did to `depth` from a query root.
-        return [_Hop(provider, "unknown", edge, free=True)]
+        #
+        # The type is resolved rather than left ``unknown``. Every other node learns its type from
+        # the hop that found it, because RSTRAN carries the *other* endpoint's type code - but a
+        # query's provider is named by RSZCOMPIC, which carries no type, and it is the target of its
+        # inbound transformations rather than their source, so no hop ever types it either. It
+        # therefore stayed ``unknown``: on a production query's diagram the provider the whole graph
+        # exists to explain was the one grey box labelled "object". One memoised lookup, and only
+        # for a query root, since nothing else takes this branch.
+        return [_Hop(provider, self._node_type_of(provider), edge, free=True)]
 
     def _query_provider_of(self, name: str) -> tuple[str, str] | None:
         """``(provider, compuid)`` if ``name`` is a BEx query, else ``None``. Memoised per name.
