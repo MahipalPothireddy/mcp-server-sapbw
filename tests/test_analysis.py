@@ -33,7 +33,14 @@ from mcp_server_sapbw.models.analysis import (
 )
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.evidence import Evidence, evidence_for
+from mcp_server_sapbw.models.lineage import (
+    ImpactAnalysis,
+    LineageEdge,
+    LineageGraph,
+    LineageNode,
+)
 from mcp_server_sapbw.models.objects import BwObjectRef
+from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.models.providers import ObjectNotFound
 from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.repositories.hana import HanaRepository
@@ -772,3 +779,151 @@ def test_the_envelope_round_trips_through_json() -> None:
     assert restored.execution.tools_used == report.execution.tools_used
     assert restored.budget.measured == report.budget.measured
     assert len(restored.sections_skipped) == len(report.sections_skipped)
+
+
+# --- the impact section's own mapping to RelatedObject -----------------------------------------
+#
+# Found by running S01 against a production ADSO: all four routine-derived consumers came back typed
+# `unknown` and carrying no Evidence at all, while the declared consumers beside them were typed
+# correctly. S01 names the requirement explicitly - a routine-derived consumer must be
+# basis=inferred, method=routine_select_parse, completeness=lower_bound - so the items whose
+# uncertainty matters most were the only ones that said nothing about it.
+#
+# Driven through `_add_impact` with a crafted ImpactAnalysis rather than through the fixture: the
+# defect is in the mapping from ImpactAnalysis to RelatedObject, and reaching it through a reverse
+# RSAABAP scan would test the fixture's SQL emulation instead of the rule.
+
+
+def _impact_with_routine_consumer() -> ImpactAnalysis:
+    """Downstream graph holding one declared consumer and one reached only through a routine."""
+    prov = Provenance(source_table="RSTRAN", source_key={"TRANID": "TR9"})
+    nodes = [
+        LineageNode(id="SALES_DSO", object_type="dso", name="SALES_DSO", provenance=prov),
+        LineageNode(id="MART_ADSO", object_type="adso", name="MART_ADSO", provenance=prov),
+        # The routine consumer *is* in the graph, with its real type. That is what makes hardcoding
+        # "unknown" a discarded answer rather than an unavoidable gap.
+        LineageNode(id="LOOKUP_CUBE", object_type="infocube", name="LOOKUP_CUBE", provenance=prov),
+    ]
+    return ImpactAnalysis(
+        root_id="SALES_DSO",
+        graph=LineageGraph(
+            root_id="SALES_DSO",
+            direction="downstream",
+            depth=2,
+            nodes=nodes,
+            edges=[
+                LineageEdge(
+                    src="SALES_DSO", dst="MART_ADSO", kind="transformation", provenance=prov
+                )
+            ],
+            node_count=len(nodes),
+            edge_count=1,
+        ),
+        affected_object_count=2,
+        routine_lookup_consumers=["LOOKUP_CUBE"],
+    )
+
+
+def _impact_run(impact: ImpactAnalysis | None = None) -> _Run:
+    """Drive ``_add_impact`` over a supplied ImpactAnalysis, and hand back the run it filled."""
+    service = _service()
+    run = _Run(service._r, tool_name="bw_analyze_object")
+    run.subject_label = "SALES_DSO"
+    fixed = impact if impact is not None else _impact_with_routine_consumer()
+
+    def stub(name: str, *, depth: int = 2) -> ImpactAnalysis:
+        return fixed
+
+    service._r.lineage.impact_analysis = stub  # type: ignore[method-assign]
+    service._add_impact(run, "SALES_DSO", depth=2)
+    # `_add_impact` routes failures through `run.step`, which records a failed section instead of
+    # raising. Without this, a broken stub would leave the lists empty and every assertion below
+    # would pass vacuously - which is exactly what happened when this fixture first went in.
+    statuses = {step.section: step.status for step in run.steps}
+    assert statuses.get("downstream") == "complete", f"the impact section did not run: {statuses}"
+    return run
+
+
+def _impact_consumers() -> list[RelatedObject]:
+    return _impact_run().consumers
+
+
+def test_a_routine_derived_consumer_carries_the_evidence_s01_requires() -> None:
+    routine = next(c for c in _impact_consumers() if c.relationship == "consumer_routine")
+    assert routine.advisory is True
+    assert routine.evidence is not None, "the least certain item was the one with no evidence"
+    assert routine.evidence.basis == "inferred"
+    assert routine.evidence.method == "routine_select_parse"
+    assert routine.evidence.completeness == "lower_bound"
+
+
+def test_a_routine_derived_consumer_is_typed_from_the_graph_not_hardcoded_unknown() -> None:
+    """The graph already holds the node's type; asserting 'unknown' threw that away."""
+    routine = next(c for c in _impact_consumers() if c.relationship == "consumer_routine")
+    assert routine.ref.name == "LOOKUP_CUBE"
+    assert routine.ref.object_type == "infocube"
+
+
+def test_a_consumer_named_by_no_graph_node_still_degrades_to_unknown() -> None:
+    """Typing from the graph must not become a crash when the name is not in it."""
+    impact = _impact_with_routine_consumer()
+    impact.routine_lookup_consumers = ["NOT_IN_THE_GRAPH"]
+    run = _impact_run(impact)
+    routine = next(c for c in run.consumers if c.relationship == "consumer_routine")
+    assert routine.ref.object_type == "unknown"
+    assert routine.ref.name == "NOT_IN_THE_GRAPH"
+
+
+def test_a_declared_downstream_consumer_says_it_is_declared() -> None:
+    """Its note claims a declared transformation, so its evidence has to agree.
+
+    Left unset, the strongest half of the consumer list carried no basis while the weakest half
+    did - which inverts what a reader needs from the field.
+    """
+    declared = [c for c in _impact_consumers() if c.relationship == "downstream"]
+    assert declared, "the fixture must produce a declared consumer for this to mean anything"
+    for consumer in declared:
+        assert consumer.advisory is False
+        assert consumer.evidence is not None
+        assert consumer.evidence.basis == "observed"
+        assert consumer.evidence.method == "declared_metadata"
+
+
+def test_the_routine_consumer_now_reaches_the_answers_own_evidence_summary() -> None:
+    """`relate` collects only the evidence it is given, so an omitted one never reached it."""
+    methods = {e.method for e in _impact_run().evidence}
+    assert "routine_select_parse" in methods
+    assert "declared_metadata" in methods
+
+
+def test_every_related_object_carries_evidence_whatever_its_relationship() -> None:
+    """The invariant, rather than one case at a time.
+
+    Mission Rule 3 wants every fact traceable, and `Evidence` is how this server says *how firmly*.
+    A related object with none is a claim with no stated basis - and the gaps were not random. They
+    were whole branches (routine consumers, then declared queries), so a per-case test would have
+    kept passing while the next branch shipped without one. Asserted over the whole set, so a new
+    relationship cannot be added without one.
+    """
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    missing = [
+        f"{item.relationship}:{item.ref.object_type}"
+        for item in [*report.dependencies, *report.consumers]
+        if item.evidence is None
+    ]
+    assert not missing, f"related objects with no evidence: {sorted(set(missing))}"
+
+
+def test_an_advisory_relationship_never_claims_an_observed_basis() -> None:
+    """`advisory` and the basis say the same thing two ways, so they must not disagree."""
+    report = _analysis(fragments=_FLOW_FRAGMENTS)
+    for item in [*report.dependencies, *report.consumers]:
+        assert item.evidence is not None
+        if item.advisory:
+            assert item.evidence.basis in {"inferred", "unknown"}, (
+                f"{item.relationship} is flagged advisory but claims basis={item.evidence.basis}"
+            )
+        else:
+            assert item.evidence.basis in {"observed", "derived"}, (
+                f"{item.relationship} is not advisory but claims basis={item.evidence.basis}"
+            )

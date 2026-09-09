@@ -46,7 +46,7 @@ from ..models.capability import CapabilityRecord, ValidationStatus
 from ..models.chains import Chain, ChainRuntimes, LoadClosure
 from ..models.completeness import BoundHit, Completeness
 from ..models.ecc import ConnectorUnavailable
-from ..models.evidence import Evidence, EvidenceSummary, summarise
+from ..models.evidence import Evidence, EvidenceSummary, evidence_for, summarise
 from ..models.findings import Finding, Severity
 from ..models.health import ProviderHealth
 from ..models.lineage import ImpactAnalysis, LineageGraph
@@ -1096,13 +1096,26 @@ class AnalysisService:
                 _node_ref(node),
                 "downstream",
                 note="reached by walking declared transformations downstream",
+                # The note already claims these were reached through *declared* transformations, so
+                # the evidence has to say the same thing. Left unset, the strongest half of the
+                # consumer list arrived carrying no basis at all while the weakest half did.
+                evidence=evidence_for("lineage_edge", "exact"),
             )
         for consumer in impact.routine_lookup_consumers:
             run.relate(
                 run.consumers,
-                BwObjectRef(object_type="unknown", name=consumer),
+                # Typed from the graph the walk already built, not hardcoded to unknown. The impact
+                # graph holds each routine consumer as a node with its real type, so asserting
+                # "unknown" discarded an answer that was already in hand - and on a production ADSO
+                # that was every one of the four routine consumers, rendered as untyped objects.
+                _ref_for(impact.graph, consumer),
                 "consumer_routine",
                 advisory=True,
+                # S01 requires exactly this on a routine-derived consumer: inferred basis,
+                # routine_select_parse method, lower_bound completeness. It was omitted entirely, so
+                # the items whose uncertainty matters most were the only ones with no evidence, and
+                # they contributed nothing to the answer's own evidence summary.
+                evidence=evidence_for("lineage_edge", "advisory"),
                 note="a routine on this object reads the subject; invisible to BW's where-used "
                 "list, and found by parsing ABAP, so this set is a lower bound",
             )
@@ -1203,6 +1216,11 @@ class AnalysisService:
                 run.consumers,
                 BwObjectRef(object_type="query", name=item.compid or item.compuid),
                 "consumer_query",
+                # RSZCOMPIC *declares* the query against this provider, so this is observed. It is
+                # deliberately the declared-assignment vocabulary rather than the generic one: the
+                # same conclusion reached by noticing a generated view touching a table is a weaker
+                # claim, and the two must not read alike.
+                evidence=evidence_for("declared_query_provider", "rszcompic"),
                 note=f"{item.origin} query" + (f", owner {item.owner}" if item.owner else ""),
             )
         if total > len(items):
