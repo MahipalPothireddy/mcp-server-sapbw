@@ -120,6 +120,34 @@ class Profile(BaseModel):
         return StorageIdentity(system=self.name, tenant=self.tenant, environment=self.environment)
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """``SafeLoader`` that refuses a duplicated mapping key instead of keeping the last one (D73).
+
+    YAML permits a key twice and every loader silently takes the later value. In a profiles file
+    that is not a stylistic matter: ``ssl_validate_certificate`` was written twice on one platform -
+    ``false`` with a careful justification about an untrusted certificate, and ``true`` twenty lines
+    below with a different one - so the **recorded** security decision was not the **effective**
+    one, and a reader who stopped at the first comment would have believed certificate validation
+    was off while it was on. Two contradictory decisions, no warning, and nothing could see it.
+
+    Failing the load is the right severity. A security setting with two values does not have a
+    sensible default resolution, and choosing one silently is how the contradiction survived.
+    """
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ProfileConfigError(
+                    f"duplicated key {key!r} at line {key_node.start_mark.line + 1} of the "
+                    "profiles file. YAML would silently keep the last value, which on a security "
+                    "setting means the recorded decision and the effective one can differ."
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 class EccProfile(BaseModel):
     """One ABAP source system reachable over ADT (SAP's HTTP metadata/source service).
 
@@ -599,7 +627,8 @@ class ProfileManager:
         if not self._path.is_file():
             raise ProfileConfigError(f"profiles file not found: {self._path}")
         try:
-            data = yaml.safe_load(self._path.read_text(encoding="utf-8"))
+            # _StrictLoader is SafeLoader plus a duplicate-key check, so this is not a widening.
+            data = yaml.load(self._path.read_text(encoding="utf-8"), Loader=_StrictLoader)
         except yaml.YAMLError as exc:
             raise ProfileConfigError(f"could not parse profiles file: {self._path}") from exc
         if not isinstance(data, Mapping) or "systems" not in data:

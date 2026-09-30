@@ -446,3 +446,76 @@ def test_a_misspelled_ecc_option_is_rejected(tmp_path: Path) -> None:
     bad = _ECC_YAML + "    use_tsl: false\n"
     with pytest.raises(ProfileConfigError, match="unrecognised setting"):
         ProfileManager(_write(tmp_path, bad), env=_ECC_ENV)
+
+
+# --- a security setting with two values has no sensible resolution (D73) ------------------------
+#
+# `ssl_validate_certificate` was written twice on one BI platform in the real profiles file: `false`
+# with a careful justification about an untrusted certificate, and `true` twenty lines below with a
+# different one. YAML takes the last, silently. So the *recorded* decision was not the *effective*
+# one, and anybody reading the first comment believed validation was off while it was on. Nothing
+# in the suite, the linter or the loader could see it.
+
+_DUPLICATED_KEY_YAML = """
+systems:
+  qa:
+    host: qa.example.invalid
+    port: 30015
+    user: qa_ro
+    password: ${BW_QA_PASSWORD}
+    encrypt: false
+    read_only_user: true
+    encrypt: true
+"""
+
+_DUPLICATED_SYSTEM_YAML = """
+systems:
+  qa:
+    host: qa.example.invalid
+    port: 30015
+    user: qa_ro
+    password: ${BW_QA_PASSWORD}
+  qa:
+    host: other.example.invalid
+    port: 30016
+    user: someone_else
+    password: ${BW_QA_PASSWORD}
+"""
+
+
+def test_a_duplicated_option_is_rejected_rather_than_silently_resolved(tmp_path: Path) -> None:
+    """Loud, because choosing one value silently is how the contradiction survived.
+
+    A misspelled option is already rejected; an option written twice was not, which is the worse
+    of the two - a typo fails visibly, while a duplicate produces a working configuration that
+    does something other than what it says.
+    """
+    with pytest.raises(ProfileConfigError) as error:
+        ProfileManager(_write(tmp_path, _DUPLICATED_KEY_YAML), env=_ENV).get("qa")
+
+    message = str(error.value)
+    assert "encrypt" in message
+    assert "duplicated" in message
+    # The line number, because a long profile with comment blocks between the two occurrences is
+    # exactly where this happens and "somewhere in this file" does not help. It names the *second*
+    # occurrence - line 10, where `encrypt` is repeated - which is the line to delete.
+    assert "line 10" in message
+
+
+def test_a_duplicated_profile_name_is_rejected_too(tmp_path: Path) -> None:
+    """Same rule one level up: two profiles with one name is two different systems, silently one."""
+    with pytest.raises(ProfileConfigError) as error:
+        ProfileManager(_write(tmp_path, _DUPLICATED_SYSTEM_YAML), env=_ENV).get("qa")
+
+    assert "duplicated" in str(error.value)
+    assert "'qa'" in str(error.value)
+
+
+def test_the_error_never_echoes_a_value(tmp_path: Path) -> None:
+    """The duplicated key might be `password`. Naming the key is the whole job; the value is not."""
+    with pytest.raises(ProfileConfigError) as error:
+        ProfileManager(_write(tmp_path, _DUPLICATED_KEY_YAML), env=_ENV).get("qa")
+
+    message = str(error.value)
+    assert "qa.example.invalid" not in message
+    assert "true" not in message.lower().split("duplicated")[0]

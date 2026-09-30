@@ -889,3 +889,129 @@ def test_a_plain_redirect_is_still_reported_as_a_redirect() -> None:
     probe = session_with(client).logon()
     assert "redirected" in probe.detail
     assert "SAML" not in probe.detail
+
+
+# --- refusing on principle is not failing to reach (D73) ---------------------------------------
+#
+# The landscape owner opened BIPRWS on the RESTful port. It answers a credential-free GET with the
+# logon template - the endpoint is up, initialised and talking to its CMS - and the connector still
+# reported `transport failure (ConnectError)`, because that port carries no TLS listener and the
+# profile will not send a password unencrypted. Two separate faults in one message: the success case
+# had no name at all, and a deliberate refusal was dressed as a network problem.
+
+
+def test_a_healthy_endpoint_is_named_as_healthy_not_as_unexpected() -> None:
+    """Every failure had a sentence and the success case fell through to "unexpected".
+
+    That inverts the one observation the whole credential-free gate exists to make.
+    """
+    detail = _classify_http(200)
+    assert "unexpected" not in detail.lower()
+    assert "healthy" in detail
+    # It must not overstate: a healthy endpoint says nothing about whether a credential is accepted.
+    assert "separate question" in detail
+
+
+def test_every_status_band_still_has_its_own_statement() -> None:
+    """Asserted as a set, because the 2xx branch was added to a chain of returns.
+
+    Collapsing the exact statuses into a table to stay under a branch limit is the kind of edit that
+    silently drops one, so the whole vocabulary is pinned rather than the new arrival alone.
+    """
+    assert "credentials rejected" in _classify_http(401)
+    assert "not permitted" in _classify_http(403)
+    assert "not deployed" in _classify_http(404)
+    assert "identity provider" in _classify_http(302)
+    assert "failing to initialise" in _classify_http(500)
+    assert "unexpected" in _classify_http(418)  # genuinely unclassified stays unclassified
+
+
+class _RaisingClient:
+    """A transport whose TLS GET fails, standing in for a port with no TLS listener."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def get(self, url: str, params: Any = None, headers: Any = None) -> Any:
+        self.calls.append(("GET", url))
+        raise OSError("ConnectError")
+
+    def post(self, url: str, json: Any = None, content: Any = None, headers: Any = None) -> Any:
+        self.calls.append(("POST", url))
+        raise AssertionError("a credential must never be sent after a transport failure")
+
+    def close(self) -> None:
+        return None
+
+
+def _session_with_fallback(
+    client: _RaisingClient, status: int | None = 200, **profile_kwargs: Any
+) -> tuple[Any, list[str]]:
+    """A session whose plain-HTTP fallback is substituted, so no socket and no httpx is needed.
+
+    ``status=None`` stands for "the plain-HTTP attempt also failed", which is how a genuinely
+    unreachable host differs from a host with no TLS listener.
+    """
+    session = session_with(client, **profile_kwargs)
+    asked: list[str] = []
+
+    def probe(url: str) -> Any | None:
+        asked.append(url)
+        return _Response(status, {}) if status is not None else None
+
+    session._plain_http_probe = probe  # type: ignore[method-assign]
+    return session, asked
+
+
+def test_a_tls_refusal_reports_the_endpoint_as_up_and_names_the_setting() -> None:
+    client = _RaisingClient()
+    session, asked = _session_with_fallback(client, use_tls=True)
+    probe = session.logon()
+
+    assert probe.authenticated is False
+    # The finding, not the symptom: the service is up, and the refusal is this profile's decision.
+    assert "no TLS listener" in probe.detail
+    assert "the service itself is up" in probe.detail
+    assert "healthy" in probe.detail
+    # Both settings named, because either alone leaves the connection refused.
+    assert "use_tls: false" in probe.detail
+    assert "allow_plain_http: true" in probe.detail
+    # And the fallback went to plain HTTP, carrying no credential.
+    assert asked and all(url.startswith("http://") for url in asked)
+    assert not any(method == "POST" for method, _ in client.calls)
+
+
+def test_the_fallback_probe_is_credential_free_by_construction() -> None:
+    """It is the same GET the health gate already makes, so it cannot carry the password.
+
+    Asserted rather than reasoned about: this is the one request the fix adds, and it is added on a
+    path that exists precisely because a credential must not go out unencrypted.
+    """
+    session, asked = _session_with_fallback(_RaisingClient(), use_tls=True)
+    session.logon()
+
+    assert len(asked) >= 1
+    for url in asked:
+        assert url.endswith("logon/long")
+        assert "password" not in url.lower()
+
+
+def test_a_profile_that_already_allows_plain_http_does_not_probe_twice() -> None:
+    """Nothing to establish: the profile has already accepted an unencrypted channel."""
+    session, asked = _session_with_fallback(
+        _RaisingClient(), use_tls=False, allow_plain_http=True
+    )
+    probe = session.logon()
+
+    assert asked == []
+    assert "transport failure" in probe.detail
+
+
+def test_a_genuinely_unreachable_host_keeps_the_transport_message() -> None:
+    """The fallback must not turn an unreachable host into a reassuring sentence."""
+    session, asked = _session_with_fallback(_RaisingClient(), status=None, use_tls=True)
+    probe = session.logon()
+
+    assert asked, "the fallback should have been attempted"
+    assert "transport failure" in probe.detail
+    assert "the service itself is up" not in probe.detail

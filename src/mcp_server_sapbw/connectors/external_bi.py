@@ -62,6 +62,15 @@ _SERVER_ERROR = 500
 #: deployment it is not a fault at all - it is the identity provider taking over the request, and no
 #: credential this connector holds can satisfy a browser-based SAML flow.
 _REDIRECT_STATUSES: frozenset[int] = frozenset({301, 302, 303, 307, 308})
+#: Lower bound of the redirect range, so the 2xx success band has an upper bound to test against.
+_REDIRECT_MIN = 300
+#: Statuses whose meaning is exact rather than a band. A table rather than a chain of returns, so
+#: adding one does not push the function past the branch limit and invite a shortcut.
+_EXACT_STATUS_DETAIL: dict[int, str] = {
+    _UNAUTHORIZED: "reachable, credentials rejected (401)",
+    _FORBIDDEN: "reachable, authenticated but not permitted (403)",
+    _NOT_FOUND: "BIPRWS is not deployed at this path (404)",
+}
 
 #: Markers that identify a federated-authentication redirect. Matched on the redirect
 #: *target*, the only place the mechanism is visible - a status code alone cannot
@@ -193,6 +202,59 @@ class _BiprwsSession:
     def _url(self, root: str, path: str) -> str:
         return self._profile.base_url(f"{root.strip('/')}/{path.strip('/')}")
 
+    def _transport_detail(self, exc: Exception, root: str) -> str:
+        """Why the transport failed - and whether the endpoint is in fact fine (D73).
+
+        **Refusing on principle is not the same as failing to reach**, and reporting both as
+        "transport failure" sends the reader to the network team for a decision that is theirs. The
+        landscape owner opened BIPRWS on the RESTful port, it answered a credential-free GET with
+        the logon template, and this connector still said ``transport failure (ConnectError)`` -
+        the port carries no TLS listener and the profile will not fall back to plain HTTP with a
+        password in hand. True, and useless: nothing in it says the endpoint works, and nothing says
+        which setting decides.
+
+        The retry is safe by construction. It is the *same credential-free* GET the health gate
+        already performs - the password is not in this request and cannot be - so establishing
+        "the service is up, just not over TLS" costs one request and discloses nothing. Only
+        attempted when TLS was actually required, so a profile that already allows plain HTTP does
+        not probe twice.
+        """
+        base = f"transport failure ({type(exc).__name__}); connection details withheld"
+        if not self._profile.use_tls or self._profile.allow_plain_http:
+            return base
+        plain = self._url(root, "logon/long").replace("https://", "http://", 1)
+        response = self._plain_http_probe(plain)
+        if response is None or not (_OK <= response.status_code < _REDIRECT_MIN):
+            return base
+        return (
+            "no TLS listener on this port, but the endpoint answers a credential-free GET over "
+            "plain HTTP, so the service itself is up: "
+            f"{_classify_http(response.status_code)} No logon was attempted, because this profile "
+            "refuses to put a credential on an unencrypted channel. To proceed, either expose "
+            "BIPRWS over TLS, or record the decision explicitly by setting use_tls: false and "
+            "allow_plain_http: true on this platform - both, so it cannot happen by accident."
+        )
+
+    def _plain_http_probe(self, url: str) -> Any | None:
+        """One credential-free GET over plain HTTP, or ``None`` when it cannot be made.
+
+        Its own method so a test can substitute it without reaching for the HTTP library. This
+        module's tests are entirely offline by design - every transport is injected - and
+        monkeypatching ``httpx`` to prove a *message* would make an optional extra mandatory for the
+        whole suite to import.
+        """
+        try:
+            import httpx  # noqa: PLC0415 - optional extra, imported lazily
+        except ModuleNotFoundError:  # pragma: no cover - the caller already needs httpx
+            return None
+        try:
+            with httpx.Client(
+                timeout=self._profile.timeout_seconds, follow_redirects=False
+            ) as client:
+                return client.get(url, headers={"Accept": "application/json"})
+        except Exception:  # any failure here just leaves the original message in place
+            return None
+
     # -- logon -------------------------------------------------------------------------
 
     def logon(self) -> BiprwsProbe:
@@ -222,12 +284,7 @@ class _BiprwsSession:
             try:
                 probe_response = client.get(url, headers={"Accept": "application/json"})
             except Exception as exc:
-                last = BiprwsProbe(
-                    root,
-                    None,
-                    False,
-                    f"transport failure ({type(exc).__name__}); connection details withheld",
-                )
+                last = BiprwsProbe(root, None, False, self._transport_detail(exc, root))
                 continue
             if probe_response.status_code != _OK:
                 detail = _classify_http(probe_response.status_code)
@@ -354,6 +411,11 @@ class _BiprwsSession:
 def _classify_http(status: int) -> str:
     """Turn a BIPRWS status into an actionable statement.
 
+    **The success case is named, and was not** (D73). Every failure had a sentence and a 2xx fell
+    through to "unexpected HTTP status 200" - so the one observation this whole gate exists to make
+    came back labelled as a surprise. Found when the landscape owner opened the RESTful port and the
+    endpoint started working: the probe reported success as an anomaly.
+
     The 500 case earns its length. On the reference landscape ``/biprws`` answers **500 to a plain
     credential-free GET**, which proves the web application is mapped in Tomcat and failing to
     initialise - not missing, not rejecting the credentials, and not disagreeing about the request
@@ -362,12 +424,16 @@ def _classify_http(status: int) -> str:
     "unexpected HTTP status 500" sends whoever reads it looking in the wrong place. It cost an hour
     of trying auth types and body shapes against an endpoint that cannot answer any of them.
     """
-    if status == _UNAUTHORIZED:
-        return "reachable, credentials rejected (401)"
-    if status == _FORBIDDEN:
-        return "reachable, authenticated but not permitted (403)"
-    if status == _NOT_FOUND:
-        return "BIPRWS is not deployed at this path (404)"
+    if _OK <= status < _REDIRECT_MIN:
+        return (
+            f"deployed and healthy (HTTP {status} to a credential-free GET). BIPRWS answers this "
+            "request with the template of attributes a logon POST expects, so the endpoint is "
+            "mapped, initialised and able to reach its CMS. Whether a credential is accepted is a "
+            "separate question this observation does not answer."
+        )
+    exact = _EXACT_STATUS_DETAIL.get(status)
+    if exact is not None:
+        return exact
     if status in _REDIRECT_STATUSES:
         return (
             f"redirected (HTTP {status}) rather than answering. On a single-sign-on "
