@@ -52,6 +52,47 @@ class AdtProvenance(BaseModel):
     fetched_at: datetime
 
 
+class TableOwner(BaseModel):
+    """Which development package a table belongs to, read from the source system (D67).
+
+    **Why a package and not an application component.** Mission §9.6 asks for enhancements reading
+    *another team's* data to be flagged, and doing that needs an ownership signal the server can
+    read
+    rather than infer. ADT's information system returns a package name and description per object in
+    one GET; a formal application component is **not** exposed - ``/packages/<name>`` answers 404 on
+    the reference system, and the package's own description is as far as it goes. So the package is
+    the
+    ownership unit used, and its limits are stated rather than glossed:
+
+    * a package is a **development-organisation** unit, which usually tracks functional ownership
+    and
+      is not guaranteed to;
+    * some packages are **shared infrastructure** - change documents, address services - and reading
+      one is not reaching into another team's business data;
+    * a customer or partner namespace may carry **no package at all** in the search result, which is
+      reported as unknown rather than as "no owner".
+
+    Hence ``basis`` for the advisory flag: this is a signal a reviewer acts on, not a verdict.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    table: str
+    #: Development package, e.g. ``VF``. Empty string when the search returned the object with no
+    #: package, which happens for customer and partner namespaces.
+    package: str | None = None
+    #: The package's own short text, so ``VF`` is readable as "Application development R/3 invoice".
+    package_description: str | None = None
+    #: The table's description, which is often the clearest statement of what was actually read.
+    table_description: str | None = None
+    #: ADT object type, e.g. ``TABL/DT``. Recorded because the search returns several objects per
+    #: name - the table, its maintenance object, documentation data elements - and which one was
+    #: chosen decides the package. Taking the first match attributed ``VBRP`` to ``VFW`` (its
+    #: maintenance object) instead of ``VF``.
+    object_type: str | None = None
+    provenance: AdtProvenance | None = None
+
+
 class ExitBranch(BaseModel):
     """One DataSource's own branch of the exit's ``CASE``, analysed in isolation.
 

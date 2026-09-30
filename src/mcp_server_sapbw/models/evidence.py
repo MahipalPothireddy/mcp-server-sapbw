@@ -180,6 +180,27 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "field. A CompositeProvider has no transformation, so this hop exists nowhere else - "
         "without it a field-level trace stops at the CompositeProvider.",
     ),
+    # FieldLineageHop.evidence for a MultiProvider hop (D22). Same standing as the CompositeProvider
+    # mapping above and for the same reason: BW's own stored identification, read row by row, not a
+    # convention applied to a name. A MultiProvider has no transformation either, so without this
+    # hop every field of one stops at the provider.
+    ("multiprovider_identification", "declared"): (
+        "observed",
+        "declared_multiprovider_identification",
+        "The MultiProvider's InfoObject identification on RSDICMULTIIOBJ names the part supplying "
+        "this field and the field's name inside that part. The part's field name is read rather "
+        "than assumed equal to the provider's, because identification may rename it.",
+    ),
+    # FieldLineageHop.evidence for the hop from a reference characteristic to the one it references
+    # (D35). Read from RSDCHA.CHABASNM, so stated rather than inferred - and pointedly not derived
+    # from a table name: the constructed route to the same fact is the one that gets it wrong.
+    ("reference_characteristic", "declared"): (
+        "observed",
+        "declared_reference_characteristic",
+        "RSDCHA.CHABASNM names the characteristic this one references. A reference characteristic "
+        "owns no master data - its attribute, SID, text and view tables belong to the referenced "
+        "characteristic and nothing loads into it - so the field is populated there, not here.",
+    ),
     # CalcViewDefinition.evidence - the logic inside a calculation view. Read from the activated
     # design-time definition, so the joins, filters and formulas are stated rather than inferred;
     # what remains uncertain is whether an inactive change exists, which the caveats say.
@@ -196,6 +217,20 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "Derived by parsing SELECTs out of a routine's ABAP. BW's own where-used lists do not "
         "contain this edge, and dynamic SQL and function-module calls are not followed, so it is a "
         "lower bound that can also be wrong.",
+    ),
+    # A lookup BW declares in a typed rule-step table. Distinct from both neighbours above, and the
+    # distinction is defect D15: lookup edges were only ever produced by parsing ABAP, so a lookup
+    # BW states outright - which has no SELECT to parse - was invisible, while a lookup that *is*
+    # declared came back advisory when it could be exact. Distinct from the generic
+    # ``declared_metadata`` too, because that sentence describes source/target endpoints and this
+    # edge is a *read*, not a data-flow hop: the reading transformation's target does not receive
+    # the looked-up object's rows, it consults them.
+    ("lineage_edge", "declared_lookup"): (
+        "observed",
+        "declared_lookup_rule",
+        "BW records this read itself, in the transformation's typed rule-step table "
+        "(RSTRANSTEPMASTER for a master-data read, RSTRANSTEPODSO/RSTRANSTEPADSO for a DataStore "
+        "read). Exact rather than parsed out of ABAP, and present in BW's own where-used list.",
     ),
     # AggregationRule.confidence / ValueSource.confidence - how a code's meaning was obtained.
     ("code_decode", "dictionary"): (

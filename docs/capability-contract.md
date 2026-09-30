@@ -13,9 +13,9 @@ neither a reader nor a stated reason.
 decision rests on the second. They used to share one word: `SUPPORTED` meant "a reader
 exists and a test covers it", but reads as "validated against supported BW versions".
 
-- **Implementation** - 82 of 101 capabilities are implemented.
+- **Implementation** - 85 of 104 capabilities are implemented.
 - **Validation** - 54 have been read through a real
-  feature against a live BW system, 18 are covered by the
+  feature against a live BW system, 21 are covered by the
   offline suite only, 29 are unproven, and
   **0 have been validated on a customer's own
   system**.
@@ -43,7 +43,7 @@ capability with a reader that no test touched reports `not_validated`.
 Presence of a table on *your* system is a third question again, answered per connection
 by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 
-## SUPPORTED (68)
+## SUPPORTED (71)
 
 | Capability | Object | Validation | Notes |
 |---|---|---|---|
@@ -70,6 +70,8 @@ by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 | `datasource` | `RSDS` | `integration_tested` | read by the server |
 | `datasource_field` | `RSDSSEGFD` | `unit_tested` | read by the server |
 | `dict_columns` | `DD03L` | `integration_tested` | read by the server |
+| `dict_domain_text` | `DD07T` | `unit_tested` | read by the server |
+| `dict_domain_values` | `DD07L` | `unit_tested` | read by the server |
 | `dso_field` | `RSDODSOIOBJ` | `integration_tested` | read by the server |
 | `dso_header` | `RSDODSO` | `integration_tested` | read by the server |
 | `dso_text` | `RSDODSOT` | `integration_tested` | read by the server |
@@ -91,6 +93,7 @@ by `bw_system_profile` and crossed with this contract by `bw_capability_report`.
 | `infosource_map` | `RSISOSMAP` | `integration_tested` | read by the server |
 | `keyfigure` | `RSDKYF` | `integration_tested` | read by the server |
 | `log_chain` | `RSPCLOGCHAIN` | `integration_tested` | read by the server |
+| `multiprovider_identification` | `RSDICMULTIIOBJ` | `unit_tested` | read by the server |
 | `multiprovider_part` | `RSDCUBEMULTI` | `integration_tested` | read by the server |
 | `nav_attribute` | `RSDATRNAV` | `integration_tested` | read by the server |
 | `object_dependencies` | `OBJECT_DEPENDENCIES` | `integration_tested` | read by the server |

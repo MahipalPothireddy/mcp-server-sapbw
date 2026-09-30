@@ -24,7 +24,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from typing import Any
 
-from ..models.chains import ChainCadence, LoadClosure, LoadedProvider
+from ..models.chains import ChainCadence, InactiveLoader, LoadClosure, LoadedProvider
 from ..models.completeness import COMPLETE, bounded
 from ..models.provenance import UnsupportedResult
 from ..repositories.base import Repository
@@ -228,13 +228,33 @@ class LoadClosureService(Repository):
         )
         dtp_ids = [str(r[0]).strip() for r in dtps if _clean(r[0])]
         if not dtp_ids:
+            # Nothing active loads it. Before reporting that as three innocent guesses, look for a
+            # loader that exists at a non-active version (D33) - because on a populated provider the
+            # difference between "never had a loader" and "had one, frozen years ago" is the
+            # difference between an orphan and deliberately retained history.
+            frozen = self._inactive_loaders(provider)
+            no_loader_caveats = [
+                "no DTP targets this provider, so no loading chain could be resolved; it may "
+                "be loaded by an InfoPackage, filled by a routine, or be virtual"
+            ]
+            if frozen:
+                versions = sorted({loader.objvers for loader in frozen})
+                sources = sorted({loader.source_name for loader in frozen if loader.source_name})
+                no_loader_caveats.append(
+                    f"{len(frozen)} transformation(s) DO target this provider but exist only at a "
+                    f"non-active version ({', '.join(versions)}) with status ACT"
+                    + (f", sourced from {', '.join(sources[:3])}" if sources else "")
+                    + ". Mission rule 6 reads the active version only, so these are correctly "
+                    "excluded from the loading chains above - but the provider is not unloaded by "
+                    "design: it was loaded and no longer is. Check whether its source was "
+                    "decommissioned and the data is retained deliberately before treating it as "
+                    "orphaned."
+                )
             return LoadClosure(
                 direction="provider_to_chains",
                 provider=provider,
-                caveats=[
-                    "no DTP targets this provider, so no loading chain could be resolved; it may "
-                    "be loaded by an InfoPackage, filled by a routine, or be virtual"
-                ],
+                inactive_loaders=frozen,
+                caveats=no_loader_caveats,
             )
 
         placeholders = ", ".join("?" for _ in dtp_ids)
@@ -276,6 +296,62 @@ class LoadClosureService(Repository):
             caveats=caveats,
         )
 
+    def _inactive_loaders(self, provider: str) -> list[InactiveLoader]:
+        """Transformations targeting ``provider`` that exist only at a non-active version (D33).
+
+        **Narrow on purpose, and the narrowing is the whole design.** "Any non-active inbound
+        transformation" covers **6,483** targets on the reference system, overwhelmingly
+        ``OBJVERS='D'`` with ``OBJSTAT='INA'`` - BW-delivered content nobody ever activated.
+        Reporting those would be true and useless. Requiring ``OBJSTAT='ACT'`` cuts it to **576**,
+        of which only ten hold any rows: a version that is not active while its status says active
+        is the signature of a loader that used to run.
+
+        **Rule 6 is not relaxed anywhere else.** The active-version filter is injected by the
+        dialect for every other read; here the ``where`` names ``OBJVERS`` explicitly, which the
+        dialect honours as a deliberate opt-out rather than overruling. So the one statement that
+        needs to see a non-active row says so in its own SQL, and nothing global changes.
+
+        Called only when the active loader read came back empty, so a provider with a working loader
+        pays nothing for this.
+        """
+        if not self.capability.is_available("transformation"):
+            return []
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["TRANID", "OBJVERS", "OBJSTAT", "SOURCENAME", "SOURCETYPE"],
+                    from_logical="transformation",
+                    # OBJVERS named explicitly: the dialect skips its own injection when a condition
+                    # already constrains the column, which is how Rule 6 is opted out of visibly
+                    # rather than by a global switch.
+                    where=["TARGETNAME = ?", "OBJVERS <> 'A'", "OBJSTAT = 'ACT'"],
+                    params=[provider],
+                    order_by=["TRANID"],
+                ),
+                limit=_MAX_INACTIVE_LOADERS,
+            )
+        )
+        loaders: list[InactiveLoader] = []
+        for tran_id, objvers, objstat, source_name, source_type in rows:
+            ident = _clean(tran_id)
+            version = _clean(objvers)
+            if not ident or not version:
+                continue
+            loaders.append(
+                InactiveLoader(
+                    tran_id=ident,
+                    objvers=version,
+                    objstat=_clean(objstat),
+                    source_name=_clean(source_name),
+                    source_type=_clean(source_type),
+                    provenance=self.provenance(
+                        "transformation",
+                        {"TRANID": ident, "OBJVERS": version, "TARGETNAME": provider},
+                    ),
+                )
+            )
+        return loaders
+
     def _parents_of(self, chain_ids: list[str]) -> set[str]:
         """Chains that call any of ``chain_ids`` as a sub-chain (one level up)."""
         if not chain_ids:
@@ -297,6 +373,10 @@ class LoadClosureService(Repository):
 
 
 _DTP_BATCH = 300
+#: Non-active loaders reported per provider. Measured: the three populated cases on the reference
+#: system have exactly one each, and the largest count across all 576 narrow-population targets is
+#: small - so this is a bound against a pathological object, not a page size.
+_MAX_INACTIVE_LOADERS = 20
 # RSBKDTP.UPDMODE -> readable update mode.
 _UPDMODE_LABEL: dict[str, str] = {"F": "full", "D": "delta", "I": "init"}
 

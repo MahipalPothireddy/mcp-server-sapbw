@@ -7,6 +7,7 @@ involved. ABAP fixtures use synthetic DataSource and table names.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any
 
 from pydantic import SecretStr
 
@@ -15,9 +16,11 @@ from mcp_server_sapbw.connectors.ecc import (
     AdtError,
     AdtResponse,
     EccConnector,
+    _best_object_reference,
 )
 from mcp_server_sapbw.core.profiles import EccProfile
-from mcp_server_sapbw.services.analyzers import _exit_index, _exit_risk
+from mcp_server_sapbw.models.ecc import TableOwner
+from mcp_server_sapbw.services.analyzers import _describe_ownership, _exit_index, _exit_risk
 from mcp_server_sapbw.services.exit_analysis import (
     ExitAnalysisService,
     parse_dynamic_dispatch,
@@ -614,3 +617,234 @@ def test_an_absent_satellite_does_not_enter_the_risk_index() -> None:
     service, _ = _dispatching_service()
     index = _exit_index(service.inventory(datasources=["DS_NOTHING"]))
     assert "DS_NOTHING" not in index
+
+
+# --- table ownership, and flagging rather than asking (D67) -------------------------------------
+#
+# Mission 9.6 requires an enhancement reading another team's data to be FLAGGED. The analyzer used
+# to
+# recommend "confirm the table(s) belong to this functional area", which hands the analyst their own
+# question back while both halves of the comparison sit in the finding's metrics.
+#
+# Ownership is read from the source system's repository - never inferred from table-name prefixes. A
+# naming convention cannot support an accusation about ownership, and it would misfile the customer
+# and industry-solution tables that make up a large share of the reads on a real landscape.
+
+
+def _search_xml(*refs: tuple[str, str, str, str]) -> str:
+    """An ADT information-system search response. ``refs`` are ``(uri, type, name, package)``."""
+    body = "".join(
+        f'<adtcore:objectReference adtcore:uri="{uri}" adtcore:type="{otype}" '
+        f'adtcore:name="{name}" adtcore:packageName="{package}" '
+        f'adtcore:description="desc of {name}"/>'
+        for uri, otype, name, package in refs
+    )
+    return f'<?xml version="1.0"?><adtcore:objectReferences>{body}</adtcore:objectReferences>'
+
+
+def test_the_table_is_picked_over_its_maintenance_object() -> None:
+    """The ranking that decides whether the ownership read is right at all.
+
+    A real search for VBRP returns its maintenance object (SOBJ/MO, package VFW) *before* the table
+    (TABL/DT, package VF). First-match therefore reports the wrong owner - and a wrong
+    owner inside a finding about ownership is worse than none: it reads as precise.
+    """
+    xml = _search_xml(
+        ("/x/sobjmo/VBRP", "SOBJ/MO", "VBRP", "VFW"),
+        ("/x/tabldt/VBRP", "TABL/DT", "VBRP", "VF"),
+    )
+    assert _best_object_reference(xml, "VBRP") == ("TABL/DT", "VF", "desc of VBRP")
+
+
+def test_a_name_that_only_partly_matches_is_ignored() -> None:
+    """A search for VBRP also returns VBRP00002; attributing its package to VBRP would be wrong."""
+    xml = _search_xml(("/x/dtelde/VBRP00002", "DTEL/DE", "VBRP00002", "BAM"))
+    assert _best_object_reference(xml, "VBRP") is None
+
+
+def test_an_unranked_object_type_still_resolves() -> None:
+    """An unfamiliar type is ranked mid-table rather than discarded - some answer beats none."""
+    xml = _search_xml(("/x/zzz/ZT", "ZZZZ/XX", "ZT", "ZPKG"))
+    assert _best_object_reference(xml, "zt") == ("ZZZZ/XX", "ZPKG", "desc of ZT")
+
+
+class OwnerFetcher:
+    """Answers the ownership search and the package-text read; records what was asked."""
+
+    def __init__(self, packages: dict[str, str], texts: dict[str, str] | None = None) -> None:
+        self._packages = packages
+        self._texts = texts or {}
+        self.calls: list[tuple[str, str]] = []
+
+    def get_text(self, path: str, params: Any, accept: str = "text/plain") -> AdtResponse:
+        self.calls.append((path, accept))
+        if "informationsystem/search" in path:
+            name = str(dict(params).get("query", "")).upper()
+            package = self._packages.get(name)
+            if package is None:
+                return AdtResponse(200, _search_xml())
+            return AdtResponse(200, _search_xml((f"/x/{name}", "TABL/DT", name, package)))
+        if "object_type/devck" in path:
+            package = path.rsplit("/", 1)[-1].upper()
+            text = self._texts.get(package)
+            if text is None:
+                return AdtResponse(404, "")
+            return AdtResponse(
+                200, f'<adtcore:mainObject adtcore:name="{package}" adtcore:description="{text}"/>'
+            )
+        return AdtResponse(404, "")
+
+
+def owner_connector(
+    packages: dict[str, str], texts: dict[str, str] | None = None
+) -> tuple[EccConnector, OwnerFetcher]:
+    fetcher = OwnerFetcher(packages, texts)
+    profile = EccProfile(
+        name="src",
+        host="src.example.invalid",
+        port=44300,
+        client="300",
+        user="reader",
+        password=SecretStr("pw"),  # pragma: allowlist secret
+        max_satellite_fetches=10,
+    )
+    return EccConnector(profile, fetcher), fetcher
+
+
+def test_owners_are_resolved_with_an_xml_accept_header() -> None:
+    """The header that made this possible.
+
+    With `text/plain` hardcoded on the client, every metadata endpoint answered 404 or
+    406 - indistinguishable from the endpoint not existing.
+    """
+    connector, fetcher = owner_connector({"VBRP": "VF"})
+    owners = connector.resolve_owners(["vbrp"])
+    assert owners["VBRP"].package == "VF"
+    assert owners["VBRP"].object_type == "TABL/DT"
+    assert owners["VBRP"].provenance is not None
+    assert all(accept == "application/xml" for _path, accept in fetcher.calls)
+
+
+def test_an_unresolvable_table_is_absent_rather_than_defaulted() -> None:
+    connector, _ = owner_connector({"VBRP": "VF"})
+    owners = connector.resolve_owners(["vbrp", "zunknown"])
+    assert set(owners) == {"VBRP"}
+
+
+def test_the_ownership_read_is_bounded_by_the_profile_budget() -> None:
+    """One GET per table against a production system, so the sweep has to have a ceiling."""
+    connector, fetcher = owner_connector({f"T{i}": "PKG" for i in range(40)})
+    connector.resolve_owners([f"t{i}" for i in range(40)])
+    assert len(fetcher.calls) == 10  # max_satellite_fetches
+
+
+def test_duplicate_table_names_are_read_once() -> None:
+    connector, fetcher = owner_connector({"VBRP": "VF"})
+    connector.resolve_owners(["vbrp", "VBRP", "vbrp"])
+    assert len(fetcher.calls) == 1
+
+
+def test_package_texts_are_unescaped() -> None:
+    """ADT returns XML, so a description with quotes arrives escaped."""
+    connector, _ = owner_connector(
+        {"BKPF": "FBAS"}, {"FBAS": "Financial Accounting &quot;Basis&quot;"}
+    )
+    texts = connector.resolve_package_texts(["FBAS"])
+    assert texts["FBAS"] == 'Financial Accounting "Basis"'
+
+
+# --- the flag itself ----------------------------------------------------------------------------
+
+
+def owners_for(mapping: dict[str, tuple[str, str]]) -> dict[str, TableOwner]:
+    """``{table: (package, package description)}`` as the analyzer receives it."""
+    return {
+        table.upper(): TableOwner(
+            table=table.upper(), package=package, package_description=text
+        )
+        for table, (package, text) in mapping.items()
+    }
+
+
+def test_reads_across_three_packages_are_flagged_as_crossing_areas() -> None:
+    """The measured threshold. The subject that prompted D67 touches six packages."""
+    ownership = _describe_ownership(
+        ["VBRP", "VBAK", "A806"],
+        owners_for(
+            {
+                "VBRP": ("VF", "Invoice"),
+                "VBAK": ("VA", "Sales"),
+                "A806": ("VKOK", "Conditions"),
+            }
+        ),
+    )
+    assert ownership.resolved is True
+    assert ownership.spans_owners is True
+    assert "reads data owned by 3 different development packages" in ownership.recommendation
+    # The packages are named with their descriptions, so the reader sees ownership directly.
+    assert "VF (Invoice)" in ownership.recommendation
+    assert "development-organisation unit" in ownership.recommendation
+
+
+def test_reads_within_two_packages_are_not_flagged() -> None:
+    """The property that makes the flag worth having: a flag that always fires is not a flag.
+
+    Two packages is the ordinary case and almost always one area talking to itself - a billing
+    extractor reading sales documents. Verified on production: 6 of 23 findings flag, not 23.
+    """
+    ownership = _describe_ownership(
+        ["VBPA", "VBAK"], owners_for({"VBPA": ("VZ", "Sales flow"), "VBAK": ("VA", "Sales")})
+    )
+    assert ownership.resolved is True
+    assert ownership.spans_owners is False
+    assert "no cross-area coordination risk" in ownership.recommendation
+
+
+def test_a_single_package_is_not_flagged() -> None:
+    ownership = _describe_ownership(
+        ["VBRP", "VBRK"], owners_for({"VBRP": ("VF", "Invoice"), "VBRK": ("VF", "Invoice")})
+    )
+    assert ownership.spans_owners is False
+    assert ownership.by_package == {"VF": ["VBRP", "VBRK"]}
+
+
+def test_unattributed_tables_make_the_owner_count_a_lower_bound() -> None:
+    """Never defaulted to a package: an unknown owner is reported as unknown.
+
+    The unresolvable table is named ``NOSUCHTAB`` rather than something customer-shaped on purpose.
+    A ``Z``-prefixed placeholder would be synthetic and would still trip the repository's own
+    customer-metadata check, which is right to reject it: the check cannot tell an invented
+    customer name from a real one, and that is the property that makes it worth having.
+    """
+    ownership = _describe_ownership(
+        ["VBRP", "NOSUCHTAB"], owners_for({"VBRP": ("VF", "Invoice")})
+    )
+    assert ownership.unresolved == ["NOSUCHTAB"]
+    assert "lower bound" in ownership.detail
+    assert "NOSUCHTAB" not in str(ownership.by_package)
+
+
+def test_no_ownership_at_all_reports_unresolved_rather_than_guessing() -> None:
+    ownership = _describe_ownership(["VBRP", "VBAK"], {})
+    assert ownership.resolved is False
+    assert ownership.spans_owners is False
+    assert ownership.detail == ""
+    assert sorted(ownership.unresolved) == ["VBAK", "VBRP"]
+
+
+def test_an_exit_reading_nothing_claims_nothing() -> None:
+    ownership = _describe_ownership([], owners_for({"VBRP": ("VF", "Invoice")}))
+    assert ownership.resolved is False
+    assert ownership.by_package == {}
+
+
+def test_a_package_with_no_description_is_still_named() -> None:
+    """Customer and partner namespaces carry no package text on the reference system."""
+    ownership = _describe_ownership(
+        ["A", "B", "C"],
+        owners_for({"A": ("/IRM/IP", ""), "B": ("VF", "Invoice"), "C": ("VA", "Sales")}),
+    )
+    assert ownership.spans_owners is True
+    assert "/IRM/IP" in ownership.recommendation
+    # No empty parenthesis where a description would go.
+    assert "/IRM/IP ()" not in ownership.recommendation

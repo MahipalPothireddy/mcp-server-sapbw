@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ..connectors.base import ConnectorRegistry
 from ..models.capability import CapabilityRecord
-from ..models.chains import LoadedProvider
+from ..models.chains import ChainRuntimes, LoadedProvider
 from ..models.description import Description
 from ..models.hana import HanaCrossingReport
 from ..models.lineage import LineageGraph
@@ -62,6 +62,8 @@ _PROVIDER_HEADERS: tuple[tuple[str, str], ...] = (
 _ENUMERATION_CAP = 5000
 # Loading chains listed inline in a coverage-table cell before the rest are summarised as a count.
 _CHAINS_PER_CELL = 4
+# Contending chains named in a runtime block before the rest become "and others" (D64).
+_CONTENDERS_PER_CELL = 3
 # Hops to walk for a per-object lineage page. Four covers the deepest flow shape this documentation
 # set is asked about - EDW DSO -> ADM DSO -> calc view -> CompositeProvider -> BEx query, which is
 # four hops - and the graph still reports when it truncates. Deeper walks cost disproportionately:
@@ -127,6 +129,84 @@ def _slug(name: str) -> str:
     """Filesystem-safe slug for an object technical name."""
     out = "".join(c if c.isalnum() else "_" for c in name).strip("_")
     return out or "object"
+
+
+def _contention_text(runtimes: ChainRuntimes) -> str:
+    """The contention cell for a chain's runtime block (D64).
+
+    Three distinct states, and the third is why this is not a bare number: contention *not measured*
+    has to read differently from contention measured and found to be zero. Collapsing them is the
+    mistake the whole defect was made of.
+    """
+    if not runtimes.contention_measured:
+        return "not measured"
+    if not runtimes.contended_runs:
+        return "0 (measured, none observed)"
+    named = runtimes.contending_chains[:_CONTENDERS_PER_CELL]
+    if not named:
+        return str(runtimes.contended_runs)
+    suffix = ", and others" if len(runtimes.contending_chains) > len(named) else ""
+    return f"{runtimes.contended_runs} ({', '.join(named)}{suffix})"
+
+
+def _failed_step_lines(runtimes: ChainRuntimes) -> list[str]:
+    """The failed-step table for a chain page (D65).
+
+    Rendered even when empty, and the empty wording is the point. "No step is recorded as failed"
+    against a chain with a sub-100% success rate means the failure sits at run level, which is a
+    different investigation from a named broken step - and a page that simply omitted the section
+    would leave a reader to conclude whichever they preferred.
+    """
+    if runtimes.failed_steps:
+        lines = [
+            "### Steps that failed",
+            "",
+            "Ranked by how often they failed, **not** by duration - the longest-running step is "
+            "listed separately and is frequently not the one that broke.",
+            "",
+            "| Step | Type | State | Failures | Longest | Example run |",
+            "|---|---|---|--:|--:|---|",
+        ]
+        for step in runtimes.failed_steps:
+            longest = f"{step.longest_s:.0f} s" if step.longest_s is not None else "-"
+            lines.append(
+                f"| {step.variant or '-'} | {step.process_type} | "
+                f"{step.state} ({step.state_label}) | {step.occurrences} | {longest} | "
+                f"{step.example_log_id or '-'} |"
+            )
+        lines.append("")
+        return lines
+    if runtimes.steps_examined and runtimes.success_rate not in (None, 1.0):
+        return [
+            "### Steps that failed",
+            "",
+            f"None. Across the {runtimes.steps_examined} step(s) examined, no step "
+            "carries a failing state - so this chain's failures are recorded at run "
+            "level rather than against a step. Check the run log in RSPC.",
+            "",
+        ]
+    return []
+
+
+def _slowest_step_lines(runtimes: ChainRuntimes) -> list[str]:
+    """The duration ranking, explicitly captioned as duration so it cannot be read as failure."""
+    if not runtimes.bottleneck_steps:
+        return []
+    lines = [
+        "### Longest-running steps",
+        "",
+        "Duration ranking only. A step here is not necessarily a failing step.",
+        "",
+        "| Step | Type | Duration | State |",
+        "|---|---|--:|---|",
+    ]
+    for step in runtimes.bottleneck_steps:
+        state = f"{step.state} ({step.state_label})" if step.state_label else (step.state or "-")
+        lines.append(
+            f"| {step.variant or '-'} | {step.process_type} | {step.duration_s:.0f} s | {state} |"
+        )
+    lines.append("")
+    return lines
 
 
 def _render_description(description: Description | None) -> str:
@@ -800,9 +880,18 @@ class DocGenerator(Repository):
                 f"{runtimes.success_rate if runtimes.success_rate is not None else '-'})",
                 f"- Duration p95: {dur.p95_s if dur.p95_s is not None else '-'} s "
                 f"(max {dur.max_s if dur.max_s is not None else '-'} s)",
-                f"- Observed overlapping runs: {runtimes.observed_overlap_runs}",
+                # Two lines, because these were one number carrying the other's caption (D64): a
+                # chain overlapping itself is that chain's scheduling fault, while a chain sharing
+                # its window with others is contention that makes its duration not its own.
+                f"- Runs overlapping this chain's own previous run: {runtimes.self_overlap_runs}",
+                f"- Runs sharing their window with another chain: {_contention_text(runtimes)}",
                 "",
             ]
+            # Failed and slowest as two separate tables, never merged. They answer different
+            # questions and a reader chasing a failure was previously handed the duration ranking
+            # (D65); on a chain that fails fast those are different steps.
+            lines += _failed_step_lines(runtimes)
+            lines += _slowest_step_lines(runtimes)
             for caveat in runtimes.caveats:
                 self._gaps.add(f"chain {chain_id}", caveat)
         lines.append(self._citation("RSPCCHAINATTR, RSPCCHAIN, RSPCLOGCHAIN, RSPCPROCESSLOG"))

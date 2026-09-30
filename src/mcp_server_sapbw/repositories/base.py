@@ -64,6 +64,38 @@ class Repository:
             alternative=alternative,
         )
 
+    def require_columns(
+        self, logical_name: str, *columns: str, alternative: str | None = None
+    ) -> UnsupportedResult | None:
+        """Return an ``UnsupportedResult`` if this release lacks any of ``columns``, else ``None``.
+
+        The pre-flight companion to :meth:`require` (D45). ``require`` answers "does the table
+        exist"; this answers "does it carry the columns this answer needs", which is a separate
+        question and was never asked. A reader that skips it still fails safely - the dialect will
+        not build the statement - but it fails as an exception, and a caller asking a legitimate
+        question about a release that structures a table differently deserves a structured result.
+
+        Silent when the column list was never measured, so a release whose ``DD03L`` could not be
+        read behaves exactly as it did before this existed.
+        """
+        status = self._capability.table(logical_name)
+        if status is None or not status.columns_known:
+            return None
+        absent = [column for column in columns if not status.has_column(column)]
+        if not absent:
+            return None
+        table = self.physical(logical_name)
+        return unsupported_result(
+            self._capability,
+            [f"{table}.{column}" for column in absent],
+            alternative=alternative,
+            detail=(
+                f"{table} exists on {self._capability.bw_release} but does not carry "
+                f"{', '.join(absent)}. The table was found and this column was not, so this is a "
+                "release difference rather than a missing grant or an absent object."
+            ),
+        )
+
     def physical(self, logical_name: str) -> str:
         """Resolved physical table name for a logical name (falls back to the logical name)."""
         status = self._capability.table(logical_name)

@@ -75,6 +75,12 @@ LineageEdgeKind = Literal[
     "composite_part",
     "calcview_base",
     "query_provider",
+    #: A read BW *declares* in a typed rule-step table (``RSTRANSTEPMASTER``/``ODSO``/``ADSO``).
+    #: Exact, and deliberately a different kind from ``routine_lookup``: the same question - what
+    #: else does this transformation read - has an authoritative answer here and a heuristic one
+    #: there, and a caller weighing an edge needs to know which it has. BW's own where-used list
+    #: contains these, so a missing one is a plain false negative rather than a bound being hit.
+    "declared_lookup",
     "routine_lookup",
     "source_extract",
     "unresolved_call",
@@ -173,6 +179,12 @@ class LineageEdge(BaseModel):
     #: and what creates the stale-lookup hazard, so it is the one worth surfacing first. Read
     #: ``update_modes`` when the distinction matters.
     update_mode: UpdateMode | None = None
+    #: Every active DTP BW has between this pair, from ``RSBKDTP.DTP``, sorted. The pair is one edge
+    #: on purpose — accumulating modes rather than letting row order pick one is the D13 fix — but
+    #: the ids were then discarded, so no individual load could be named. That is half of D18: on a
+    #: production ADSO eight inbound DTPs were reported as one edge with no way to identify any of
+    #: them, and an operator asking "which load do I re-run" had nothing to go on.
+    dtp_ids: list[str] = Field(default_factory=list)
     chain_id: str | None = None
     chain_frequency: str | None = None
     note: str | None = None
@@ -251,7 +263,14 @@ class LineageGraph(BaseModel):
 
 
 class ImpactAnalysis(BaseModel):
-    """Downstream blast radius of a change to an object, including routine-embedded consumers.
+    """Downstream blast radius of a change to an object, including consumers that only *read* it.
+
+    Two of those read relations exist and they are deliberately separate lists, because they carry
+    different weight. ``declared_lookup_consumers`` are objects whose transformation declares a read
+    of the root in its rule metadata: BW records these itself, they appear in BW's own where-used
+    list, and they are exact. ``routine_lookup_consumers`` are the ones found by parsing ABAP, which
+    BW's where-used list does *not* have and which are a heuristic lower bound. Collapsing them
+    would either overstate the second or understate the first.
 
     ``routine_lookup_consumers`` are objects whose transformation *routines* read the root object —
     dependencies invisible to BW's own where-used lists. They are advisory (heuristic lower bound).
@@ -264,6 +283,10 @@ class ImpactAnalysis(BaseModel):
     affected_object_count: int = 0
     affected_by_type: dict[str, int] = Field(default_factory=dict)
     routine_lookup_consumers: list[str] = Field(default_factory=list)
+    #: Objects whose transformation declares a read of the root in a typed rule-step table. Exact,
+    #: and present in BW's own where-used list — a missing entry here is a false negative, not a
+    #: bound being reached. Absent entirely before defect D15 was fixed.
+    declared_lookup_consumers: list[str] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
 
 

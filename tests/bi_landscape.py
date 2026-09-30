@@ -138,6 +138,10 @@ class ScriptedConnection:
             return [
                 (f"LOG{index}", _datum(day), _START_HHMMSS, "G") for index, day in enumerate(_DATES)
             ]
+        if "CHAIN_ID <> ?" in sql:  # contention: other chains' start times (D64)
+            # This landscape holds one chain, so nothing else can contend. Returned empty rather
+            # than omitted, so the reader records "measured, none found" instead of "not measured".
+            return []
         if "ZEIT" in sql:  # median start time (CHAIN_ID, ZEIT)
             return [(CHAIN, _START_HHMMSS)]
         if "DATUM" in sql:  # distinct run days

@@ -61,6 +61,25 @@ ecc = [
     "httpx>=0.27,<0.29",
 ]
 
+# Reading report schedules and dashboard sources from a live BI platform (scenarios 9.7 and 9.8).
+#
+# Optional for the same reason as `ecc`: these are separate systems with separate credentials, and a
+# BW-only install must never need them. Both drivers are imported lazily, so the extra's absence
+# costs nothing until a `bi_platforms` profile is configured.
+#
+#   psycopg  - Tableau's repository ("workgroup") is PostgreSQL, and reading it with a standard
+#              PostgreSQL driver is Tableau's own documented route. psycopg 3 is the current
+#              generation of the de-facto standard adapter (https://www.psycopg.org/), LGPL-3.0,
+#              same maintainer as psycopg2. The [binary] flavour bundles a prebuilt libpq so no
+#              PostgreSQL installation is needed on the machine running this server - which matters
+#              on Windows, where building from source needs a toolchain most analysts do not have.
+#   httpx    - already required by `ecc`; the BOBJ RESTful service (BIPRWS) speaks HTTP. Repeated
+#              here rather than relied upon transitively, so installing `bi` alone works.
+bi = [
+    "psycopg[binary]>=3.2,<4",
+    "httpx>=0.27,<0.29",
+]
+
 # NOTE: mission Section 10 lists an optional "pyrfc" extra for RFC-based query resolution.
 # It is intentionally NOT declared here: SAP PyRFC is no longer supported and every
 # pyrfc>=2.5 release is yanked on PyPI (see https://github.com/SAP/PyRFC/issues/372), which

@@ -27,7 +27,12 @@ _PROVIDER_SOURCES: tuple[tuple[str, str], ...] = (
     ("composite_header", "compositeprovider"),
 )
 
-#: Guard against a pathological hierarchy (a cycle in PARENT_AREA would otherwise loop).
+#: ``RSDAREA``'s parent link. Named here because it is the column the whole hierarchy rests on and
+#: it was wrong: ``PARENT_AREA`` does not exist on BW 7.50 and this tool raised on every call (D48).
+_PARENT_COLUMN = "INFOAREA_P"
+
+#: Guard against a pathological hierarchy (a cycle in the parent link would loop). Measured on the
+#: reference system there are none, and the deepest path is 6.
 _MAX_AREA_DEPTH = 12
 
 
@@ -38,6 +43,11 @@ class SemanticsRepository(Repository):
         self, *, limit: int = 100, offset: int = 0
     ) -> SemanticMap | UnsupportedResult:
         unsupported = self.require("info_area")
+        if unsupported is not None:
+            return unsupported
+        # The hierarchy is the point of this answer, so a release without the parent link gets a
+        # structured result naming the column, not a driver error at a character offset (D45).
+        unsupported = self.require_columns("info_area", "INFOAREA", _PARENT_COLUMN)
         if unsupported is not None:
             return unsupported
 
@@ -106,16 +116,27 @@ class SemanticsRepository(Repository):
     # --- reads ----------------------------------------------------------------------------
 
     def _parents(self) -> dict[str, str]:
-        """``{area: parent}`` from the hierarchy table. An empty parent means a root."""
-        rows = self.select(
-            self.dialect.build_select(
-                columns=["INFOAREA", "PARENT_AREA"],
-                from_logical="info_area",
-            )
-        )
+        """``{area: parent}`` from the hierarchy table. An empty parent means a root.
+
+        The parent column is ``INFOAREA_P``. It was ``PARENT_AREA``, which **does not exist on BW
+        7.50** - so this whole tool raised ``invalid column name`` on the reference system and had
+        never returned an answer there (D48). ``RSDAREA`` carries ``INFOAREA_P``, ``INFOAREA_C`` and
+        ``INFOAREA_N``, SAP's parent / first-child / next-sibling encoding.
+
+        The name was **verified rather than swapped for another guess**, which is the lesson of the
+        defect. Across 471 active areas: 29 roots, **0** parents naming an area with no row of its
+        own, 0 cycles, maximum depth 6 - and decisively, a *second* column agrees. For every one of
+        the 150 rows with a resolvable ``INFOAREA_C``, that child's own ``INFOAREA_P`` points back
+        to the row; and all 320 rows with a resolvable ``INFOAREA_N`` share a parent with it.
+        """
         return {
             str(area).strip(): str(parent or "").strip()
-            for area, parent in rows
+            for area, parent in self.select(
+                self.dialect.build_select(
+                    columns=["INFOAREA", _PARENT_COLUMN],
+                    from_logical="info_area",
+                )
+            )
             if str(area or "").strip()
         }
 

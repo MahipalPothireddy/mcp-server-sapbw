@@ -20,6 +20,7 @@ from collections import deque
 from typing import Any, cast
 
 from ..core.budget import current_budget
+from ..core.dialect import LIKE_ESCAPE, LikeTerm
 from ..models.evidence import evidence_for, summarise
 from ..models.lineage import (
     ImpactAnalysis,
@@ -36,6 +37,7 @@ from ..models.lineage import (
 from ..models.objects import BwObjectRef, normalise_object_type
 from ..models.provenance import Provenance, UnsupportedResult
 from ..models.providers import Provider
+from ..models.transformations import DeclaredLookup, LookupKind
 from ..repositories.base import Repository
 from ..repositories.providers import ProvidersRepository
 from ..repositories.transformations import TransformationsRepository
@@ -47,6 +49,18 @@ from .table_resolver import (
     query_from_calc_view,
     split_datasource_endpoint,
 )
+
+
+def _prefix_term(name: str) -> LikeTerm:
+    """A ``LIKE`` term matching values that *start with* ``name`` (D72).
+
+    Deliberately not :func:`core.dialect.like_term`, which wraps the pattern in ``%`` on both sides:
+    a substring search for a short DataSource name would pull back every endpoint containing it,
+    and the cap would then decide which one was found. Underscores are escaped for the usual
+    reason - almost every BW technical name has one, and ``_`` is a single-character wildcard.
+    """
+    escaped = name.strip().replace(LIKE_ESCAPE, LIKE_ESCAPE * 2).replace("_", f"{LIKE_ESCAPE}_")
+    return LikeTerm(f"{escaped}%", escaped=escaped != name.strip())
 
 
 # RSTLOGO type code -> lineage node type. Decoded through the canonical table in models.objects
@@ -122,6 +136,10 @@ _COMPLETENESS_PRECEDENCE: tuple[LineageCompleteness, ...] = (
 
 _MAX_NODES = 400
 _MAX_DEPTH = 12
+#: Endpoint candidates read when resolving a bare DataSource name to its stored form (D72). A
+#: DataSource extracted into more than one logical system has one row per system, and a handful is
+#: enough to find the match without letting a short name pull back a large slice.
+_MAX_ENDPOINT_CANDIDATES = 20
 _ROUTINE_TRANS_CAP = 25  # transformations-per-node whose routines we parse for lookups
 _REVERSE_CODEID_CAP = 150  # RSAABAP code-ids scanned in the reverse (impact) routine search
 
@@ -150,6 +168,35 @@ _DTP_COLUMNS: dict[bool, tuple[str, str, str]] = {
     True: ("SRC", "TGT", "TGTTLOGO"),
     False: ("TGT", "SRC", "SRCTLOGO"),
 }
+
+
+# Declared-lookup decoding. Kept beside the other per-direction tables so the three facts a lookup
+# edge needs - what the looked-up object is, how to say so in the note, and which table proves it -
+# stay in one place rather than being spelled out at each construction site.
+_LOOKUP_KIND_TO_NODE: dict[LookupKind, LineageNodeType] = {
+    "master_data": "infoobject",
+    "dso": "dso",
+    "adso": "adso",
+}
+_LOOKUP_KIND_LABEL: dict[str, str] = {
+    "master_data": "master-data read",
+    "dso": "DataStore lookup",
+    "adso": "DataStore lookup",
+}
+_LOOKUP_PROVENANCE: dict[str, tuple[str, str]] = {
+    "master_data": ("transformation_step_master", "IOBJNM"),
+    "dso": ("transformation_step_dso", "ODSOBJECT"),
+    "adso": ("transformation_step_adso", "ADSONM"),
+}
+
+
+def _is_dtp_endpoint(type_code: str | None) -> bool:
+    """Whether a transformation endpoint's TLOGO says the *name* is a DTP rather than an object.
+
+    BW stores a self-transformation's source this way. The endpoint then has to be dereferenced
+    through ``RSBKDTP`` before it means anything as a data source (D18).
+    """
+    return (type_code or "").strip().upper() == "DTPA"
 
 
 def _prefetch_directions(direction: LineageDirection) -> tuple[bool, ...]:
@@ -344,6 +391,9 @@ class LineageService(Repository):
         #: Reasons discovery was bounded during the walk in progress. Reset per BFS.
         self._walk_incomplete: set[LineageCompleteness] = set()
         self._node_type_memo: dict[str, LineageNodeType] = {}
+        #: Bare DataSource name -> the padded endpoint BW stores it under, ``""`` for "no endpoint
+        #: exists" so a miss is remembered rather than re-read on every call (D72).
+        self._endpoint_memo: dict[str, str] = {}
         self._consumers_memo: dict[str, list[tuple[str, LineageNodeType, str]]] = {}
         self._trace_memo: dict[tuple[str, int], TraceToSource] = {}
         # Declared-edge rows prefetched a BFS level at a time, keyed by (name, downstream) and
@@ -351,7 +401,12 @@ class LineageService(Repository):
         # list means "read, no rows"; an absent key means "not read", and the reader then issues
         # its own single-node query. That distinction is what makes the prefetch optional.
         self._pf_tran: dict[tuple[str, bool], list[tuple[str, str, str]]] = {}
-        self._pf_dtp: dict[tuple[str, bool], list[tuple[str, str, str]]] = {}
+        self._pf_dtp: dict[tuple[str, bool], list[tuple[str, str, str, str]]] = {}
+        #: ``(DTP id, downstream) -> (object at the DTP's far end, its TLOGO)``. BW writes a DTP's
+        #: name where an object belongs - a self-transformation's stored source, and an error DTP's
+        #: endpoint - so resolving one costs a read; memoised because a walk meets the same DTP from
+        #: several nodes. Keyed by direction because which end is "the object" depends on it.
+        self._dtp_source_memo: dict[tuple[str, bool], tuple[str, str] | None] = {}
         #: name -> (provider, compuid) or None. ``None`` is a cached answer, not a miss, so the
         #: `in` test rather than `.get` is what makes "this is not a query" cost one lookup.
         self._query_provider_memo: dict[str, tuple[str, str] | None] = {}
@@ -378,8 +433,10 @@ class LineageService(Repository):
         if unsupported is not None:
             return unsupported
         depth = max(1, min(depth, _MAX_DEPTH))
-        nodes, edges, completeness = self._bfs(name, direction, depth, include_routine=True)
-        return self._graph(name, direction, depth, nodes, edges, completeness=completeness)
+        # A bare DataSource name is not the key BW stores it under; see _resolve_subject (D72).
+        subject = self._resolve_subject(name)
+        nodes, edges, completeness = self._bfs(subject, direction, depth, include_routine=True)
+        return self._graph(subject, direction, depth, nodes, edges, completeness=completeness)
 
     def trace_to_source(self, name: str, *, depth: int = 8) -> TraceToSource | UnsupportedResult:
         """Walk upstream to the DataSource boundary. Memoised, like :meth:`_expand`.
@@ -392,11 +449,12 @@ class LineageService(Repository):
         if unsupported is not None:
             return unsupported
         depth = max(1, min(depth, _MAX_DEPTH))
-        cached = self._trace_memo.get((name, depth))
+        subject = self._resolve_subject(name)  # D72
+        cached = self._trace_memo.get((subject, depth))
         if cached is not None:
             return cached
-        traced = self._trace_uncached(name, depth)
-        self._trace_memo[(name, depth)] = traced
+        traced = self._trace_uncached(subject, depth)
+        self._trace_memo[(subject, depth)] = traced
         return traced
 
     def _trace_uncached(self, name: str, depth: int) -> TraceToSource:
@@ -438,6 +496,10 @@ class LineageService(Repository):
         if unsupported is not None:
             return unsupported
         depth = max(1, min(depth, _MAX_DEPTH))
+        # Resolved once and then used as *the* key everywhere below. The root's node carries the
+        # bare name since D19, so anything identifying the root by comparing names would count the
+        # root among its own consumers the moment the two differed (D72).
+        name = self._resolve_subject(name)
         nodes, edges, completeness = self._bfs(name, "downstream", depth, include_routine=False)
 
         # Reverse routine detection: objects whose routines READ the root (invisible to where-used).
@@ -466,11 +528,14 @@ class LineageService(Repository):
             )
 
         graph = self._graph(name, "downstream", depth, nodes, edges, completeness=completeness)
-        affected = [n for n in nodes.values() if n.name != name]
+        # Excluded by key, not by display name: a DataSource root's node name is the bare DataSource
+        # while its key is the padded endpoint, so a name comparison would report the root as one of
+        # the objects a change to it affects.
+        affected = [n for n in nodes.values() if n.id != name]
         by_type: dict[str, int] = {}
         for node in affected:
             by_type[node.object_type] = by_type.get(node.object_type, 0) + 1
-        caveats = [_ROUTINE_CAVEAT]
+        caveats = [_ROUTINE_CAVEAT, *self._declared_lookup_caveats()]
         if completeness != "complete":
             caveats.append(_COMPLETENESS_CAVEATS[completeness])
         return ImpactAnalysis(
@@ -479,6 +544,13 @@ class LineageService(Repository):
             affected_object_count=len(affected),
             affected_by_type=dict(sorted(by_type.items())),
             routine_lookup_consumers=sorted({c[0] for c in consumers if c[0] != name}),
+            declared_lookup_consumers=sorted(
+                {
+                    edge.dst
+                    for edge in edges
+                    if edge.kind == "declared_lookup" and edge.src == name and edge.dst != name
+                }
+            ),
             caveats=caveats,
         )
 
@@ -631,27 +703,35 @@ class LineageService(Repository):
         key_col, other_name_col, other_type_col = _DTP_COLUMNS[downstream]
         for chunk in _chunks(names, _PREFETCH_CHUNK):
             owner_of = {name.strip().upper(): name for name in chunk}
-            buckets: dict[str, list[tuple[str, str, str]]] = {name: [] for name in chunk}
+            buckets: dict[str, list[tuple[str, str, str, str]]] = {name: [] for name in chunk}
             placeholders = ", ".join("?" for _ in chunk)
             rows = self.select(
                 self.dialect.build_select(
-                    columns=[key_col, other_name_col, other_type_col, "UPDMODE"],
+                    # Column list and order mirror the single-node read in _dtp_rows exactly; the
+                    # two must not drift, or a prefetched node and a directly read one would carry
+                    # different facts about the same pair.
+                    columns=[key_col, other_name_col, other_type_col, "UPDMODE", "DTP"],
                     from_logical="dtp",
                     # RSBK* prefix: no OBJVERS auto-inject, so it is stated here as in the
                     # single-node read.
                     where=[f"{key_col} IN ({placeholders})", "OBJVERS = 'A'"],
                     params=list(chunk),
-                    order_by=[key_col, other_name_col],
+                    order_by=[key_col, other_name_col, "DTP"],
                 )
             )
             attributed = True
-            for key_value, other_name, other_type, updmode in rows:
+            for key_value, other_name, other_type, updmode, dtp_id in rows:
                 owner = owner_of.get(str(key_value).strip().upper())
                 if owner is None:
                     attributed = False
                     break
                 buckets[owner].append(
-                    (str(other_name).strip(), str(other_type).strip(), str(updmode).strip())
+                    (
+                        str(other_name).strip(),
+                        str(other_type).strip(),
+                        str(updmode).strip(),
+                        str(dtp_id).strip(),
+                    )
                 )
             if not attributed:
                 continue  # abandon the chunk rather than cache it - see _prefetch_transformations
@@ -753,10 +833,16 @@ class LineageService(Repository):
             # the other is a naming convention. The order decides which evidence a caller sees.
             hops.extend(self._declared_query_hops(name))
             hops.extend(self._composite_consumer_hops(name))
+            hops.extend(self._declared_lookup_consumer_hops(name))
             hops.extend(self._query_provider_hops(name, downstream=True))
         if direction in ("upstream", "both"):
             hops.extend(self._declared_hops(name, downstream=False))
             hops.extend(self._composite_part_hops(name))
+            # Before the routine branch, for the reason the declared query hop precedes the
+            # calc-view one: a transformation can both declare a lookup and SELECT the same
+            # object in ABAP, the walk keeps the first of a duplicate edge, and this one is
+            # what BW states rather than what we parsed.
+            hops.extend(self._declared_lookup_hops(name))
             if include_routine:
                 hops.extend(self._routine_lookup_hops(name))
             hops.extend(self._query_provider_hops(name, downstream=False))
@@ -781,6 +867,72 @@ class LineageService(Repository):
         if " " not in name.strip():
             return False
         return self._node_type_of(name) == "datasource"
+
+    def _resolve_subject(self, name: str) -> str:
+        """The key the graph stores this object under, which is not always the name given (D72).
+
+        A DataSource is stored as ``<DATASOURCE><padding><LOGSYS>``, so a walk rooted on the bare
+        name binds it to ``SOURCENAME = ?`` and matches nothing: measured on the reference system,
+        downstream lineage from a bare DataSource name returned **1 node and 0 edges** where the
+        stored endpoint returned **44 and 49**. An empty graph reads as "this DataSource feeds
+        nothing", which is the most confident possible way to be wrong.
+
+        This became urgent with D19. Before it, the server reported the padded endpoint, so a reader
+        who copied a name out of one answer into the next request happened to copy a working one.
+        D19 is right to report the bare name - the logical system is not part of the DataSource's
+        identity - but it means every name the server now hands back for a DataSource would have
+        failed as an input. A fix that makes one field correct and another field useless is not a
+        fix, so the two ship together.
+
+        Only reached when the name resolves as nothing and carries no whitespace, so a normal
+        provider costs nothing and an endpoint already in hand is passed straight through.
+        """
+        subject = name.strip()
+        if not subject or " " in subject:
+            return name
+        if self._node_type_of(subject) != "unknown":
+            return name
+        cached = self._endpoint_memo.get(subject)
+        if cached is None:
+            cached = self._stored_endpoint(subject) or ""
+            self._endpoint_memo[subject] = cached
+        return cached or name
+
+    def _stored_endpoint(self, name: str) -> str | None:
+        """Search the columns endpoints are actually stored in for one whose head is ``name``.
+
+        Read rather than constructed. The endpoint *looks* like ``name.ljust(30) + logsys``, and
+        building it from that rule would work on the reference system and be a guess everywhere
+        else - the same mistake D35 recorded, where a constructed master-data table name was wrong
+        for every reference characteristic. A prefix search finds whatever BW actually stored.
+
+        The head must match **exactly** after splitting, so ``2LIS_13_VD`` never resolves to
+        ``2LIS_13_VDKON``: a prefix search is a candidate generator, not the answer.
+        """
+        term = _prefix_term(name)
+        for logical, column in (("transformation", "SOURCENAME"), ("dtp", "SRC")):
+            if not self.capability.is_available(logical):
+                continue
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=[f"DISTINCT {column}"],
+                        from_logical=logical,
+                        where=[term.clause(column)],
+                        params=[term.value],
+                        # Capped read, so it needs an order or the candidate set differs per call
+                        # (D8) - and with several logical systems the answer would too.
+                        order_by=[column],
+                    ),
+                    limit=_MAX_ENDPOINT_CANDIDATES,
+                )
+            )
+            for row in rows:
+                candidate = str(row[0]).strip()
+                head, logsys = split_datasource_endpoint(candidate)
+                if logsys and head == name and candidate != name:
+                    return candidate
+        return None
 
     def _node_type_of(self, name: str) -> LineageNodeType:
         """The root's own object type, so the graph's centre is never labelled 'unknown'.
@@ -1657,6 +1809,7 @@ class LineageService(Repository):
                         transformation_id=info.get("tran_id"),
                         update_modes=modes,
                         update_mode=modes[0] if modes else None,
+                        dtp_ids=sorted(cast("set[str]", info.get("dtp_ids") or set())),
                         provenance=info["provenance"],
                     ),
                 )
@@ -1666,14 +1819,99 @@ class LineageService(Repository):
     def _collect_transformation_hops(
         self, name: str, *, downstream: bool, merged: dict[str, dict[str, Any]]
     ) -> None:
-        for other, type_code, tran_id in self._transformation_rows(name, downstream=downstream):
-            if not other:
+        rows = self._transformation_rows(name, downstream=downstream)
+        # Resolve DTP-typed endpoints in one batch before merging: BW stores a self-transformation's
+        # source as the DTP's technical name, and a DTP is not a data source. Left as read, the
+        # graph gains a node named after a load rather than the object the data came from (D18).
+        resolved_sources = self._resolve_dtp_endpoints(
+            [name_ for name_, type_, _tran in rows if _is_dtp_endpoint(type_) and name_],
+            # The endpoint being resolved sits on the far side from ``name``, so the DTP's matching
+            # end is the same far side: its SRC when walking upstream, its TGT when walking down.
+            downstream=downstream,
+        )
+        for raw_name, raw_type, tran_id in rows:
+            if not raw_name:
                 continue
-            merged[other] = {
-                "type_code": type_code,
-                "tran_id": tran_id or None,
-                "provenance": self.provenance("transformation", {"TRANID": tran_id}),
-            }
+            tran_provenance = self.provenance("transformation", {"TRANID": tran_id})
+            neighbour, type_code = raw_name, raw_type
+            provenance: Provenance | list[Provenance] = tran_provenance
+            via_dtp: str | None = None
+            if _is_dtp_endpoint(raw_type):
+                resolved = resolved_sources.get(raw_name)
+                if resolved is None:
+                    # The DTP could not be read, so the endpoint stays as BW stored it rather than
+                    # being dropped. Naming a DTP is wrong but visible; losing the edge would hide a
+                    # real load path, and on a full-update object this is usually the
+                    # self-transformation - the one that matters most.
+                    self._walk_incomplete.add("error_degraded")
+                else:
+                    via_dtp = raw_name
+                    neighbour, type_code = resolved
+                    provenance = [tran_provenance, self.provenance("dtp", {"DTP": raw_name})]
+            entry = merged.setdefault(neighbour, {})
+            entry.update(
+                {
+                    "type_code": type_code,
+                    "tran_id": tran_id or None,
+                    "provenance": provenance,
+                }
+            )
+            if via_dtp:
+                cast("set[str]", entry.setdefault("dtp_ids", set())).add(via_dtp)
+
+    def _resolve_dtp_endpoints(
+        self, dtp_ids: list[str], *, downstream: bool = False
+    ) -> dict[str, tuple[str, str]]:
+        """``DTP id -> (the object at its far end, that object's TLOGO)``, batched and memoised.
+
+        BW writes a DTP's technical name where an object belongs in two places: a
+        self-transformation's stored source, and an error DTP's endpoint (which is the parent DTP's
+        error stack). Both need the same dereference before the name means anything as data flow.
+
+        Which end is "the object" follows the direction being walked. Looking *upstream* the DTP's
+        own ``SRC`` is what feeds it; looking downstream its ``TGT`` is what it feeds. Reading one
+        end for both would invert the edge, so the direction is a parameter rather than a default.
+        """
+        wanted = sorted({d.strip() for d in dtp_ids if d and d.strip()})
+        if not wanted or not self.capability.is_available("dtp"):
+            return {}
+        out: dict[str, tuple[str, str]] = {}
+        missing: list[str] = []
+        for dtp_id in wanted:
+            key = (dtp_id, downstream)
+            if key in self._dtp_source_memo:
+                cached = self._dtp_source_memo[key]
+                if cached is not None:
+                    out[dtp_id] = cached
+            else:
+                missing.append(dtp_id)
+        for chunk in _chunks(missing, _PREFETCH_CHUNK):
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["DTP", "SRC", "SRCTLOGO", "TGT", "TGTTLOGO"],
+                    from_logical="dtp",
+                    where=[f"DTP IN ({placeholders})", "OBJVERS = 'A'"],
+                    params=list(chunk),
+                    order_by=["DTP"],
+                )
+            )
+            for dtp_id, src, src_tlogo, tgt, tgt_tlogo in rows:
+                key_name = str(dtp_id).strip()
+                far_name, far_type = (
+                    (str(tgt or ""), str(tgt_tlogo or ""))
+                    if downstream
+                    else (str(src or ""), str(src_tlogo or ""))
+                )
+                far_name = far_name.strip()
+                if not key_name or not far_name:
+                    continue
+                resolved = (far_name, far_type.strip())
+                self._dtp_source_memo[(key_name, downstream)] = resolved
+                out[key_name] = resolved
+            for dtp_id in chunk:
+                self._dtp_source_memo.setdefault((dtp_id, downstream), None)
+        return out
 
     def _transformation_rows(self, name: str, *, downstream: bool) -> list[tuple[str, str, str]]:
         """``(other_name, other_type_code, tran_id)`` for one endpoint, prefetched or read now.
@@ -1707,9 +1945,27 @@ class LineageService(Repository):
     ) -> None:
         if not self.capability.is_available("dtp"):
             return
-        for other, type_code, updmode in self._dtp_rows(name, downstream=downstream):
-            if not other:
+        rows = self._dtp_rows(name, downstream=downstream)
+        # An error DTP's own endpoint is the *parent* DTP's error stack, so RSBKDTP hands back a DTP
+        # name where an object belongs - the same wrong class of thing as the transformation case
+        # above, reached by a different path. Dereferencing the parent gives the object the data
+        # actually came from, which for an error DTP is the provider itself (D18).
+        resolved_endpoints = self._resolve_dtp_endpoints(
+            [other for other, type_, _um, _d in rows if _is_dtp_endpoint(type_) and other],
+            downstream=downstream,
+        )
+        for raw_other, raw_type, updmode, dtp_id in rows:
+            if not raw_other:
                 continue
+            other, type_code = raw_other, raw_type
+            via_parent: str | None = None
+            if _is_dtp_endpoint(raw_type):
+                resolved = resolved_endpoints.get(raw_other)
+                if resolved is None:
+                    self._walk_incomplete.add("error_degraded")
+                else:
+                    via_parent = raw_other
+                    other, type_code = resolved
             update_mode = _UPDMODE_MAP.get(updmode)
             existing = merged.get(other)
             if existing is None:
@@ -1719,6 +1975,13 @@ class LineageService(Repository):
                     "dtp_only": True,
                     "provenance": self.provenance("dtp", prov_key),
                 }
+            if via_parent:
+                # Keep the intermediate DTP nameable: it is the object an operator re-runs.
+                cast("set[str]", existing.setdefault("dtp_ids", set())).add(via_parent)
+            # Accumulated for the same reason as the modes: the pair is one edge, so this is the
+            # only place an individual load can still be named (D18).
+            if dtp_id:
+                cast("set[str]", existing.setdefault("dtp_ids", set())).add(dtp_id)
             # Accumulated, not assigned. Several active DTPs routinely connect one pair with
             # different modes - a repair/init full alongside the regular delta - so the last row
             # read is not "the" update mode. Overwriting here meant the answer depended on row
@@ -1727,12 +1990,15 @@ class LineageService(Repository):
                 modes = cast("set[UpdateMode]", existing.setdefault("update_modes", set()))
                 modes.add(update_mode)
 
-    def _dtp_rows(self, name: str, *, downstream: bool) -> list[tuple[str, str, str]]:
-        """``(other_name, other_type_code, updmode)`` for one endpoint, prefetched or read now.
+    def _dtp_rows(self, name: str, *, downstream: bool) -> list[tuple[str, str, str, str]]:
+        """``(other_name, other_type_code, updmode, dtp_id)`` for one endpoint.
 
-        Ordered by the neighbour's name in both paths, for the same reason as
-        :meth:`_transformation_rows`: several DTPs can connect one pair of objects and the caller
-        keeps the last update mode it sees, so an unstated order let the database decide.
+        Ordered by the neighbour's name then the DTP id in both paths, for the same reason as
+        :meth:`_transformation_rows`: several DTPs can connect one pair of objects, and an unstated
+        order let the database decide which facts survived the merge.
+
+        The DTP's own name is selected because the merge below collapses a pair to one edge, so
+        without it the individual loads are unnameable (D18).
         """
         cached = self._pf_dtp.get((name, downstream))
         if cached is not None:
@@ -1740,19 +2006,133 @@ class LineageService(Repository):
         key_col, other_name_col, other_type_col = _DTP_COLUMNS[downstream]
         rows = self.select(
             self.dialect.build_select(
-                columns=[other_name_col, other_type_col, "UPDMODE"],
+                columns=[other_name_col, other_type_col, "UPDMODE", "DTP"],
                 from_logical="dtp",
                 where=[f"{key_col} = ?", "OBJVERS = 'A'"],  # RSBK* prefix: no OBJVERS auto-inject
                 params=[name],
-                order_by=[other_name_col],
+                order_by=[other_name_col, "DTP"],
             )
         )
         return [
-            (str(other_name).strip(), str(other_type).strip(), str(updmode).strip())
-            for other_name, other_type, updmode in rows
+            (
+                str(other_name).strip(),
+                str(other_type).strip(),
+                str(updmode).strip(),
+                str(dtp_id).strip(),
+            )
+            for other_name, other_type, updmode, dtp_id in rows
         ]
 
     # --- routine-derived edges -----------------------------------------------------------
+
+    # --- declared lookup edges (D15) ------------------------------------------------------
+
+    def _declared_lookup_hops(self, name: str) -> list[_Hop]:
+        """Upstream: objects a transformation *targeting* ``name`` declares that it reads.
+
+        The exact counterpart of :meth:`_routine_lookup_hops`. Both answer "what else does the
+        inbound transformation read", but BW records these itself, so they are ``exact`` where the
+        routine parser's are ``advisory``. Before D15 only the parser ran, which meant a declared
+        lookup with no ``SELECT`` to parse produced no edge at all.
+        """
+        tran_ids = self._transformations_targeting(name)
+        if not tran_ids:
+            return []
+        by_tran = self._transformations.lookups_declared_by(tran_ids)
+        hops: list[_Hop] = []
+        seen: set[str] = set()
+        for tran_id in tran_ids:  # ordered by TRANID, so the edge set is reproducible
+            for lookup in by_tran.get(tran_id, ()):
+                obj = lookup.object_name
+                if not obj or obj == name or obj in seen:
+                    continue
+                seen.add(obj)
+                hops.append(
+                    _Hop(
+                        obj,
+                        _LOOKUP_KIND_TO_NODE.get(lookup.kind, "unknown"),
+                        self._declared_lookup_edge(src=obj, dst=name, tran_id=tran_id, of=lookup),
+                    )
+                )
+        return hops
+
+    def _declared_lookup_consumer_hops(self, name: str) -> list[_Hop]:
+        """Downstream: transformations that declare a read of ``name``, as its consumers.
+
+        This is the direction BW's own where-used list reports and the one D15 was found in: a
+        transformation whose *source* is something else entirely still depends on ``name``, because
+        one of its rules looks ``name`` up. Its target is therefore affected by a change here.
+        """
+        declaring = self._transformations.transformations_looking_up(name)
+        if not declaring:
+            return []
+        kind_of = dict(declaring)
+        targets = self._targets_for_tranids({tran_id for tran_id, _kind in declaring})
+        hops: list[_Hop] = []
+        seen: set[tuple[str, str]] = set()
+        for target, node_type, tran_id in targets:
+            if not target or target == name or (target, tran_id) in seen:
+                continue
+            seen.add((target, tran_id))
+            hops.append(
+                _Hop(
+                    target,
+                    node_type,
+                    self._declared_lookup_edge(
+                        src=name, dst=target, tran_id=tran_id, kind=kind_of.get(tran_id)
+                    ),
+                )
+            )
+        return hops
+
+    def _declared_lookup_edge(
+        self,
+        *,
+        src: str,
+        dst: str,
+        tran_id: str,
+        of: DeclaredLookup | None = None,
+        kind: LookupKind | None = None,
+    ) -> LineageEdge:
+        lookup_kind = of.kind if of is not None else kind
+        readable = _LOOKUP_KIND_LABEL.get(lookup_kind or "", "declared")
+        logical, column = _LOOKUP_PROVENANCE.get(
+            lookup_kind or "", ("transformation", "TRANID")
+        )
+        key = {"TRANID": tran_id}
+        if of is not None:
+            key[column] = of.object_name
+        return LineageEdge(
+            src=src,
+            dst=dst,
+            kind="declared_lookup",
+            derivation="declared",
+            confidence="exact",
+            transformation_id=tran_id,
+            note=(
+                f"transformation {tran_id} declares a {readable} of this object in its rule "
+                "metadata; BW records the read itself, so this is exact rather than parsed "
+                "out of ABAP"
+            ),
+            # Passed rather than left to the model's validator: the validator keys evidence off
+            # `confidence`, and 'exact' maps to the generic declared_metadata sentence about source
+            # and target endpoints. This edge is a *read*, not a data-flow hop - the reading
+            # transformation's target does not receive these rows, it consults them - so it needs
+            # its own method string or the account of how it was found would be wrong (D10's shape).
+            evidence=evidence_for("lineage_edge", "declared_lookup"),
+            provenance=self.provenance(logical, key),
+        )
+
+    def _declared_lookup_caveats(self) -> list[str]:
+        """Say when declared lookups could not be asked about, so empty is not read as none."""
+        missing = self._transformations.missing_lookup_tables()
+        if not missing:
+            return []
+        return [
+            "declared lookup edges are unavailable on this release: "
+            f"{', '.join(missing)} not present, so a transformation that reads an object through a "
+            "rule rather than a routine is not represented here"
+        ]
 
     def _routine_lookup_hops(self, name: str) -> list[_Hop]:
         """Upstream lookups: tables a transformation *targeting* ``name`` reads in its routines."""
@@ -1908,13 +2288,36 @@ class LineageService(Repository):
         node_type: LineageNodeType,
         provenance: Provenance | list[Provenance],
     ) -> None:
+        """Create or upgrade one node. ``name`` is the raw endpoint and stays the graph key.
+
+        **A DataSource endpoint is two facts in one column** (D19). BW stores it as the DataSource
+        name padded out and suffixed with its logical system, so ``RSTRAN.SOURCENAME`` reads
+        ``1_CO_PA_001<spaces>SRCCLNT100``. Reported verbatim, the object's *name* carried an
+        environment-specific system that BDLS rewrites per landscape - so the same DataSource had a
+        different name in every system, and nothing keyed by DataSource name would match it.
+
+        Split here rather than at the edge of the payload, because every consumer of the graph gets
+        it once: ``name`` and the derived ``ref`` carry the DataSource, and the logical system
+        becomes a *fact* on ``source_system``, where the model already has a slot for it. ``id``
+        keeps the raw endpoint, because the edges reference it and the model documents it as the
+        internal key - which is also why :meth:`ObjectGraph.from_lineage` had to stop resolving
+        endpoints through ``name``.
+        """
         existing = nodes.get(name)
         if existing is None:
+            label, logsys = (
+                split_datasource_endpoint(name) if node_type == "datasource" else (name, None)
+            )
             nodes[name] = LineageNode(
                 id=name,
                 object_type=node_type,
-                name=name,
+                name=label or name,
                 upstream_resolved=node_type != "datasource",
+                # Named, not classified: which *kind* of source system this is belongs to
+                # bw_get_source_systems, which decodes it from the registry.
+                source_system=(
+                    SourceSystemRef(system_type="unknown", system_id=logsys) if logsys else None
+                ),
                 provenance=provenance,
             )
         elif existing.object_type == "unknown" and node_type != "unknown":
@@ -1922,9 +2325,22 @@ class LineageService(Repository):
             # upgraded when a later hop or the provider catalogue resolves it. The canonical ref was
             # derived at construction, so it has to be rebuilt here or it keeps the stale type - and
             # then two tools disagree about the same object, which is the whole thing being fixed.
+            #
+            # The endpoint split has to happen on this path too. A DataSource is routinely named
+            # by a neighbour before its own type is known, so the untyped node is created with the
+            # padded name intact and only *becomes* a DataSource here - and rebuilding the ref from
+            # the raw parameter would put the logical system straight back into the name.
+            label, logsys = (
+                split_datasource_endpoint(name) if node_type == "datasource" else (name, None)
+            )
             existing.object_type = node_type
-            existing.ref = BwObjectRef(object_type=normalise_object_type(node_type), name=name)
+            existing.name = label or name
+            existing.ref = BwObjectRef(
+                object_type=normalise_object_type(node_type), name=label or name
+            )
             existing.upstream_resolved = node_type != "datasource"
+            if logsys and existing.source_system is None:
+                existing.source_system = SourceSystemRef(system_type="unknown", system_id=logsys)
 
     def _resolve_boundary(self, nodes: dict[str, LineageNode], hop: _Hop) -> None:
         """Record on the DataSource node that its source-system parent was resolved.
@@ -1932,17 +2348,22 @@ class LineageService(Repository):
         ``upstream_resolved`` is what a caller reads to decide whether the graph really ends there.
         Leaving it ``False`` on a DataSource that now *has* a parent in the same graph would put the
         node and the edge in contradiction, and the flag is the one a client is documented to trust.
+
+        The logical system is taken from ``id``, the raw endpoint, rather than from ``name``: since
+        D19 the name no longer carries it, so splitting the name here would return ``None`` and this
+        method would overwrite a system id that had already been read correctly.
         """
         boundary = nodes.get(hop.edge.dst)
         if boundary is None or boundary.object_type != "datasource":
             return
-        _datasource, logsys = split_datasource_endpoint(boundary.name)
+        _datasource, logsys = split_datasource_endpoint(boundary.id)
+        known = boundary.source_system.system_id if boundary.source_system else None
         boundary.upstream_resolved = True
         boundary.source_system = SourceSystemRef(
             # The *kind* of source system is a separate decode (bw_get_source_systems owns it); this
             # names the system and the object without claiming to have classified it.
             system_type="unknown",
-            system_id=logsys,
+            system_id=logsys or known,
             object_name=hop.name,
         )
 

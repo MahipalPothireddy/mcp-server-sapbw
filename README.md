@@ -22,7 +22,7 @@ MCP is currently the only *interactive* interface, and the one this repository i
 > **Status: functional.** The metadata extraction, lineage, diagram rendering, routine analysis,
 > BEx query, HANA, provider-health, security, risk-analyzer, and knowledge-base subsystems are
 > implemented:
-> **61 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
+> **62 tools, 7 resource templates and 6 prompts**, most of them exercised against a live BW 7.50
 > system.
 > What the server does with each metadata object it declares is published in
 > [`docs/capability-contract.md`](docs/capability-contract.md) and enforced by CI; ask
@@ -266,6 +266,7 @@ calls (connections are pooled per profile). List tools accept `limit`/`offset` a
 | `bw_system_profile` | `system` | Release, ABAP schema, object-model variants, log window, table presence/counts |
 | `bw_refresh_capabilities` | `system` | Re-run capability discovery, replacing the cached record |
 | `bw_capability_report` | `system` | Which questions resolve on *this* system: contract state × table presence, verdict per capability |
+| `bw_check_code_decodes` | `system` | Whether this system's dictionary still declares the codes the server decodes — **run this first on an unfamiliar landscape** |
 | `bw_access_report` | `system` | Which deployment mode is in force, which reads were refused, and the exact grants to fix them |
 | `bw_support_matrix` | `tool?`, `release?`, `system?` | Which tool works on which BW release — **no connection required** |
 | `bw_performance_profile` | `tool?`, `growth?` | What each tool costs and what a bigger system does to it — **no connection required** |
@@ -280,6 +281,7 @@ Three answers, in increasing specificity, and the first needs nothing from you:
 |---|---|---|
 | Which tools work on BW 7.4 / 7.5 / BW/4HANA? | `bw_support_matrix` | no |
 | Which questions resolve on *my* system? | `bw_capability_report` | yes |
+| Do this server's code decodes still match *my* dictionary? | `bw_check_code_decodes` | yes |
 | What does this server do with metadata object X? | [`docs/capability-contract.md`](docs/capability-contract.md) | no |
 | What do we grant the connecting user? | [`docs/deployment-modes.md`](docs/deployment-modes.md) | no |
 | What is this user actually allowed to read? | `bw_access_report` | yes |
@@ -293,7 +295,7 @@ Denial and absence are now recorded separately, and `bw_access_report` names the
 `bw_support_matrix` is keyed by **tool**, because that is the unit the question is asked in. Its
 `requires` field bridges to the capability contract and is **measured**, by attributing each metadata
 read to the tool that caused it while the offline suite runs — so it cannot drift the way a
-hand-written mapping across 61 tools would. It is a lower bound: everything listed really is read,
+hand-written mapping across 62 tools would. It is a lower bound: everything listed really is read,
 and a code path no test reaches contributes nothing.
 
 There is deliberately no `supported` verdict. Every value says where the claim comes from:

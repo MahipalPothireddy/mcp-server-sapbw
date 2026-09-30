@@ -33,7 +33,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .capability import ValidationStatus
-from .chains import Chain, ChainRuntimes, LoadClosure
+from .chains import Chain, ChainCadence, ChainRuntimes, LoadClosure
 from .completeness import BoundedResult
 from .evidence import Evidence, EvidenceBasis, EvidenceCompleteness, EvidenceSummary
 from .findings import Finding, severity_rank
@@ -82,13 +82,17 @@ LimitationReason = Literal[
 ]
 
 #: How an object relates to the subject. ``consumer_routine`` is the one BW's own where-used list
-#: does not have, and it is always advisory.
+#: does not have, and it is always advisory. ``consumer_lookup`` is its exact counterpart - a read
+#: BW declares in a typed rule-step table - and is never advisory; the two are separate values
+#: because a caller deciding whether to act on an edge needs to know whether BW stated it or we
+#: inferred it from ABAP text.
 Relationship = Literal[
     "upstream",
     "downstream",
     "part_provider",
     "consumer_query",
     "consumer_calcview",
+    "consumer_lookup",
     "consumer_routine",
     "loading_chain",
     "source_datasource",
@@ -311,6 +315,12 @@ class Analysis(BaseModel):
     query_lineage: QueryLineage | None = None
     query_usage: QueryUsage | None = None
     chain: Chain | None = None
+    #: How often the chain actually runs, derived from run history and never from its name (D52).
+    #: Reported here rather than on :class:`~.chains.Chain` on purpose: cadence is a *runtime* fact
+    #: and ``Chain`` is cached under the long structural TTL, so attaching it there would hold run
+    #: history well past the one-hour cap mission Section 3 puts on runtime statistics. The analysis
+    #: is not cached, so this is the honest place for it.
+    cadence: ChainCadence | None = None
     runtimes: ChainRuntimes | None = None
     load: LoadClosure | None = None
     health: ProviderHealth | None = None

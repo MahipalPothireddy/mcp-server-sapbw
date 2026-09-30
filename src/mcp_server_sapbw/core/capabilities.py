@@ -93,6 +93,13 @@ ABAP_TABLES: dict[str, str] = {
     "cube_text": "RSDCUBET",
     "cube_field": "RSDCUBEIOBJ",
     "multiprovider_part": "RSDCUBEMULTI",
+    # A MultiProvider's "InfoObject identification": which field of which part supplies each of the
+    # provider's own fields. Keyed (INFOCUBE, IOBJNM, PARTCUBE) -> PARTIOBJ. Needed because the part
+    # field is NOT always the same name: measured 66 renames in 5,372 active rows on the reference
+    # system, including navigation-attribute forms such as 0COSTCENTER -> 0ASSET__0COSTCENTER. A
+    # field with no row here is not supplied by that part at all (PARTIOBJ is never blank: 0 of
+    # 5,372), so absence is the "not supplied" signal rather than an empty value.
+    "multiprovider_identification": "RSDICMULTIIOBJ",
     # Advanced DSO (RSOADSO*) and CompositeProvider (RSOHCPR*): mission Appendix A flags these as
     # discover-tier (names vary by release). Confirmed live in B4 on 7.50 and kept here as
     # existence-tier (still runtime-confirmed via DD02L); the discover-tier families 'adso' /
@@ -107,7 +114,11 @@ ABAP_TABLES: dict[str, str] = {
     "infoobject_text": "RSDIOBJT",
     # InfoArea hierarchy and its texts. Every provider header already carries an INFOAREA code, and
     # without these it stays exactly that: BW's own business grouping, read and unresolved. RSDAREA
-    # holds the parent link (PARENT_AREA), so an area resolves to a path rather than a flat label.
+    # holds the parent link in **INFOAREA_P** (with INFOAREA_C / INFOAREA_N for first-child and
+    # next-sibling), so an area resolves to a path rather than a flat label. This comment previously
+    # named PARENT_AREA, which does not exist on 7.50 - and the reader built on it, so the tool
+    # raised on every call (D48). Verified: 471 areas, 29 roots, 0 cycles, depth 6, and INFOAREA_C
+    # points back on all 150 resolvable rows.
     "info_area": "RSDAREA",
     "info_area_text": "RSDAREAT",
     "characteristic": "RSDCHA",
@@ -150,6 +161,14 @@ ABAP_TABLES: dict[str, str] = {
     "dict_tables_text": "DD02T",
     "dict_columns": "DD03L",
     "dict_dataelement_text": "DD04T",
+    # Domain fixed values and their texts: the dictionary's own authority for every code this server
+    # decodes. They were absent from this catalogue until D44, which is the whole of that defect -
+    # about fifty code->meaning tables were read from one system's dictionary at development time,
+    # frozen into source, and never checked again - while the tables that would have checked them
+    # were not even declared. Declaring them turns "decoded from the dictionary" from a claim about
+    # the development system into a statement checkable against the connected one.
+    "dict_domain_values": "DD07L",
+    "dict_domain_text": "DD07T",
     # Analysis authorisations (BW row-level security). Deliberately EXISTENCE-tier by canonical name
     # AND re-checked per query, because a locked-down reporting user frequently cannot read these at
     # all: they are the authorisation model itself. An absent or unreadable table is a documented
@@ -304,6 +323,7 @@ class CapabilityResolver:
         discovered = self._discover(schema, connection)
         tables.update(discovered.table_status)
         self._populate_row_counts(schema, tables, connection)
+        self._populate_columns(schema, tables, connection)
         object_models, undetermined_models = self._detect_object_models(tables, discovered)
         hana_repo = self._detect_hana_repo_style(tables)
         retention = self._measure_retention(schema, tables, connection)
@@ -549,6 +569,54 @@ class CapabilityResolver:
         # Cap at one year: analyze at most the last 365 days of process-chain log, regardless of
         # how far back it actually goes (owner decision); reports the actual span when under a year.
         return min(_days_since(str(rows[0][0])), MAX_RUNTIME_WINDOW_DAYS)
+
+    def _populate_columns(
+        self, schema: str, tables: dict[str, TableStatus], connection: SupportsSelect
+    ) -> None:
+        """Set ``columns`` for present ABAP-schema tables from one bulk ``DD03L`` read (D45).
+
+        Table existence has been validated since the first build; column existence never was, so a
+        column absent on the connected release reached the driver and came back as ``invalid column
+        name`` at a character offset - indistinguishable, to a reader, from a bug in this server.
+        Measured on the reference system this read is 1,253 rows across 59 tables in 0.27s, so it
+        belongs in discovery rather than being deferred to first use.
+
+        Failure leaves every set empty, which :meth:`TableStatus.has_column` treats as *unmeasured*
+        and therefore permissive. Refusing reads because the dictionary could not be examined would
+        convert one missing grant into a server that answers nothing - the same reasoning as the
+        existence probe, which also declines to be fatal.
+
+        ``.INCLUDE`` rows are structure includes rather than columns and are excluded; the columns
+        they contribute appear in their own right.
+        """
+        names = sorted(
+            {
+                ts.resolved_name
+                for ts in tables.values()
+                if ts.present and ts.resolved_name and ts.schema_name == schema
+            }
+        )
+        if not names:
+            return
+        placeholders = ", ".join("?" for _ in names)
+        query = (
+            f"SELECT TABNAME, FIELDNAME FROM {quote_ident(schema)}.{quote_ident('DD03L')} "
+            f"WHERE AS4LOCAL = 'A' AND FIELDNAME NOT LIKE '.%' AND TABNAME IN ({placeholders})"
+        )
+        rows, _outcome = _attempt(connection, query, names)
+        if rows is None:
+            return
+        by_table: dict[str, set[str]] = {}
+        for table, field in rows:
+            column = str(field).strip().upper()
+            if column:
+                by_table.setdefault(str(table).strip().upper(), set()).add(column)
+        for status in tables.values():
+            if status.resolved_name is None:
+                continue
+            found = by_table.get(status.resolved_name.upper())
+            if found:
+                status.columns = frozenset(found)
 
     def _populate_row_counts(
         self, schema: str, tables: dict[str, TableStatus], connection: SupportsSelect

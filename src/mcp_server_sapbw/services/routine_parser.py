@@ -87,6 +87,60 @@ def _strip_comments(lines: list[str]) -> list[tuple[int, str]]:
     return cleaned
 
 
+_FORM_START_RE = re.compile(r"^\s*form\s+([a-z0-9_]+)", re.IGNORECASE)
+_ENDFORM_RE = re.compile(r"^\s*endform\b", re.IGNORECASE)
+_IN_PROGRAM_RE = re.compile(r"\bin\s+program\b", re.IGNORECASE)
+
+
+def form_bodies(lines: list[str]) -> dict[str, list[str]]:
+    """``{form_name_lower: body_lines}`` for every ``FORM … ENDFORM`` defined in ``lines``.
+
+    Needed because BW splits a *migrated update rule* in two: the field routine's own source block
+    is a short wrapper that performs a subroutine, and the subroutine itself is a ``FORM`` in the
+    transformation's global block. Analysing the wrapper alone describes none of the logic (D39).
+
+    The body excludes the ``FORM``/``ENDFORM`` lines themselves, since those are the signature
+    rather than the work. A ``FORM`` with no matching ``ENDFORM`` is skipped rather than run to the
+    end of the block: guessing an end would attribute unrelated statements to it.
+    """
+    bodies: dict[str, list[str]] = {}
+    current: str | None = None
+    collected: list[str] = []
+    for raw in lines:
+        if current is None:
+            match = _FORM_START_RE.match(raw)
+            if match:
+                current = match.group(1).lower()
+                collected = []
+            continue
+        if _ENDFORM_RE.match(raw):
+            bodies.setdefault(current, collected)
+            current = None
+            continue
+        collected.append(raw)
+    return bodies
+
+
+def performed_forms(lines: list[str]) -> list[str]:
+    """Lower-cased names of local subroutines ``lines`` performs, in order of first appearance.
+
+    ``PERFORM x IN PROGRAM (y)`` is deliberately excluded. That form resolves the program at runtime
+    and is the pattern the mission's Known Limitation 3 is about; treating it as a local subroutine
+    would claim a resolution that was never made. Statement-level rather than line-level, because
+    the ``IN PROGRAM`` clause is routinely on a later line than the ``PERFORM``.
+    """
+    found: list[str] = []
+    joined = " ".join(text for _, text in _strip_comments(lines))
+    for statement in joined.split("."):
+        if _IN_PROGRAM_RE.search(statement):
+            continue
+        for match in _PERFORM_RE.finditer(statement):
+            name = match.group(1).lower()
+            if name not in found:
+                found.append(name)
+    return found
+
+
 def _resolve_bw_table(
     table: str, catalog: Mapping[str, Iterable[str]] | None = None
 ) -> tuple[str | None, str | None, str | None]:
@@ -121,12 +175,23 @@ class RoutineParser:
         lines: list[str],
         provenance: Provenance,
         catalog: Mapping[str, Iterable[str]] | None = None,
+        extra_caveats: list[str] | None = None,
+        followed_forms: Iterable[str] | None = None,
     ) -> RoutineAnalysis:
         """Analyse one routine.
 
         ``catalog`` maps an object kind to the known object names of that kind. Supplying it lets a
         table reading be *confirmed* against real objects instead of resting on the naming
         convention; without it every resolution is reported as ``advisory``.
+
+        ``extra_caveats`` lets the caller record something about the *source it supplied* that the
+        parser cannot know - specifically that a performed subroutine's body was appended, and from
+        where, so a line number in the result can still be located (D39).
+
+        ``followed_forms`` names subroutines whose bodies the caller appended. Those stop counting
+        as unresolved calls, because they *were* followed: leaving them in would make the evidence
+        line say three calls went unfollowed when only two did, which overstates the shortfall as
+        surely as omitting a caveat would understate it.
         """
         cleaned = _strip_comments(lines)
         code_lines = [text for _, text in cleaned]
@@ -135,6 +200,15 @@ class RoutineParser:
         table_deps = self._table_dependencies(joined, catalog)
         anti, complexity = self._scan_lines(cleaned)
         unresolved = self._unresolved_calls(cleaned)
+        if followed_forms:
+            followed = {name.strip().lower() for name in followed_forms}
+            unresolved = [
+                ref
+                for ref in unresolved
+                if not (
+                    ref.call_kind == "form" and ref.object_name.strip().lower() in followed
+                )
+            ]
         complexity.line_count = len(lines)
         complexity.call_count = len(unresolved)
 
@@ -142,6 +216,7 @@ class RoutineParser:
             "static heuristic parse; dynamic SQL, function-module and class-method calls are not "
             "followed, so table dependencies are a lower bound",
             "/BIC/ and /BI0/ table-to-object resolution is advisory (naming-convention based)",
+            *(extra_caveats or []),
         ]
         return RoutineAnalysis(
             code_id=code_id,

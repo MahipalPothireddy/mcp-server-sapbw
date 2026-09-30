@@ -40,12 +40,15 @@ Every failure is therefore re-raised as :class:`AdtError` naming only the profil
 
 from __future__ import annotations
 
+import re
 import ssl
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from html import unescape
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from ..core.profiles import EccProfile
-from ..models.ecc import ExitDataKind, ExitUnavailableReason
+from ..models.ecc import AdtProvenance, ExitDataKind, ExitUnavailableReason, TableOwner
 from .base import ConnectorStatus
 
 # HTTP status codes ADT uses that this connector interprets rather than merely reports.
@@ -75,6 +78,70 @@ EXIT_SLOTS: tuple[ExitSlot, ...] = (
 )
 
 
+#: Results requested per ownership search. Small on purpose: the search returns the table plus its
+#: related objects, and a handful is enough to rank among. A large page costs bytes for nothing.
+_OWNER_SEARCH_RESULTS = 10
+
+#: ADT object types that *are* the table, ranked most-authoritative first, then everything else.
+#:
+#: **This ranking is the correctness of the whole ownership read.** A search for ``VBRP`` returns
+#: its
+#: maintenance object (``SOBJ/MO``, package ``VFW``) *before* the table itself (``TABL/DT``, package
+#: ``VF``). First-match therefore reports the wrong package - and a wrong owner inside a finding
+#: about
+#: ownership is worse than no finding, because it reads as precise.
+_OBJECT_TYPE_RANK: dict[str, int] = {
+    "TABL/DT": 0,  # transparent table - the thing being read
+    "TABL/DS": 1,  # structure
+    "VIEW/DV": 2,  # view
+    "DTEL/DE": 8,  # data element that merely shares the name
+    "SOBJ/MO": 9,  # maintenance object
+}
+_UNRANKED_TYPE = 5
+
+_OBJECT_REFERENCE = re.compile(
+    r"<adtcore:objectReference\b([^>]*)>?",
+    re.IGNORECASE,
+)
+_NAME_ATTR = re.compile(r'adtcore:name="([^"]*)"')
+_TYPE_ATTR = re.compile(r'adtcore:type="([^"]*)"')
+_PACKAGE_ATTR = re.compile(r'adtcore:packageName="([^"]*)"')
+_DESCRIPTION_ATTR = re.compile(r'adtcore:description="([^"]*)"')
+
+
+def _best_object_reference(xml: str, name: str) -> tuple[str, str, str] | None:
+    """Pick the reference that *is* the named object, returning ``(type, package, description)``.
+
+    Exact name match first, then :data:`_OBJECT_TYPE_RANK`. Returns ``None`` when the search found
+    nothing with this exact name, so the caller reports the object as unknown rather than
+    attributing
+    it to whatever came back.
+    """
+    def attr(pattern: re.Pattern[str], attrs: str) -> str:
+        match = pattern.search(attrs)
+        return match.group(1) if match else ""
+
+    candidates: list[tuple[int, str, str, str]] = []
+    for reference in _OBJECT_REFERENCE.finditer(xml):
+        attrs = reference.group(1)
+        if attr(_NAME_ATTR, attrs).upper() != name.upper():
+            continue
+        object_type = attr(_TYPE_ATTR, attrs)
+        candidates.append(
+            (
+                _OBJECT_TYPE_RANK.get(object_type, _UNRANKED_TYPE),
+                object_type,
+                attr(_PACKAGE_ATTR, attrs),
+                attr(_DESCRIPTION_ATTR, attrs),
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: candidate[0])
+    _rank, object_type, package, description = candidates[0]
+    return object_type, package, description
+
+
 class AdtError(Exception):
     """An ADT fetch failed. The message names the profile and path only - never host or secrets."""
 
@@ -91,9 +158,20 @@ class AdtResponse:
 
 @runtime_checkable
 class AdtFetcher(Protocol):
-    """Minimal read-only ADT transport. ``GET`` is the only operation it can express."""
+    """Minimal read-only ADT transport. ``GET`` is the only operation it can express.
 
-    def get_text(self, path: str, params: Mapping[str, str]) -> AdtResponse: ...
+    ``accept`` is negotiable because ADT serves *source* as ``text/plain`` and *metadata* as
+    ``application/vnd.sap.adt.*+xml``, and a single hardcoded header cannot ask for both. That was
+    not
+    a theoretical limitation: with ``text/plain`` fixed, every object-metadata endpoint answered 404
+    or
+    406, reading exactly like "this ADT exposes no object metadata" and wrong. Defaulted,
+    so every existing source read is unchanged.
+    """
+
+    def get_text(
+        self, path: str, params: Mapping[str, str], accept: str = "text/plain"
+    ) -> AdtResponse: ...
 
 
 def _legacy_cipher_context(validate_certificate: bool) -> ssl.SSLContext:
@@ -155,18 +233,25 @@ class HttpxAdtFetcher:
             verify=verify,
             follow_redirects=False,
             headers={
-                "Accept": "text/plain",
                 # Stateless: ADT takes no enqueue lock on objects read this way.
                 "X-sap-adt-sessiontype": "stateless",
             },
         )
         return self._client
 
-    def get_text(self, path: str, params: Mapping[str, str]) -> AdtResponse:
-        """Issue the one and only request this connector can make: a GET."""
+    def get_text(
+        self, path: str, params: Mapping[str, str], accept: str = "text/plain"
+    ) -> AdtResponse:
+        """Issue the one and only request this connector can make: a GET.
+
+        ``Accept`` moved from the client to the call. ADT renders source as ``text/plain`` and
+        object
+        metadata as its own XML content types, and a client-level ``text/plain`` made every metadata
+        endpoint answer 404 or 406 - indistinguishable from the endpoint not existing.
+        """
         client = self._ensure_client()
         try:
-            response = client.get(path, params=dict(params))
+            response = client.get(path, params=dict(params), headers={"Accept": accept})
         except Exception as exc:
             # Broad by design: httpx raises a family of transport errors and every one of them
             # embeds the full URL. The type is reported; the message is not (mission Rule 5).
@@ -275,6 +360,110 @@ class EccConnector:
     def max_satellite_fetches(self) -> int:
         """Ceiling on satellite probe requests per inventory call."""
         return self._profile.max_satellite_fetches if self._profile else 0
+
+    # --- object ownership (D67) --------------------------------------------------------------
+
+    def resolve_owners(self, names: Sequence[str], *, limit: int = 0) -> dict[str, TableOwner]:
+        """Package and description per object name, from ADT's information system.
+
+        **The read that lets scenario 9.6 flag rather than ask.** Mission §9.6 wants an enhancement
+        reading another team's data flagged; without an ownership signal the analyzer could only
+        list
+        the tables and hand the judgement back to the reader, which is defect D67 entire.
+
+        One GET per name against ``repository/informationsystem/search``, which returns package
+        name,
+        description and object type together. Measured at ~77 ms per table on the reference system,
+        49 of 49 resolved, so the cost is real but small - and bounded by ``limit`` (defaulting
+        to the profile's satellite budget) because these are requests against a production system.
+
+        **Ranked, not first-match.** The search returns several objects for one name: ``VBRP``
+        yields
+        its maintenance object ``SOBJ/MO`` in package ``VFW`` *before* the table ``TABL/DT`` in
+        ``VF``.
+        Taking the first hit therefore attributes the table to the wrong package, which is worse
+        than
+        no answer - it is a confident wrong owner in a finding about ownership.
+
+        Unresolvable names are simply absent from the result. The caller reports them as unknown
+        rather than defaulting them to any package.
+        """
+        if self._profile is None or self._fetcher is None:
+            raise AdtError("ECC connector is not configured")
+        budget = limit or self._profile.max_satellite_fetches
+        params_base = {"sap-client": self._profile.client}
+        root = self._profile.adt_root.rstrip("/")
+        path = f"{root}/repository/informationsystem/search"
+        owners: dict[str, TableOwner] = {}
+        # De-duplicated on the NORMALISED name, not the raw string. The ABAP parser yields table
+        # names lower-cased while other paths yield them upper-cased, so de-duplicating on the raw
+        # value read the same table twice - one wasted GET against a production system per table
+        # appearing in both forms. Found by a test, not by reading the code.
+        unique = list(dict.fromkeys(n.strip().upper() for n in names if n and n.strip()))
+        for query in unique[:budget]:
+            try:
+                response = self._fetcher.get_text(
+                    path,
+                    {
+                        **params_base,
+                        "operation": "quickSearch",
+                        "query": query,
+                        "maxResults": str(_OWNER_SEARCH_RESULTS),
+                    },
+                    accept="application/xml",
+                )
+            except AdtError:
+                continue
+            if response.status != _OK:
+                continue
+            picked = _best_object_reference(response.text, query)
+            if picked is None:
+                continue
+            object_type, package, description = picked
+            owners[query.upper()] = TableOwner(
+                table=query.upper(),
+                package=package or None,
+                table_description=unescape(description) if description else None,
+                object_type=object_type or None,
+                provenance=AdtProvenance(
+                    profile=self._profile.name,
+                    client=self._profile.client,
+                    adt_path=path,
+                    object_name=query.upper(),
+                    object_kind="include",
+                    fetched_at=datetime.now(UTC),
+                ),
+            )
+        return owners
+
+    def resolve_package_texts(self, packages: Sequence[str], *, limit: int = 0) -> dict[str, str]:
+        """Short text per development package, so ``VF`` reads as what it is.
+
+        A second, much smaller read: there are far fewer packages than tables (30 across 49 on the
+        reference system). ``/packages/<name>`` answers 404 here; the workbench object route does
+        answer, which is why that path is used rather than the more obvious one.
+        """
+        if self._profile is None or self._fetcher is None:
+            raise AdtError("ECC connector is not configured")
+        budget = limit or self._profile.max_satellite_fetches
+        params = {"sap-client": self._profile.client}
+        root = self._profile.adt_root.rstrip("/")
+        texts: dict[str, str] = {}
+        for package in list(dict.fromkeys(p for p in packages if p and p.strip()))[:budget]:
+            path = f"{root}/vit/wb/object_type/devck/object_name/{package.strip().lower()}"
+            try:
+                response = self._fetcher.get_text(path, params, accept="*/*")
+            except AdtError:
+                continue
+            if response.status != _OK:
+                continue
+            match = _DESCRIPTION_ATTR.search(response.text)
+            if match and match.group(1).strip():
+                # Unescaped: ADT returns XML, so a description containing quotes arrives as
+                # `Financial Accounting &quot;Basis&quot;`. Putting that in a finding would show the
+                # entity to a reader.
+                texts[package.strip().upper()] = unescape(match.group(1).strip())
+        return texts
 
     @staticmethod
     def classify_status(status: int) -> ExitUnavailableReason | None:

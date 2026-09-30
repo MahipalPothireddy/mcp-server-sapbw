@@ -1,6 +1,18 @@
 # secrets and customer metadata - never commit
+#
+# The credential-file patterns are deliberately broader than ".env". A file named "env" (no leading
+# dot) was found untracked in the working tree holding the same 125 lines of hosts and passwords as
+# .env, and nothing was ignoring it - one "git add ." would have committed it. Editors, shell
+# redirects and copy-paste all produce these variants, so they are all covered rather than the one
+# spelling anybody remembers. ".env.example" stays committed via the negation below.
 .env
+env
+env.*
+.env.*
+*.env
+!.env.example
 profiles.yaml
+profiles.local.yaml
 output/
 extracts/
 cache/

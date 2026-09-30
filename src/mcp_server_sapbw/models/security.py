@@ -40,9 +40,28 @@ from pydantic import BaseModel, ConfigDict, Field
 from .completeness import BoundedResult
 from .provenance import Provenance
 
-#: How a range's bounds are interpreted (RSECVAL SIGN / OPTION, decoded).
+#: How a range's bounds are interpreted (RSECVAL sign / option, decoded).
+#:
+#: The negating operators are here because leaving them out was a security defect, not a cosmetic
+#: gap (D53). ``RSECVAL``'s option column sits on ``RSZ_OPERATOR_DOMAIN``, which declares ten
+#: values; the five originally mapped covered only the affirmative ones, so ``NE``, ``NB``, ``GT``,
+#: ``LT`` and ``NP`` all decoded to ``"unknown"``. In a permission payload that reads as "this
+#: bound could not be interpreted" when the truth was "this bound *excludes*" - understating a
+#: restriction by reporting it as unintelligible.
 RangeSign = Literal["include", "exclude", "unknown"]
-RangeOperator = Literal["equal", "between", "greater_equal", "less_equal", "pattern", "unknown"]
+RangeOperator = Literal[
+    "equal",
+    "not_equal",
+    "between",
+    "not_between",
+    "greater_equal",
+    "greater_than",
+    "less_equal",
+    "less_than",
+    "pattern",
+    "not_pattern",
+    "unknown",
+]
 
 #: What a value literally means, where BW gives it a special reading.
 SpecialValue = Literal["all", "aggregation_only", "unassigned", "literal"]

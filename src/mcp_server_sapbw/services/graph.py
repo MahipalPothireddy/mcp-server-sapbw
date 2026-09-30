@@ -138,16 +138,23 @@ class ObjectGraph:
     def from_lineage(cls, graph: LineageGraph) -> ObjectGraph:
         """Build from a :class:`LineageGraph`, using each node's canonical ref as its key.
 
-        The lineage graph keys its own nodes by bare technical name, because its edges reference
-        that key. Here the key is type-qualified, which is what makes two graphs from different
-        tools - or different systems - comparable.
+        The lineage graph keys its own nodes by ``id``, because its edges reference that key. Here
+        the key is type-qualified, which is what makes two graphs from different tools - or from
+        different systems - comparable.
+
+        **Endpoints resolve through ``id``, not ``name``.** They used to resolve through ``name``,
+        which held only because the two were equal for every node ever built: a lineage node's id
+        *is* its bare technical name. The moment one node's display name legitimately differs from
+        its key - which is what D19 does to a DataSource, whose stored endpoint carries a logical
+        system that is not part of its identity - every edge touching it would fail this lookup and
+        be dropped silently, taking the DataSource out of every rendered diagram with no caveat.
         """
         built = cls()
-        by_name = {node.name: node for node in graph.nodes}
+        by_id = {node.id: node for node in graph.nodes}
         for node in graph.nodes:
             built.add_node(node.ref or BwObjectRef(object_type="unknown", name=node.name))
         for edge in graph.edges:
-            src_node, dst_node = by_name.get(edge.src), by_name.get(edge.dst)
+            src_node, dst_node = by_id.get(edge.src), by_id.get(edge.dst)
             if src_node is None or dst_node is None:
                 continue
             built.add_edge(

@@ -146,6 +146,15 @@ _CALL_SITE_COVERED: dict[str, tuple[str, ...]] = {
     # same conclusion from a generated table's name - the mechanisms differ and so does the trust.
     "composite_part": ("declared_model",),
     "composite_field_mapping": ("declared",),
+    # services/field_lineage.py: the MultiProvider part supplying a field, from BW's own InfoObject
+    # identification. Kept distinct from composite_field_mapping because the two read different
+    # tables for differently shaped objects, and a reader tracing a field needs to know which union
+    # it crossed (D22).
+    "multiprovider_identification": ("declared",),
+    # services/field_lineage.py: the hop from a reference characteristic to the characteristic it
+    # references. Distinct from nav_attribute - that one is about the field, this one about the
+    # object holding no data of its own (D35).
+    "reference_characteristic": ("declared",),
 }
 
 

@@ -47,6 +47,7 @@ from ..models.security import (
     SpecialValue,
 )
 from .base import Repository
+from .texts import DEFAULT_LANGUAGE, lang_rank
 
 #: The catch-all authorisation SAP ships. A holder is unrestricted.
 CATCH_ALL = "0BI_ALL"
@@ -60,41 +61,79 @@ _SPECIAL_VALUES: dict[str, SpecialValue] = {
 }
 
 # RSECVAL sign/option codes, decoded. An unrecognised code is reported 'unknown', never guessed.
+#
+# Both maps were checked against this system's dictionary rather than recalled: the sign column sits
+# on RALDB_SIGN, which declares exactly I and E, and the option column sits on RSZ_OPERATOR_DOMAIN,
+# which declares ten values. Both are registered in the domain-drift registry so a release that
+# changes either is reported instead of silently decoding to 'unknown'.
 _SIGNS: dict[str, RangeSign] = {"I": "include", "E": "exclude"}
 _OPERATORS: dict[str, RangeOperator] = {
     "EQ": "equal",
+    "NE": "not_equal",
     "BT": "between",
+    "NB": "not_between",
     "GE": "greater_equal",
+    "GT": "greater_than",
     "LE": "less_equal",
+    "LT": "less_than",
     "CP": "pattern",
+    "NP": "not_pattern",
 }
 
-# Candidate column names per logical role, most likely first. Resolved against DD03L at runtime.
+# Candidate column names per logical role, most likely first. Resolved against the connected system
+# at runtime, so a release that names a column differently is handled by adding a candidate here.
+#
+# **The TCT-prefixed names are not alternatives, they are what BW actually ships** (D53). Every role
+# below previously listed only the unprefixed name - AUTH, IOBJNM, LOW - and on BW 7.50 not one of
+# them exists: the columns are TCTAUTH, TCTIOBJNM, TCTLOW. Because require_security() fails closed
+# when the authorisation and characteristic roles cannot be resolved, the effect was not a wrong
+# answer but a *dead subsystem*: all three security tools returned "unsupported on this release"
+# against tables holding 443 active value rows across 296 authorisations. Nothing raised, because
+# returning an unsupported result is what the code is supposed to do when a column is missing. That
+# is the same failure shape as D48 - a capability check working exactly as designed on top of a
+# wrong premise - and it is why the unprefixed names are kept rather than replaced: they are
+# unverified on any system reachable from here, and dropping them would trade one guess for another.
 _VALUE_COLUMNS: dict[str, tuple[str, ...]] = {
-    "auth": ("AUTH",),
-    "characteristic": ("IOBJNM", "CHANM"),
-    "sign": ("SIGNCH", "SIGN"),
-    "operator": ("OPTIONCH", "OPTION"),
-    "low": ("LOW",),
-    "high": ("HIGH",),
+    "auth": ("TCTAUTH", "AUTH"),
+    "characteristic": ("TCTIOBJNM", "IOBJNM", "CHANM"),
+    "sign": ("TCTSIGN", "SIGNCH", "SIGN"),
+    "operator": ("TCTOPTION", "OPTIONCH", "OPTION"),
+    "low": ("TCTLOW", "LOW"),
+    "high": ("TCTHIGH", "HIGH"),
 }
+# RSECHIE. 'node_type' resolves to TCTATYPE, whose domain RSSAUTHHIERTYPE declares how far access
+# reaches below the node (0 selected nodes only, 1 subtree, 2 subtree to an absolute level, 3 whole
+# hierarchy, 4 subtree to a relative level). The raw code is passed through rather than decoded:
+# this table is empty on the only system available to verify against, so a decode here would be an
+# untested claim in a permission payload.
+#
+# validity_from / validity_to are deliberately left unresolvable on BW 7.50. The table's two date
+# columns, TCTHIEDATE and TCTHDATE, are *not* a from/to pair - TCTHIEDATE is the hierarchy key date
+# that TCTACOMPM compares against ("Name, Version Identical and Key Date Less Than or Equal to").
+# Mapping a key date onto a validity range would have produced a confident, wrong statement about
+# when a permission applies, so the roles stay unresolved and the caveat reports them missing.
 _HIERARCHY_COLUMNS: dict[str, tuple[str, ...]] = {
-    "auth": ("AUTH",),
-    "characteristic": ("IOBJNM", "CHANM"),
-    "hierarchy": ("HIENM",),
-    "node": ("NODENAME", "NIOBJNM"),
-    "node_type": ("NIOBJNM", "NODETYPE"),
-    "level": ("TLEVEL", "LEVEL"),
+    "auth": ("TCTAUTH", "AUTH"),
+    "characteristic": ("TCTIOBJNM", "IOBJNM", "CHANM"),
+    "hierarchy": ("TCTHIENM", "HIENM"),
+    "node": ("TCTNODE", "NODENAME"),
+    "node_type": ("TCTATYPE", "NODETYPE"),
+    "level": ("TCTTLEVEL", "TLEVEL", "LEVEL"),
     "validity_from": ("DATEFROM",),
     "validity_to": ("DATETO",),
 }
+# RSECUSERAUTH is the one table in this group that does use unprefixed names.
 _USER_COLUMNS: dict[str, tuple[str, ...]] = {
-    "auth": ("AUTH",),
+    "auth": ("AUTH", "TCTAUTH"),
     "user": ("UNAME", "BNAME"),
 }
+# 'language' is its own role because without it the description was picked arbitrarily (D55): this
+# system holds nine languages per authorisation, so a dict built in row order returned whichever the
+# database happened to emit last.
 _TEXT_COLUMNS: dict[str, tuple[str, ...]] = {
-    "auth": ("AUTH",),
-    "text": ("TXTLG", "TXTSH", "TEXT"),
+    "auth": ("TCTAUTH", "AUTH"),
+    "text": ("TCTTXTLG", "TCTTXTMD", "TCTTXTSH", "TXTLG", "TXTSH", "TEXT"),
+    "language": ("TCTLANGU", "LANGU", "SPRAS"),
 }
 
 #: Row budget for the landscape-wide shape scan of RSECVAL. Hitting it is reported, not hidden.
@@ -103,6 +142,10 @@ _MAX_SCAN_ROWS = 50_000
 _MAX_RANGES = 2000
 _MAX_AUTHS = 5000
 _MAX_USERS = 5000
+#: Languages allowed for per authorisation when reading the text table. The reference system holds
+#: nine; the headroom is deliberate, because hitting this cap costs descriptions on the tail of a
+#: page rather than raising.
+_MAX_TEXT_LANGUAGES = 40
 
 # A leading '$' marks a variable reference in an authorisation value: the effective scope resolves
 # per user at runtime, so metadata cannot state it.
@@ -111,6 +154,29 @@ _VARIABLE_PREFIX = "$"
 _NEVER_CACHED_CAVEAT = (
     "authorisation data is read live and never cached: a permission set changes when someone "
     "joins, moves or leaves, so a stale answer here would be worse than a slow one"
+)
+
+#: Said when the assignment table is readable but holds nothing (D54).
+#:
+#: An empty table and an unreadable one were treated as different problems and only the second was
+#: caveated. So a system where RSECUSERAUTH holds no rows reported
+#: ``users_with_any_authorisation = 0`` and ``unrestricted_users = []`` with nothing to qualify
+#: them - two claims that read as
+#: "nobody is governed" and "nobody is unrestricted", which cannot both be reassuring and in this
+#: case were both unfounded. On the reference system that table is empty while the role side holds
+#: 1,063 grants of S_RS_AUTH/BIAUTH across 487 authorisations, for 1,805 users holding roles. Zero
+#: was not a finding about access; it was a measurement that had not been taken.
+_ASSIGNMENT_EMPTY_CAVEAT = (
+    "the analysis-authorisation -> user assignment table is present but holds no rows, so user "
+    "counts and the unrestricted-user list are UNAVAILABLE rather than zero. Do not read this as "
+    "'nobody holds an authorisation'. BW also grants analysis authorisations through role "
+    "maintenance (authorisation object S_RS_AUTH, field BIAUTH, stored in AGR_1251), which this "
+    "server does not read; on a system configured that way the assignment table is legitimately "
+    "empty while thousands of grants exist."
+)
+_ASSIGNMENT_UNREADABLE_CAVEAT = (
+    "the authorisation -> user assignment table is not readable with this connection, so user "
+    "counts and the unrestricted-user list are unavailable (not empty)"
 )
 
 #: Length of an ABAP date literal (YYYYMMDD).
@@ -177,6 +243,10 @@ class SecurityRepository(Repository):
         """
         super().__init__(connection, capability, None)
         self._column_cache: dict[str, set[str]] = {}
+        # Tri-state, resolved at most once per instance: True rows present, False readable but
+        # empty, None unreadable. In-memory only - this is still permission data.
+        self._assignment_rows: bool | None = None
+        self._assignment_probed = False
 
     # --- availability --------------------------------------------------------------------
 
@@ -188,14 +258,27 @@ class SecurityRepository(Repository):
         columns = self._columns("auth_values", _VALUE_COLUMNS)
         if not columns.has("auth", "characteristic"):
             table = self.physical("auth_values")
+            unresolved = [
+                f"{role} (tried {'/'.join(_VALUE_COLUMNS[role])})"
+                for role in ("auth", "characteristic")
+                if not columns.has(role)
+            ]
+            available = sorted(self._table_columns("auth_values"))
             return unsupported_result(
                 self.capability,
-                [f"{table}.AUTH/IOBJNM"],
+                [f"{table}.{role.split(' ')[0]}" for role in unresolved],
                 detail=(
-                    f"{table} exists but its authorisation and characteristic columns could "
-                    "not be resolved from DD03L on this release, so no authorisation can be "
-                    "read reliably. This is a documented gap: it does NOT mean no "
-                    "authorisations exist."
+                    # The candidate names and the real column list are both named on purpose. When
+                    # this fired on BW 7.50 (D53) the message said only "AUTH/IOBJNM could not be
+                    # resolved", which told the reader nothing about what the table *does* have, so
+                    # a dead subsystem looked like an unsupported release. Whoever sees this next
+                    # should be able to fix it by reading the message.
+                    f"{table} exists but these column roles could not be resolved on this "
+                    f"release: {'; '.join(unresolved)}. The table's actual columns are: "
+                    f"{', '.join(available) if available else '(could not be read)'}. Add the "
+                    "correct name to the candidate list in repositories/security.py to support "
+                    "this release. This is a documented gap: it does NOT mean no authorisations "
+                    "exist."
                 ),
             )
         return None
@@ -323,11 +406,11 @@ class SecurityRepository(Repository):
                 "a ':' range grants aggregated access only: the user can see a total but not the "
                 "individual rows behind it. This is not the same as no access."
             )
-        if not self.capability.is_available("auth_user"):
-            caveats.append(
-                "the authorisation -> user assignment table is not readable with this "
-                "connection, so assigned_users is unavailable (not empty)"
-            )
+        assignment = self._assignment_state()
+        if assignment is None:
+            caveats.append(_ASSIGNMENT_UNREADABLE_CAVEAT)
+        elif assignment is False:
+            caveats.append(_ASSIGNMENT_EMPTY_CAVEAT)
         if truncated:
             caveats.append(f"range list capped at {_MAX_RANGES}")
 
@@ -369,12 +452,11 @@ class SecurityRepository(Repository):
         uncovered = [e.characteristic for e in relevant if not e.covered]
 
         caveats = [_NEVER_CACHED_CAVEAT]
-        if not self.capability.is_available("auth_user"):
-            caveats.append(
-                "the authorisation -> user assignment table is not readable with this "
-                "connection, so user counts and the unrestricted-user list are unavailable "
-                "(not empty)"
-            )
+        assignment = self._assignment_state()
+        if assignment is None:
+            caveats.append(_ASSIGNMENT_UNREADABLE_CAVEAT)
+        elif assignment is False:
+            caveats.append(_ASSIGNMENT_EMPTY_CAVEAT)
         if not relevant:
             caveats.append(
                 "no authorisation-relevant characteristics could be read (RSDCHA.AUTHRELFL "
@@ -441,14 +523,28 @@ class SecurityRepository(Repository):
         """
         relevant = {e.characteristic for e in self._auth_relevant_characteristics()}
         in_play = sorted(relevant & {c.strip().upper() for c in characteristics})
+        # `None` means coverage could not be assessed, which is not the same as nothing being
+        # covered (D57). The difference is the whole finding: treating an unreadable RSECVAL as an
+        # empty one declares every characteristic in the query uncovered and attaches "without a
+        # catch-all the query returns no data" - a live configuration fault asserted from
+        # an absence of data. Demonstrated while fixing D53: on a subject query whose six
+        # authorisation-relevant
+        # characteristics are all covered, the unreadable path called all six uncovered. That is
+        # worse than the three tools D53 silenced, because a gap is visible and this was not.
         covered = self._characteristics_with_authorisations()
-        uncovered = [char for char in in_play if char not in covered]
+        uncovered = [char for char in in_play if char not in covered] if covered is not None else []
         caveats = [
             "lists the characteristics that make this query user-specific; it does not "
             "resolve what any individual sees, which needs a per-user value join",
             "a query restricted on an authorisation-relevant characteristic returns different rows "
             "per user, so two people comparing figures can both be right",
         ]
+        if covered is None and in_play:
+            caveats.append(
+                "the authorisation values could not be read, so whether anything grants these "
+                "characteristics is UNKNOWN - not uncovered. Coverage was not assessed here; use "
+                "bw_access_report to find out whether this is a grant or a release limitation."
+            )
         if uncovered:
             caveats.append(
                 f"{len(uncovered)} characteristic(s) in this query are authorisation-relevant "
@@ -520,6 +616,18 @@ class SecurityRepository(Repository):
     def _table_columns(self, logical: str) -> set[str]:
         if logical in self._column_cache:
             return self._column_cache[logical]
+        # Prefer the column set the capability resolver already measured at connect (D45). It is the
+        # same dictionary read, done once for the whole server instead of once per table per
+        # instance, and it means this subsystem no longer needs DD03L to be separately grantable:
+        # before, a connection without it resolved no roles and the security tools went dead for a
+        # reason that had nothing to do with the RSEC* tables. The live read stays as the fallback
+        # for tables the resolver could not measure.
+        status = self.capability.table(logical)
+        if status is not None and status.present and status.columns_known:
+            measured = {str(column).strip().upper() for column in status.columns}
+            if measured:
+                self._column_cache[logical] = measured
+                return measured
         columns: set[str] = set()
         if self.capability.is_available(logical) and self.capability.is_available("dict_columns"):
             try:
@@ -545,14 +653,20 @@ class SecurityRepository(Repository):
         """Generated authorisations are program/DAP-maintained: a manual edit is lost on next run.
 
         BW records no flag for this, so it is read from the naming convention SAP's own generation
-        uses. Nothing further is asserted.
+        uses - and where the name says nothing, the answer is ``"unknown"`` rather than
+        ``"maintained"`` (D56). Falling back to "maintained" made an assertion out of an absence of
+        evidence, and the failure was total rather than marginal: on the reference system the
+        convention matched exactly one of 296 authorisations, so 295 were reported as
+        hand-maintained purely because their names did not look generated. Someone acting on that
+        would edit an authorisation a program overwrites on its next run. ``AuthOrigin`` already had
+        "unknown" available; nothing needed inventing, only using.
         """
         upper = auth.upper()
         if upper == CATCH_ALL:
             return "maintained"
         if upper.startswith(("0BI_", "!")) or upper.endswith("_GEN"):
             return "generated"
-        return "maintained"
+        return "unknown"
 
     def _descriptions(self, auths: list[str]) -> dict[str, str]:
         if not auths or not self.capability.is_available("auth_text"):
@@ -560,23 +674,68 @@ class SecurityRepository(Repository):
         columns = self._columns("auth_text", _TEXT_COLUMNS)
         if not columns.has("auth", "text"):
             return {}
+        # The text table is keyed by language, so reading it without one returns a row per language
+        # per authorisation and the last one written to the dict wins (D55). On the reference system
+        # that is nine rows each, which made the description non-deterministic: same query, same
+        # data, different answer depending on how the database ordered the result. Ranked with the
+        # same rule the texts repository uses - preferred, then English, then whatever exists - so a
+        # system holding only German still gets a description rather than nothing.
+        # Every text column this release has, in preference order, not just the first one.
+        # Resolving a
+        # single column lost the description whenever the preferred one was blank, and the case that
+        # exposed it is the one that matters most: SAP ships 0BI_ALL - the catch-all, the
+        # single most
+        # important authorisation on any system - with all nine of its long texts empty and only the
+        # short text filled. One authorisation in 471 here, but a system populating short texts by
+        # convention would lose all of them, which is the portability version of the same bug.
+        available = self._table_columns("auth_text")
+        text_columns = [c for c in _TEXT_COLUMNS["text"] if c in available]
+        language_column = columns["language"]
+        selected = [str(columns["auth"]), *text_columns]
+        if language_column is not None:
+            selected.append(language_column)
         placeholders = ", ".join("?" for _ in auths)
         try:
             rows = self.select(
                 self.dialect.paginate(
                     self.dialect.build_select(
-                        columns=[str(columns["auth"]), str(columns["text"])],
+                        columns=selected,
                         from_logical="auth_text",
                         where=[f"{columns['auth']} IN ({placeholders})"],
                         params=list(auths),
                         order_by=[str(columns["auth"])],  # capped read; see D8
                     ),
-                    limit=_MAX_AUTHS,
+                    # One row per language, so the cap has to allow for all of them or the last
+                    # authorisations in the page silently lose their descriptions.
+                    limit=_MAX_AUTHS * _MAX_TEXT_LANGUAGES,
                 )
             )
         except Exception:
             return {}
-        return {str(a).strip(): str(t).strip() for a, t in rows if _clean(a) and _clean(t)}
+        language_index = 1 + len(text_columns)
+        best: dict[str, tuple[int, str]] = {}
+        for row in rows:
+            auth = _clean(row[0])
+            if auth is None:
+                continue
+            text = next(
+                (value for value in (_clean(cell) for cell in row[1:language_index]) if value),
+                None,
+            )
+            # A description that merely repeats the technical name is not a description. This is the
+            # quality rule the description subsystem applies everywhere else, and 0BI_ALL is exactly
+            # the case it exists for: its short text is the literal string "0BI_ALL". Dropping it
+            # keeps the answer None - but now for a measured reason rather than because the read
+            # happened to look at the wrong column.
+            if text is None or text.upper() == auth.upper():
+                continue
+            has_language = language_column is not None and len(row) > language_index
+            language = _clean(row[language_index]) if has_language else None
+            rank = lang_rank(language, DEFAULT_LANGUAGE) if language is not None else 1
+            current = best.get(auth)
+            if current is None or rank < current[0]:
+                best[auth] = (rank, text)
+        return {auth: text for auth, (_rank, text) in best.items()}
 
     def _hierarchy_nodes(self, auth: str) -> list[AuthHierarchyNode]:
         if not self.capability.is_available("auth_hierarchy"):
@@ -656,9 +815,44 @@ class SecurityRepository(Repository):
             return {}
         return {str(a).strip(): int(n or 0) for a, n in rows if _clean(a)}
 
-    def _users_of(self, auth: str) -> list[str]:
+    def _assignment_state(self) -> bool | None:
+        """``True`` rows present, ``False`` readable but empty, ``None`` unreadable.
+
+        The middle state is the one that existed without being represented (D54). Every user fact
+        this repository reports is derived from one table, and an empty one cannot distinguish "no
+        user holds an authorisation" from "assignment is recorded somewhere this server does not
+        read". Those have opposite meanings for a reader assessing access, so the difference is
+        measured once and carried into the caveats rather than collapsing into zero.
+        """
+        if self._assignment_probed:
+            return self._assignment_rows
+        self._assignment_probed = True
         columns = self._user_columns()
         if columns is None:
+            self._assignment_rows = None
+            return None
+        try:
+            # Counted rather than read: "does any row exist" needs no rows, and a capped read would
+            # have to state an order (D8) to be deterministic, which is meaningless for an existence
+            # probe. The aggregate also keeps a permission table's contents out of the process.
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["COUNT(*)"],
+                    from_logical="auth_user",
+                )
+            )
+        except Exception:
+            self._assignment_rows = None
+            return None
+        if not rows or rows[0][0] is None:
+            self._assignment_rows = None
+            return None
+        self._assignment_rows = int(rows[0][0]) > 0
+        return self._assignment_rows
+
+    def _users_of(self, auth: str) -> list[str]:
+        columns = self._user_columns()
+        if columns is None or self._assignment_state() is not True:
             return []
         try:
             rows = self.select(
@@ -684,9 +878,14 @@ class SecurityRepository(Repository):
         return sorted(found)
 
     def _user_counts(self, auths: list[str]) -> dict[str, int] | None:
-        """``None`` when assignment cannot be read, so "unknown" is never rendered as zero."""
+        """``None`` when assignment cannot be read, so "unknown" is never rendered as zero.
+
+        An empty table counts as "cannot be read" here: it yields no row for any authorisation, so
+        every count would come back absent anyway, and returning a mapping would assert that the
+        question was answered.
+        """
         columns = self._user_columns()
-        if not auths or columns is None:
+        if not auths or columns is None or self._assignment_state() is not True:
             return None
         auth_column, user_column = str(columns["auth"]), str(columns["user"])
         placeholders = ", ".join("?" for _ in auths)
@@ -709,8 +908,9 @@ class SecurityRepository(Repository):
         return {str(a).strip(): int(n or 0) for a, n in rows if _clean(a)}
 
     def _distinct_user_count(self) -> int | None:
+        """``None`` rather than 0 when the table is empty: 0 would be a claim, None is the truth."""
         columns = self._user_columns()
-        if columns is None:
+        if columns is None or self._assignment_state() is not True:
             return None
         try:
             rows = self.select(
@@ -759,22 +959,38 @@ class SecurityRepository(Repository):
             if _clean(r[0])
         ]
 
-    def _characteristics_with_authorisations(self) -> set[str]:
+    def _characteristics_with_authorisations(self) -> set[str] | None:
+        """Characteristics some authorisation grants, or ``None`` when that cannot be read.
+
+        The ``None`` is the point (D57). Returning an empty set on an unreadable table is
+        indistinguishable from "no authorisation covers anything", and the caller turns that into a
+        finding that every characteristic is uncovered - which reads as a serious misconfiguration
+        and would send someone to fix a system that is correctly configured.
+        """
         unsupported = self.require_security()
         if unsupported is not None:
-            return set()
+            return None
         columns = self._columns("auth_values", _VALUE_COLUMNS)
-        rows = self.select(
-            self.dialect.paginate(
-                self.dialect.build_select(
-                    columns=[f"DISTINCT {columns['characteristic']}"],
-                    from_logical="auth_values",
-                    # Ordered because the scan is capped. This set is compared against the
-                    # authorisation-relevant characteristics to find uncovered ones, so an arbitrary
-                    # slice would report a different coverage gap on each run (D8).
-                    order_by=[str(columns["characteristic"])],
-                ),
-                limit=_MAX_AUTHS,
+        try:
+            rows = self.select(
+                self.dialect.paginate(
+                    self.dialect.build_select(
+                        columns=[f"DISTINCT {columns['characteristic']}"],
+                        from_logical="auth_values",
+                        # Ordered because the scan is capped. This set is compared against the
+                        # authorisation-relevant characteristics to find uncovered ones, so an
+                        # arbitrary slice would report a different coverage gap on each run (D8).
+                        order_by=[str(columns["characteristic"])],
+                    ),
+                    limit=_MAX_AUTHS,
+                )
             )
-        )
+        except Exception:
+            # The only read in this file that was unguarded, and the realistic failure is a withheld
+            # grant rather than a missing table: the authorisation group is the one that
+            # mission Section 10
+            # names as first to withhold, so a connection that can see RSECVAL in the dictionary but
+            # not select from it is the expected case, not an edge one. Unguarded, that propagated a
+            # raw database error out of a tool whose whole contract is to degrade into a stated gap.
+            return None
         return {str(r[0]).strip().upper() for r in rows if _clean(r[0])}

@@ -18,7 +18,8 @@ on the DataSource name alone can never match.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Any, cast
+from collections.abc import Iterable
+from typing import Any, cast, get_args
 
 from ..core.dialect import like_term
 from ..models.objects import normalise_object_type
@@ -42,7 +43,7 @@ from ..models.transformations import (
     TransformationEndpoint,
     TransformationSummary,
 )
-from ..services.routine_parser import RoutineParser
+from ..services.routine_parser import RoutineParser, form_bodies, performed_forms
 from .base import Repository
 from .texts import StoredText, TextsRepository, TextTableSpec
 
@@ -50,15 +51,27 @@ _TEXT_SPEC = TextTableSpec("transformation_text", "TRANID", "classic")
 
 
 # RSTLOGO endpoint type code -> readable kind.
+_ENDPOINT_KINDS: frozenset[str] = frozenset(get_args(EndpointKind))
+
+
 def _endpoint_kind(code: str) -> EndpointKind:
     """Decode a TLOGO code through the canonical table in ``models.objects``.
 
     This was a local copy of that table. Three copies existed and had drifted, so the codes are now
     decoded in one place. ``EndpointKind`` spells "untypable" ``other`` while the canonical
     vocabulary says ``unknown``, so that one word is translated back here for schema compatibility.
+
+    The canonical vocabulary is wider than ``EndpointKind``: it includes things that can appear in
+    an endpoint column but are not providers, ``DTPA`` being the one BW actually uses (a
+    self-transformation's source is stored as its DTP). Decoding that to ``dtp`` and handing it
+    straight to the model raised a validation error and failed the whole read, so anything outside
+    this schema's vocabulary degrades to ``other`` rather than taking the tool down. The DTP case is
+    then dereferenced properly by ``_resolve_endpoint``; this is only the floor under it.
     """
     resolved = normalise_object_type(code)
-    return cast("EndpointKind", "other" if resolved == "unknown" else resolved)
+    if resolved == "unknown" or resolved not in _ENDPOINT_KINDS:
+        return "other"
+    return cast("EndpointKind", resolved)
 
 
 # Rule-depth decodes. Every mapping below was read from the ABAP dictionary (DD03L -> DD07T fixed
@@ -113,6 +126,19 @@ _RULETYPE_TO_RULE: dict[str, RuleType] = {
     "ADSO": "adso",
     "ODSO": "odso",
     "HIER_SPLIT": "hier_split",
+}
+
+# Bind-parameter budget for the batched rule-step reads. Well inside HANA's limit, and small enough
+# that one oversized frontier cannot turn a walk into a statement the driver rejects.
+_LOOKUP_CHUNK = 300
+
+# What to call a rule-step table this release does not have. Only used to name the gap in a caveat:
+# the resolved name is preferred when capability discovery found one, and this is the fallback for a
+# table that was never resolved at all, so the message still names something a BW person recognises.
+_LOOKUP_FALLBACK: dict[str, str] = {
+    "transformation_step_master": "RSTRANSTEPMASTER",
+    "transformation_step_dso": "RSTRANSTEPODSO",
+    "transformation_step_adso": "RSTRANSTEPADSO",
 }
 
 # RSTRANSTEPROUT.KIND -> RoutineKind (field-level routines).
@@ -296,8 +322,8 @@ class TransformationsRepository(Repository):
             tran_id=tran_id,
             description=self._texts_for([tran_id]).get(tran_id),
             active=str(row[0]).strip() == "ACT",
-            source=_endpoint(row[1], row[2], row[3]),
-            target=_endpoint(row[4], row[5], row[6]),
+            source=self._resolve_endpoint(_endpoint(row[1], row[2], row[3])),
+            target=self._resolve_endpoint(_endpoint(row[4], row[5], row[6])),
             field_mappings=self._field_mappings(tran_id),
             routines=refs,
             declared_lookups=self._declared_lookups_or_note(tran_id),
@@ -306,6 +332,43 @@ class TransformationsRepository(Repository):
             has_expert_routine=bool(_clean(row[9])),
             caveats=self._structure_caveats(),
             provenance=self.provenance("transformation", {"TRANID": tran_id, "OBJVERS": "A"}),
+        )
+
+    def _resolve_endpoint(
+        self, endpoint: TransformationEndpoint | None
+    ) -> TransformationEndpoint | None:
+        """Dereference an endpoint BW stored as a DTP rather than as an object (D18).
+
+        A self-transformation's source is recorded as the DTP's technical name, ``TLOGO='DTPA'``.
+        Passed through, the endpoint names a *load* where a data source belongs. ``RSBKDTP.SRC`` is
+        the object the DTP reads, which is what the transformation actually consumes.
+
+        On failure the DTP id is kept in ``name`` and ``unresolved_dtp`` says so, rather than the
+        endpoint being dropped or silently presented as an object.
+        """
+        if endpoint is None or endpoint.type_code.strip().upper() != "DTPA":
+            return endpoint
+        if not self.capability.is_available("dtp"):
+            return endpoint.model_copy(update={"via_dtp": endpoint.name, "unresolved_dtp": True})
+        rows = self.select(
+            self.dialect.build_select(
+                columns=["SRC", "SRCTLOGO"],
+                from_logical="dtp",
+                where=["DTP = ?", "OBJVERS = 'A'"],  # RSBK* prefix: no OBJVERS auto-inject
+                params=[endpoint.name],
+                order_by=["SRC"],  # one row expected; stated because the read is bounded
+            )
+        )
+        source = _clean(rows[0][0]) if rows else None
+        if source is None:
+            return endpoint.model_copy(update={"via_dtp": endpoint.name, "unresolved_dtp": True})
+        type_code = _clean(rows[0][1]) or endpoint.type_code
+        return TransformationEndpoint(
+            name=source,
+            kind=_endpoint_kind(type_code),
+            type_code=type_code,
+            subtype=endpoint.subtype,
+            via_dtp=endpoint.name,
         )
 
     def _declared_lookups_or_note(self, tran_id: str) -> list[DeclaredLookup]:
@@ -400,6 +463,16 @@ class TransformationsRepository(Repository):
             )
         return result
 
+    #: ``(logical table, object-name column, lookup kind)`` for the typed rule-step tables. One
+    #: place, because the forward read, the batched read and the reverse read must all ask about the
+    #: same three tables and the same columns; a table present in one and missing from another would
+    #: silently change which lookups exist depending on which direction the caller walked.
+    _LOOKUP_SOURCES: tuple[tuple[str, str, LookupKind], ...] = (
+        ("transformation_step_master", "IOBJNM", "master_data"),
+        ("transformation_step_dso", "ODSOBJECT", "dso"),
+        ("transformation_step_adso", "ADSONM", "adso"),
+    )
+
     def declared_lookups(self, tran_id: str) -> list[DeclaredLookup]:
         """Lookups the transformation declares, from the typed rule-step tables.
 
@@ -412,6 +485,101 @@ class TransformationsRepository(Repository):
         lookups.extend(self._store_lookups(tran_id, "transformation_step_adso", "ADSONM", "adso"))
         lookups.sort(key=lambda item: (item.kind, item.object_name))
         return lookups
+
+    def missing_lookup_tables(self) -> list[str]:
+        """Physical names of the rule-step tables this release does not have.
+
+        Exposed so a caller can say *why* a declared-lookup list is empty. An empty list of lookups
+        and an unanswerable question are different facts, and only one of them means "none".
+        """
+        missing: list[str] = []
+        for logical, _column, _kind in self._LOOKUP_SOURCES:
+            if self.capability.is_available(logical):
+                continue
+            status = self.capability.table(logical)
+            missing.append((status.resolved_name if status else None) or _LOOKUP_FALLBACK[logical])
+        return missing
+
+    def lookups_declared_by(self, tran_ids: Iterable[str]) -> dict[str, list[DeclaredLookup]]:
+        """``TRANID -> declared lookups``, one statement per rule-step table rather than per id.
+
+        The per-transformation :meth:`declared_lookups` costs three statements each, and the lineage
+        walk asks about every transformation feeding a node. Batched, a frontier costs three
+        statements regardless of its width.
+        """
+        ordered = sorted({t.strip() for t in tran_ids if t and t.strip()})
+        if not ordered:
+            return {}
+        out: dict[str, list[DeclaredLookup]] = defaultdict(list)
+        for logical, column, kind in self._LOOKUP_SOURCES:
+            if not self.capability.is_available(logical):
+                continue
+            for chunk in [
+                ordered[i : i + _LOOKUP_CHUNK] for i in range(0, len(ordered), _LOOKUP_CHUNK)
+            ]:
+                placeholders = ", ".join("?" for _ in chunk)
+                rows = self.select(
+                    self.dialect.build_select(
+                        columns=["TRANID", column, "RULEID", "STEPID"],
+                        from_logical=logical,
+                        where=[f"TRANID IN ({placeholders})"],
+                        params=list(chunk),
+                        # Stated so a capped or compared read is reproducible, for the same reason
+                        # every other bounded read here states one.
+                        order_by=["TRANID", column, "RULEID", "STEPID"],
+                    )
+                )
+                for tran_id, obj, rule_id, step_id in rows:
+                    name = _clean(obj)
+                    owner = _clean(tran_id)
+                    if name is None or owner is None:
+                        continue
+                    out[owner].append(
+                        DeclaredLookup(
+                            kind=kind,
+                            object_name=name,
+                            rule_id=_as_int(rule_id),
+                            step_id=_as_int(step_id),
+                            provenance=self.provenance(
+                                logical, {"TRANID": owner, column: name}
+                            ),
+                        )
+                    )
+        return {k: sorted(v, key=lambda i: (i.kind, i.object_name)) for k, v in out.items()}
+
+    def transformations_looking_up(self, object_name: str) -> list[tuple[str, LookupKind]]:
+        """Reverse of :meth:`declared_lookups`: which transformations declare a read of this object.
+
+        This is the question BW's own where-used list answers and this repository could not: the
+        rule-step tables were only ever queried by ``TRANID``, so "what does this transformation
+        look up" was answerable and "who looks this object up" was not. Defect D15 was the
+        consequence — a declared read never reached the lineage graph in either direction, and a
+        lookup with no ``SELECT`` to parse was therefore invisible.
+        """
+        wanted = (object_name or "").strip()
+        if not wanted:
+            return []
+        found: list[tuple[str, LookupKind]] = []
+        seen: set[tuple[str, str]] = set()
+        for logical, column, kind in self._LOOKUP_SOURCES:
+            if not self.capability.is_available(logical):
+                continue
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["TRANID", "RULEID", "STEPID"],
+                    from_logical=logical,
+                    where=[f"{column} = ?"],
+                    params=[wanted],
+                    order_by=["TRANID", "RULEID", "STEPID"],
+                )
+            )
+            for tran_id, _rule_id, _step_id in rows:
+                owner = _clean(tran_id)
+                if owner is None or (owner, kind) in seen:
+                    continue
+                seen.add((owner, kind))
+                found.append((owner, kind))
+        return found
 
     def _master_lookups(self, tran_id: str) -> list[DeclaredLookup]:
         if not self.capability.is_available("transformation_step_master"):
@@ -683,17 +851,52 @@ class TransformationsRepository(Repository):
         codes = self.get_routine_code(tran_id)
         if isinstance(codes, UnsupportedResult):
             return codes
-        return [
-            self._parser.analyze(
-                code_id=code.code_id,
-                kind=code.kind,
-                lines=code.lines,
-                provenance=self.provenance(
-                    "routine_source", {"CODEID": code.code_id, "OBJVERS": "A"}
-                ),
+        # D39: BW stores a *migrated update rule* in two pieces. The field routine's own source
+        # block is a short wrapper - declare locals, copy the source structure, PERFORM a
+        # subroutine, convert monitor messages - and the subroutine itself is a FORM in the
+        # global block. Analysing the wrapper alone reports no dependencies for a routine whose body
+        # this repository has already retrieved: measured 1,859 wrapper blocks of 10,383 on the
+        # reference system, and 63 of the bodies they perform contain a SELECT.
+        #
+        # So index every FORM defined anywhere in this transformation and append the body of any
+        # subroutine a block performs. The link is a name match, not an inference.
+        bodies: dict[str, tuple[str, list[str]]] = {}
+        for code in codes:
+            for name, body in form_bodies(code.lines).items():
+                bodies.setdefault(name, (code.code_id, body))
+        analyses: list[RoutineAnalysis] = []
+        for code in codes:
+            lines = list(code.lines)
+            caveats: list[str] = []
+            followed: list[str] = []
+            for name in performed_forms(code.lines):
+                found = bodies.get(name)
+                # Skip a FORM defined in this same block: its statements are already present, and
+                # appending them would double-count every dependency it declares.
+                if found is None or found[0] == code.code_id:
+                    continue
+                host_code_id, body = found
+                caveats.append(
+                    f"this routine performs subroutine '{name}', whose body is defined in code id "
+                    f"{host_code_id}; its {len(body)} line(s) were appended after line "
+                    f"{len(lines)} of this routine's own source, so the findings below cover both "
+                    "the wrapper and the subroutine that actually runs"
+                )
+                lines = lines + body
+                followed.append(name)
+            analyses.append(
+                self._parser.analyze(
+                    code_id=code.code_id,
+                    kind=code.kind,
+                    lines=lines,
+                    provenance=self.provenance(
+                        "routine_source", {"CODEID": code.code_id, "OBJVERS": "A"}
+                    ),
+                    extra_caveats=caveats,
+                    followed_forms=followed,
+                )
             )
-            for code in codes
-        ]
+        return analyses
 
     # --- helpers -------------------------------------------------------------------------
 

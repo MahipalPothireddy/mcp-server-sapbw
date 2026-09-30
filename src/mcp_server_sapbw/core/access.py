@@ -73,9 +73,20 @@ GRANT_GROUPS: tuple[GrantGroup, ...] = (
             "is allowed to trust. This is the one group with no degraded mode."
         ),
         capabilities=frozenset(
-            {"dict_tables", "dict_tables_text", "dict_columns", "dict_dataelement_text"}
+            {
+                "dict_tables",
+                "dict_tables_text",
+                "dict_columns",
+                "dict_dataelement_text",
+                # Domain fixed values and their texts (D44). In this group rather than a group of
+                # their own because they answer the same question the rest of it answers - what does
+                # this release actually declare - and because without them every code decode in the
+                # server is an assumption carried over from the development system.
+                "dict_domain_values",
+                "dict_domain_text",
+            }
         ),
-        abap_objects=("DD02L", "DD02T", "DD03L", "DD04T", "CVERS"),
+        abap_objects=("DD02L", "DD02T", "DD03L", "DD04T", "DD07L", "DD07T", "CVERS"),
         other_objects=("SYS.TABLES",),
         required=True,
     ),
@@ -123,6 +134,7 @@ GRANT_GROUPS: tuple[GrantGroup, ...] = (
                 "cube_text",
                 "cube_field",
                 "multiprovider_part",
+                "multiprovider_identification",
                 "adso_header",
                 "adso_text",
                 "adso_keyfields",
@@ -148,6 +160,7 @@ GRANT_GROUPS: tuple[GrantGroup, ...] = (
             "RSDCUBET",
             "RSDCUBEIOBJ",
             "RSDCUBEMULTI",
+            "RSDICMULTIIOBJ",
             "RSOADSO",
             "RSOADSOT",
             "RSOADSOKEYFIELDS",

@@ -5,7 +5,7 @@
     "Only BW 7.50 has been verified (SAP_BW 750, HANA 2.0). Every other release reports 'unverified' for every tool. That is an absence of evidence, stated rather than filled in: which metadata objects a release carries is what the capability resolver discovers at connect time, and predicting it from a version number here would be guesswork wearing the clothes of a support statement.",
     "On an unverified release, the capabilities resolved by pattern rather than by a known name are the ones that decide the answer: adso, analysis_auth, composite_provider, extractor, extractor_field, query_stats, transformation_text. Connect and run bw_capability_report to settle them in one call."
   ],
-  "contract_revision": "0.1.0+757b3b0d",
+  "contract_revision": "0.1.0+52b4a903",
   "releases": [
     {
       "evidence": "not_verified",
@@ -230,6 +230,20 @@
       },
       "requires": [],
       "tool": "bw_capability_report",
+      "validation": "not_validated"
+    },
+    {
+      "implementation": null,
+      "measurement": "measured",
+      "needs_connector": null,
+      "note": "Measured to read no BW metadata.",
+      "releases": {
+        "BW 7.40": "unverified",
+        "BW 7.50": "verified",
+        "BW/4HANA 2.0": "unverified"
+      },
+      "requires": [],
+      "tool": "bw_check_code_decodes",
       "validation": "not_validated"
     },
     {
@@ -583,6 +597,7 @@
       "requires": [
         "element_dir",
         "element_range",
+        "element_select",
         "element_text",
         "element_xref",
         "query_dir",
@@ -1134,16 +1149,16 @@
   "totals": {
     "BW 7.40": {
       "needs_connector": 2,
-      "unverified": 59
+      "unverified": 60
     },
     "BW 7.50": {
       "expected": 16,
       "needs_connector": 2,
-      "verified": 43
+      "verified": 44
     },
     "BW/4HANA 2.0": {
       "needs_connector": 2,
-      "unverified": 59
+      "unverified": 60
     }
   }
 }

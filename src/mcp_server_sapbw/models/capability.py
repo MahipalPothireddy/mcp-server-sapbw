@@ -133,6 +133,35 @@ class TableStatus(BaseModel):
     # Named schema_name rather than "schema" to avoid shadowing pydantic's model API.
     schema_name: str | None = None
     row_estimate: int | None = None
+    #: Column names this release actually has, upper-cased. **Empty means not measured**, never "no
+    #: columns" - read :attr:`columns_known` rather than testing emptiness, and treat an unmeasured
+    #: set as permission to proceed. Populated for ABAP-schema tables from one bulk ``DD03L`` read
+    #: at connect (1,253 rows across 59 tables in 0.27s on the reference system).
+    #:
+    #: Added for D45. Table existence was validated from the first build and column existence never
+    #: was, so a column this release does not have reached the driver and came back as
+    #: ``invalid column name: X: line 1 col 18`` - which reads as a server fault rather than a
+    #: release difference. It was not hypothetical: ``bw_list_business_areas`` was **dead on BW
+    #: 7.50** because ``RSDAREA`` has no ``PARENT_AREA``, and two earlier instances
+    #: (``RSTRAN.EXPERTROUTINE``, the guessed ``RSPCPROCESSLOG`` timestamps) were each found by a
+    #: human running SQL by hand.
+    columns: frozenset[str] = frozenset()
+
+    @property
+    def columns_known(self) -> bool:
+        """True when the columns were measured, so an absence really means the column is absent."""
+        return bool(self.columns)
+
+    def has_column(self, name: str) -> bool:
+        """Whether this release has ``name``. ``True`` when the columns were never measured.
+
+        Defaulting to ``True`` on an unmeasured set is deliberate: the alternative refuses every
+        read on a release whose ``DD03L`` could not be examined, which would turn one missing grant
+        into a server that answers nothing.
+        """
+        if not self.columns:
+            return True
+        return name.strip().upper() in self.columns
 
     @property
     def determinate(self) -> bool:

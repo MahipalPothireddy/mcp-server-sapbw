@@ -95,6 +95,10 @@ class _Profiles:
     def bi_inventory_path(self) -> str | None:
         return None
 
+    def bi_platform_names(self) -> list[str]:
+        """No live BI platform in the fixture: the default install holds no BI credentials."""
+        return []
+
 
 def _runtime(
     tmp_path: Path, *, cache_enabled: bool = True, tenant: str | None = None

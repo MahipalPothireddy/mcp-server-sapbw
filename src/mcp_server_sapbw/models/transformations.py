@@ -86,8 +86,17 @@ class TransformationEndpoint(BaseModel):
 
     name: str
     kind: EndpointKind
-    type_code: str  # raw RSTLOGO code (RSDS/ODSO/ADSO/CUBE/IOBJ/HCPR/TRCS/MPRO/ELEM)
+    type_code: str  # raw RSTLOGO code (RSDS/ODSO/ADSO/CUBE/IOBJ/HCPR/TRCS/MPRO/ELEM/DTPA)
     subtype: str | None = None
+    #: The DTP this endpoint was stored as, when BW recorded the endpoint as a DTP rather than an
+    #: object (``type_code`` ``DTPA``, the usual shape for a self-transformation). ``name`` then
+    #: holds the object the DTP reads, dereferenced through ``RSBKDTP``, and this field keeps the
+    #: DTP so the load is still identifiable. Reporting the DTP id as the endpoint's ``name`` was
+    #: defect D18: a DTP is a load, not a data source, so the answer named the wrong class of thing.
+    via_dtp: str | None = None
+    #: True when ``type_code`` said DTP and the dereference could not be completed, so ``name`` is
+    #: still the DTP id. Stated rather than left to look like a resolved object.
+    unresolved_dtp: bool = False
 
 
 class ConstantValue(BaseModel):

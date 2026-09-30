@@ -56,8 +56,14 @@ def _clean(value: Any) -> str | None:
     return text or None
 
 
-def _lang_rank(language: str, preferred: str) -> int:
-    """Rank a language: preferred first, then English, then anything else."""
+def lang_rank(language: str, preferred: str) -> int:
+    """Rank a language: preferred first, then English, then anything else.
+
+    Public because the security repository needs the same rule (D55) and two implementations of
+    "which language wins" would drift. Note that SAP language keys are not guaranteed to be ASCII -
+    the reference system stores nine of them for each authorisation, two as non-Latin single
+    characters - so this only ever compares, never parses.
+    """
     upper = language.upper()
     if upper == preferred.upper():
         return 0
@@ -138,7 +144,7 @@ class TextsRepository(Repository):
             text = _clean(short)
             if not key or text is None:
                 continue
-            rank = _lang_rank(str(langu).strip(), preferred_language)
+            rank = lang_rank(str(langu).strip(), preferred_language)
             current = best.get(key)
             if current is None or rank < current[0]:
                 best[key] = (rank, text)
@@ -164,7 +170,7 @@ class TextsRepository(Repository):
             text = _clean(desc)
             if not column or text is None:
                 continue
-            rank = _lang_rank(str(langu).strip(), preferred_language)
+            rank = lang_rank(str(langu).strip(), preferred_language)
             current = best.get(column)
             if current is None or rank < current[0]:
                 best[column] = (rank, text)

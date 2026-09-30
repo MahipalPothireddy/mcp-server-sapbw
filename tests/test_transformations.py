@@ -14,11 +14,13 @@ from mcp_server_sapbw.core.dialect import LIKE_ESCAPE
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.provenance import UnsupportedResult
 from mcp_server_sapbw.repositories.transformations import TransformationsRepository
+from mcp_server_sapbw.services.routine_parser import form_bodies, performed_forms
 from tests.sqllike import matches_like
 
 SCHEMA = "TESTSCHEMA"
 _TABLES = {
     "transformation": "RSTRAN",
+    "dtp": "RSBKDTP",  # needed to dereference a DTP-typed endpoint (D18)
     "transformation_rule": "RSTRANRULE",
     "transformation_field": "RSTRANFIELD",
     "transformation_step_rout": "RSTRANSTEPROUT",
@@ -65,6 +67,26 @@ _TRAN["TRANSFORM02"] = (
     "",
     "",
 )
+# A self-transformation as BW stores one: SOURCETYPE 'DTPA' and SOURCENAME the *DTP's* technical
+# name. Reported verbatim it names a load where a data source belongs, which was defect D18 - on a
+# production ADSO the dependency list carried a DTP id instead of the ADSO's own name.
+_SELF_DTP_ID = "DTP_FIN_SELF"
+_TRAN["TRANSFORM03"] = (
+    "ACT",
+    "DTPA",
+    "",
+    _SELF_DTP_ID,
+    "ADSO",
+    "",
+    "FIN_ADSO",
+    "",
+    "",
+    "",
+    "",
+    "",
+)
+# RSBKDTP: DTP id -> (SRC, SRCTLOGO). The dereference D18 needs.
+_DTP_HEADER = {_SELF_DTP_ID: ("FIN_ADSO", "ADSO")}
 # RULEID, RULETYPE, AGGR, GROUPTYPE, NO_CONV
 _RULES = {
     "TRANSFORM01": [
@@ -94,8 +116,38 @@ _ADSO_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {}
 _STEPROUT = {"TRANSFORM01": [(2, "CODEFIELD", "NORMAL")]}
 _SOURCE = {
     "CODESTART": ["METHOD start_routine.", "  SELECT * FROM mara INTO TABLE lt.", "ENDMETHOD."],
-    "CODEGLBL": ["* global", "DATA gv TYPE i."],
-    "CODEFIELD": ["METHOD field.", "  result = src-dmbtr + src-wrbtr.", "ENDMETHOD."],
+    # A migrated update rule's body lives in the GLOBAL block as a FORM, not in the field routine's
+    # own block. The SELECT here is the dependency the field routine really has (D39). The second
+    # FORM is never performed, so it must not leak into the wrapper's analysis.
+    "CODEGLBL": [
+        "* global",
+        "DATA gv TYPE i.",
+        "FORM routine_0013",
+        "  USING &CS& TYPE ty_src",
+        "  CHANGING &RS& TYPE ty_tgt.",
+        # Synthetic namespace on purpose: the leak check forbids the real generated-table
+        # namespaces outside tests/fixtures/, and the parser offers ANY namespaced table to the
+        # resolver, so a neutral one exercises the same path.
+        "  SELECT SINGLE * FROM /TST/PRATE INTO ls WHERE key = &CS&-cost.",
+        "  CALL FUNCTION 'CONVERT_TO_STAT_CURRENCY'.",
+        "ENDFORM.",
+        "FORM routine_9999",
+        "  SELECT * FROM /TST/PNEVER INTO TABLE lt2.",
+        "ENDFORM.",
+    ],
+    # The wrapper: locals, copy the source structure, perform the subroutine, convert messages.
+    # Carries no business logic of its own, which is exactly why analysing it alone said nothing.
+    "CODEFIELD": [
+        "  DATA: l_monitor TYPE STANDARD TABLE OF rsmonitor.",
+        "  MOVE-CORRESPONDING &SF& to &CS&.",
+        "  Perform routine_0013",
+        "  TABLES l_monitor",
+        "  USING &CS&",
+        "  CHANGING &RS& l_subrc l_abort.",
+        "  LOOP AT l_monitor INTO ls_monitor.",
+        "    append monitor_rec to &MO&.",
+        "  ENDLOOP.",
+    ],
 }
 _TEXT = {"TRANSFORM01": ("E", "Load fin postings", "Load financial postings into ADSO")}
 
@@ -124,6 +176,9 @@ class ScriptedConnection:
         name = str(params[-1]) if params else ""
         if "TOTAL_COUNT" in sql:
             return [(len(_endpoint_filtered(sql, params)),)]
+        if "RSBKDTP" in sql:
+            row = _DTP_HEADER.get(str(params[0]))
+            return [row] if row else []
         if "RSTRANSTEPROUT" in sql:
             rows = _STEPROUT.get(name, [])
             if "KIND" in sql:
@@ -216,7 +271,7 @@ def test_list_transformations() -> None:
     result = _repo().list_transformations()
     assert not isinstance(result, UnsupportedResult)
     summaries, total = result
-    assert total == 2
+    assert total == 3  # TRANSFORM03 is the DTP-sourced self-transformation added for D18
     summary = next(s for s in summaries if s.tran_id == "TRANSFORM01")
     assert summary.source_kind == "datasource"
     assert summary.target_kind == "adso"
@@ -258,6 +313,10 @@ def test_get_routine_code() -> None:
     assert set(by_code) == {"CODESTART", "CODEGLBL", "CODEFIELD"}
     assert by_code["CODESTART"].line_count == 3
     assert by_code["CODESTART"].provenance.source_table == "RSAABAP"
+    # Retrieval reports what the source table stores, unchanged: the wrapper is 9 lines and the
+    # subroutine body is not spliced into it here. Only the ANALYSIS follows the PERFORM (D39), so
+    # that "what is stored under this code id" stays answerable.
+    assert by_code["CODEFIELD"].line_count == 9
 
 
 def test_analyze_routines_lower_bound() -> None:
@@ -349,6 +408,27 @@ def test_declared_lookups_are_exact_and_carry_miss_behaviour() -> None:
     assert dso.miss_constant == "0.00"
 
 
+def test_a_dtp_typed_source_endpoint_is_dereferenced_to_the_object() -> None:
+    """D18: BW stores a self-transformation's source as a DTP id, not an object."""
+    tran = _repo().get_transformation("TRANSFORM03")
+    assert not isinstance(tran, UnsupportedResult)
+    assert tran.source is not None
+    assert tran.source.name == "FIN_ADSO", "the DTP id is standing in for a source object"
+    assert tran.source.kind == "adso"
+    assert tran.source.via_dtp == _SELF_DTP_ID, "the load must stay identifiable"
+    assert tran.source.unresolved_dtp is False
+
+
+def test_an_unresolvable_dtp_endpoint_says_so_instead_of_looking_resolved() -> None:
+    """Without RSBKDTP the name cannot be dereferenced; that must be stated, not disguised."""
+    tran = _repo(set(_TABLES) - {"dtp"}).get_transformation("TRANSFORM03")
+    assert not isinstance(tran, UnsupportedResult)
+    assert tran.source is not None
+    assert tran.source.name == _SELF_DTP_ID  # kept, not dropped
+    assert tran.source.unresolved_dtp is True
+    assert tran.source.via_dtp == _SELF_DTP_ID
+
+
 def test_missing_lookup_tables_are_declared_as_a_caveat() -> None:
     """An empty lookup list must be distinguishable from 'this release cannot tell us'."""
     present = set(_TABLES) - {
@@ -361,3 +441,89 @@ def test_missing_lookup_tables_are_declared_as_a_caveat() -> None:
     assert not isinstance(tran, UnsupportedResult)
     assert tran.declared_lookups == []
     assert any("RSTRANSTEPMASTER" in c for c in tran.caveats)
+
+
+# --- D39: a migrated update rule's analysis must describe the body, not the wrapper -----------
+# Found by S02. BW splits this kind of field routine in two: the field routine's own source block is
+# a short wrapper that performs a subroutine, and the subroutine is a FORM in the transformation's
+# global block. Measured on production: 1,859 of 10,383 source blocks are wrappers, and 63 of the
+# bodies they perform contain a SELECT - dependencies that exist, were already retrieved, and were
+# being reported as none.
+
+
+def test_migrated_update_rule_analysis_follows_the_performed_subroutine() -> None:
+    result = _repo().analyze_routines("TRANSFORM01")
+    assert not isinstance(result, UnsupportedResult)
+    field = next(a for a in result if a.code_id == "CODEFIELD")
+    tables = {d.table.lower() for d in field.table_dependencies}
+    assert "/tst/prate" in tables, "the subroutine's SELECT is the field routine's real dependency"
+
+
+def test_the_wrapper_analysis_says_where_the_body_came_from() -> None:
+    """A line number in the result must remain locatable, so the splice is stated, not silent."""
+    result = _repo().analyze_routines("TRANSFORM01")
+    assert not isinstance(result, UnsupportedResult)
+    field = next(a for a in result if a.code_id == "CODEFIELD")
+    spliced = [c for c in field.caveats if "routine_0013" in c]
+    assert spliced, "the caveat must name the subroutine that was followed"
+    assert "CODEGLBL" in spliced[0], "and the code id its body came from"
+    assert "after line 9" in spliced[0], "and where in this routine's own source it was appended"
+
+
+def test_a_subroutine_that_is_not_performed_does_not_leak_in() -> None:
+    """Appending every FORM in the global block would attribute unrelated reads to this routine."""
+    result = _repo().analyze_routines("TRANSFORM01")
+    assert not isinstance(result, UnsupportedResult)
+    field = next(a for a in result if a.code_id == "CODEFIELD")
+    tables = {d.table.lower() for d in field.table_dependencies}
+    assert "/tst/pnever" not in tables
+
+
+def test_the_global_block_is_not_double_counted_against_itself() -> None:
+    """The block defining the FORM already contains its statements; appending them again would
+    report the same dependency twice."""
+    result = _repo().analyze_routines("TRANSFORM01")
+    assert not isinstance(result, UnsupportedResult)
+    glbl = next(a for a in result if a.code_id == "CODEGLBL")
+    rate = [d for d in glbl.table_dependencies if d.table.lower() == "/tst/prate"]
+    assert len(rate) == 1
+    assert not any("body is defined in code id" in c for c in glbl.caveats)
+
+
+def test_dynamic_perform_in_program_is_not_resolved_as_a_local_subroutine() -> None:
+    """``PERFORM x IN PROGRAM (y)`` resolves at runtime. Treating it as a local FORM would claim a
+    resolution that was never made - the exact shape of mission Known Limitation 3."""
+    lines = [
+        "  CONCATENATE 'PRE_' i_vnam INTO lv_prog.",
+        "  PERFORM execute_variable_exit",
+        "    IN PROGRAM (lv_prog)",
+        "    USING i_vnam.",
+        "  PERFORM local_helper.",
+    ]
+    assert performed_forms(lines) == ["local_helper"]
+    assert form_bodies(lines) == {}
+
+
+def test_a_form_without_endform_is_skipped_rather_than_guessed() -> None:
+    bodies = form_bodies(
+        ["FORM good.", "  SELECT * FROM a.", "ENDFORM.", "FORM truncated.", "  SELECT * FROM b."]
+    )
+    assert set(bodies) == {"good"}
+    assert bodies["good"] == ["  SELECT * FROM a."]
+
+
+def test_a_followed_subroutine_stops_counting_as_an_unfollowed_call() -> None:
+    """The evidence line reports how many calls were named but not followed. A subroutine whose body
+    was spliced in *was* followed, so leaving it in that count overstates the shortfall - the mirror
+    of the error that omitting a caveat would be."""
+    result = _repo().analyze_routines("TRANSFORM01")
+    assert not isinstance(result, UnsupportedResult)
+    field = next(a for a in result if a.code_id == "CODEFIELD")
+    forms = [r for r in field.unresolved_refs if r.call_kind == "form"]
+    assert not any(r.object_name.lower() == "routine_0013" for r in forms)
+    # The function module inside the body is a different matter: it genuinely was not followed, and
+    # naming it is the useful form of a lower bound.
+    modules = [r.object_name.upper() for r in field.unresolved_refs
+               if r.call_kind == "function_module"]
+    assert "CONVERT_TO_STAT_CURRENCY" in modules
+    assert field.complexity.call_count == len(field.unresolved_refs)

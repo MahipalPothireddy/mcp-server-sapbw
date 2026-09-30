@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -89,7 +89,15 @@ _TABLES = {
     "cs_tables": "M_CS_TABLES",
     "object_dependencies": "OBJECT_DEPENDENCIES",
     "hana_views": "VIEWS",
-    "auth_value": "RSECVAL",
+    # Plural, matching the capability key. This fixture carried the singular form, which is why
+    # nothing caught D60: the fixture agreed with the typo, so the resolution "worked" in tests and
+    # emitted a non-existent table name on the real system.
+    "auth_values": "RSECVAL",
+    # Needed to expand a union provider into the parts that hold data (D58). `cube_field` is here
+    # because auto-detection requires a probe's whole table group before it will try it, so without
+    # it the InfoCube probe is skipped and a MultiProvider resolves as ObjectNotFound.
+    "cube_field": "RSDCUBEIOBJ",
+    "multiprovider_part": "RSDCUBEMULTI",
 }
 
 
@@ -105,13 +113,20 @@ class ScriptedConnection:
         self,
         *,
         rows: dict[str, list[tuple[Any, ...]]] | None = None,
-        fragments: dict[str, list[tuple[Any, ...]]] | None = None,
+        fragments: dict[tuple[str, ...], list[tuple[Any, ...]]] | None = None,
         fail_on: str | None = None,
         budget_after: int | None = None,
     ) -> None:
         self._rows = rows or {}
-        # Matched on a SQL fragment rather than a table, because one table answers several different
-        # questions with different column shapes - RSTRAN is read once per lineage direction.
+        # Matched on SQL fragments rather than a table, because one table answers several different
+        # questions with different column shapes - RSTRAN is read once per lineage direction, once
+        # for a target's transformation list, and once for D33's non-active loaders.
+        #
+        # A key is a *tuple* and every part must appear, because single substrings could not tell
+        # those reads apart: `TARGETNAME = ?` matches both the upstream lineage read and the D33
+        # probe, so the probe was handed three-column lineage rows, raised on the unpack, and the
+        # section handler recorded a failure no test looked at (D71). The conjunction lets the
+        # active-version condition do the discriminating, which is what actually differs.
         self._fragments = fragments or {}
         self._fail_on = fail_on
         self._budget_after = budget_after
@@ -127,9 +142,13 @@ class ScriptedConnection:
             )
         if self._fail_on and f'"{self._fail_on}"' in sql:
             raise RuntimeError("scripted read failure")
-        for fragment, rows in self._fragments.items():
-            if fragment in sql:
-                return rows
+        matched = [key for key in self._fragments if all(part in sql for part in key)]
+        # Ambiguity is refused rather than settled by order. Taking the first match is how a
+        # collision becomes invisible; raising here makes the fixture name the two keys that
+        # overlap.
+        assert len(matched) <= 1, f"fragment keys {matched} both match one statement: {sql}"
+        if matched:
+            return self._fragments[matched[0]]
         for physical, rows in self._rows.items():
             if f'"{physical}"' in sql:
                 return rows
@@ -167,7 +186,7 @@ def _service(
     *,
     present: set[str] | None = None,
     rows: dict[str, list[tuple[Any, ...]]] | None = None,
-    fragments: dict[str, list[tuple[Any, ...]]] | None = None,
+    fragments: dict[tuple[str, ...], list[tuple[Any, ...]]] | None = None,
     fail_on: str | None = None,
     budget_after: int | None = None,
 ) -> AnalysisService:
@@ -198,16 +217,38 @@ def _service(
 def _analysis(**kwargs: Any) -> Analysis:
     result = _service(**kwargs).analyze_object("SALES_DSO")
     assert isinstance(result, Analysis), result
+    _assert_no_swallowed_failure(result, kwargs)
     return result
+
+
+def _assert_no_swallowed_failure(result: Analysis, kwargs: dict[str, Any]) -> None:
+    """No section may have failed unless the test asked for a failure (D71).
+
+    A reader that raises is recorded as a ``failed`` section so one broken reader cannot cost the
+    others, and that is the behaviour two tests below deliberately exercise. The cost is that a
+    fixture whose rows stop matching a reader's SELECT produces the same recorded failure, and every
+    test that does not inspect that section keeps passing. That is how D33's ``RSTRAN`` read went in
+    with the ``loading_chains`` section raising ``ValueError`` on every call in this module.
+
+    Checked here rather than in each test because every analysis in this module is built through
+    ``_analysis``, so a drifted fixture now fails loudly at the point of use.
+    """
+    if kwargs.get("fail_on") or kwargs.get("budget_after"):
+        return  # the failure is the subject of the test
+    broken = [f"{s.section}/{s.tool}: {s.detail}" for s in result.steps if s.status == "failed"]
+    assert not broken, f"a reader raised and the section handler swallowed it: {broken}"
 
 
 # A flow with real edges: STAGE_DSO --TR1--> SALES_DSO --TR2--> SALES_CUBE, plus a transformation
 # whose routine reads SALES_DSO (the consumer BW's own where-used list cannot show).
-_FLOW_FRAGMENTS: dict[str, list[tuple[Any, ...]]] = {
+#
+# Both keys carry the active-version condition, which is what separates a lineage read from D33's
+# non-active loader probe over the same table and the same `TARGETNAME = ?` filter.
+_FLOW_FRAGMENTS: dict[tuple[str, ...], list[tuple[Any, ...]]] = {
     # lineage downstream: (target name, target tlogo, transformation id)
-    "SOURCENAME = ?": [("SALES_CUBE", "CUBE", "TR2")],
+    ("SOURCENAME = ?", "OBJVERS = 'A'"): [("SALES_CUBE", "CUBE", "TR2")],
     # lineage upstream: (source name, source tlogo, transformation id)
-    "TARGETNAME = ?": [("STAGE_DSO", "ODSO", "TR1")],
+    ("TARGETNAME = ?", "OBJVERS = 'A'"): [("STAGE_DSO", "ODSO", "TR1")],
 }
 
 
@@ -824,6 +865,45 @@ def _impact_with_routine_consumer() -> ImpactAnalysis:
     )
 
 
+def _impact_with_declared_lookup_consumer() -> ImpactAnalysis:
+    """Downstream graph whose consumer is reached only by a lookup BW *declares* (D15).
+
+    RATE_MART is not the root's target and is in no ABAP. A transformation feeding it declares a
+    read of the root in its rule metadata, which is how BW's own where-used list knows about it and
+    how our consumer list did not.
+    """
+    prov = Provenance(source_table="RSTRANSTEPADSO", source_key={"TRANID": "TR7"})
+    nodes = [
+        LineageNode(id="SALES_DSO", object_type="dso", name="SALES_DSO", provenance=prov),
+        LineageNode(id="RATE_MART", object_type="adso", name="RATE_MART", provenance=prov),
+    ]
+    return ImpactAnalysis(
+        root_id="SALES_DSO",
+        graph=LineageGraph(
+            root_id="SALES_DSO",
+            direction="downstream",
+            depth=2,
+            nodes=nodes,
+            edges=[
+                LineageEdge(
+                    src="SALES_DSO",
+                    dst="RATE_MART",
+                    kind="declared_lookup",
+                    derivation="declared",
+                    confidence="exact",
+                    transformation_id="TR7",
+                    evidence=evidence_for("lineage_edge", "declared_lookup"),
+                    provenance=prov,
+                )
+            ],
+            node_count=len(nodes),
+            edge_count=1,
+        ),
+        affected_object_count=1,
+        declared_lookup_consumers=["RATE_MART"],
+    )
+
+
 def _impact_run(impact: ImpactAnalysis | None = None) -> _Run:
     """Drive ``_add_impact`` over a supplied ImpactAnalysis, and hand back the run it filled."""
     service = _service()
@@ -846,6 +926,32 @@ def _impact_run(impact: ImpactAnalysis | None = None) -> _Run:
 
 def _impact_consumers() -> list[RelatedObject]:
     return _impact_run().consumers
+
+
+def test_a_declared_lookup_consumer_reaches_the_consumer_list_as_exact() -> None:
+    """D15: BW's own where-used list named this consumer and bw_analyze_object omitted it.
+
+    Found by S01 human verification round 2 against production. The two read relations must stay
+    distinguishable: this one is exact and BW records it, the routine-parsed one is a lower bound.
+    """
+    run = _impact_run(_impact_with_declared_lookup_consumer())
+    declared = next(c for c in run.consumers if c.relationship == "consumer_lookup")
+    assert declared.ref.name == "RATE_MART"
+    assert declared.ref.object_type == "adso"  # typed from the graph, not hardcoded unknown
+    assert declared.advisory is False, "BW declares this read; calling it advisory understates it"
+    assert declared.evidence is not None
+    assert declared.evidence.basis == "observed"
+    assert declared.evidence.method == "declared_lookup_rule"
+    assert declared.evidence.completeness == "complete"
+
+
+def test_a_declared_lookup_consumer_is_not_filed_as_a_routine_consumer() -> None:
+    """A caller filtering for heuristic edges must not pick up an exact one, or vice versa."""
+    run = _impact_run(_impact_with_declared_lookup_consumer())
+    assert not [c for c in run.consumers if c.relationship == "consumer_routine"]
+    # And the reverse: the routine fixture must not start reporting declared lookups.
+    routine_run = _impact_run(_impact_with_routine_consumer())
+    assert not [c for c in routine_run.consumers if c.relationship == "consumer_lookup"]
 
 
 def test_a_routine_derived_consumer_carries_the_evidence_s01_requires() -> None:
@@ -927,3 +1033,312 @@ def test_an_advisory_relationship_never_claims_an_observed_basis() -> None:
             assert item.evidence.basis in {"observed", "derived"}, (
                 f"{item.relationship} is not advisory but claims basis={item.evidence.basis}"
             )
+
+
+# --- a union provider holds no data of its own (D58) -------------------------------------------
+#
+# A MultiProvider (CUBETYPE 'M') over two parts, one of which the request ledger knows about. The
+# rows are shared across providers by the scripted connection, which is fine here: what these tests
+# pin down is *which object the currency question was asked about*, not what the answer was.
+_UNION_ROWS: dict[str, list[tuple[Any, ...]]] = {
+    # Emptied on purpose: auto-detection probes the classic DSO header first, so leaving the shared
+    # RSDODSO row in place classifies the subject as a DSO and the union is never recognised.
+    "RSDODSO": [],
+    # RSDCUBE: CUBETYPE, OBJSTAT, INFOAREA, OWNER, APPL. 'M' is a MultiProvider.
+    "RSDCUBE": [("M", "ACT", "SD", "DEVUSER", "SD")],
+    # RSDCUBEMULTI: PARTCUBE, POSIT
+    "RSDCUBEMULTI": [("PART_ONE", 1), ("PART_TWO", 2)],
+}
+
+
+def _union_service(**kwargs: Any) -> AnalysisService:
+    return _service(rows={**_ROWS, **_UNION_ROWS}, **kwargs)
+
+
+def test_a_union_provider_is_expanded_to_the_parts_that_hold_the_data() -> None:
+    """The defect S05 exposed, and the most dangerous answer shape this server can produce.
+
+    A MultiProvider holds no rows and books no requests: it unions its parts when the query runs. So
+    a currency check aimed at one finds nothing and says so, a loading-chain lookup finds nothing
+    and says so, and the payload reads ``currency: no records found`` next to ``confidence: high,
+    6 of 6 sections complete``. That is a silence indistinguishable from a clean bill of health, on
+    the one question the tool exists to answer.
+
+    Measured on production: a report over a MultiProvider whose three parts were one current and two
+    sixty-six days behind, loaded by a monthly chain that had missed two cycles. The owner later
+    confirmed the two flows had been retired deliberately. None of it appeared in the answer.
+    """
+    result = _union_service().troubleshoot_missing_data("UNION_PROVIDER")
+    assert isinstance(result, Analysis), result
+
+    currency_subjects = {
+        step.detail for step in result.steps if step.section == "currency" and step.detail
+    }
+    assert {"PART_ONE", "PART_TWO"} <= currency_subjects, (
+        f"currency must be checked on the parts; it was asked about {currency_subjects}"
+    )
+    assert "UNION_PROVIDER" not in currency_subjects, (
+        "the union itself has no request ledger, so diagnosing it only adds a finding that says "
+        "nothing"
+    )
+
+
+def test_the_union_expansion_is_stated_rather_than_silently_substituted() -> None:
+    """A reader must be able to tell why the answer is about objects they did not ask about."""
+    result = _union_service().troubleshoot_missing_data("UNION_PROVIDER")
+    assert isinstance(result, Analysis), result
+
+    summary = " ".join(result.summary)
+    assert "UNION_PROVIDER" in summary and "union" in summary.lower()
+    assert "PART_ONE" in summary and "PART_TWO" in summary
+
+    limitation = next(
+        (
+            entry
+            for entry in result.limitations
+            if "UNION_PROVIDER" in entry.scope and "by design" in entry.limitation
+        ),
+        None,
+    )
+    assert limitation is not None, (
+        "the empty ledger of a union provider is a property of its type, not a gap in the read, "
+        "and saying so is what lets a caller tell it apart from a provider that has no requests"
+    )
+
+
+def test_each_loading_chain_row_names_the_provider_it_belongs_to() -> None:
+    """With a union expanded, this section runs once per part.
+
+    Three rows reading "loading_chains: 2 record(s)" with nothing to tell them apart is not a
+    readable answer - and the point of the whole fix is that one part can be stale while the others
+    are current, which is unsayable if the reader cannot match a chain to a part. Caught by
+    measuring my own fix on production rather than by the fix being wrong.
+    """
+    result = _union_service().troubleshoot_missing_data("UNION_PROVIDER")
+    assert isinstance(result, Analysis), result
+
+    rows = [step for step in result.steps if step.section == "loading_chains"]
+    assert rows, "the loading-chain section should have run for each part"
+    assert all(row.detail for row in rows), (
+        "every loading_chains row must name its provider, or several identical rows are "
+        "indistinguishable"
+    )
+
+
+def test_a_non_union_provider_is_diagnosed_directly_and_not_expanded() -> None:
+    """The fix must not add a hop for providers that hold their own data."""
+    parts, source = ProvidersRepository(
+        ScriptedConnection(rows=_ROWS), _capability()
+    ).data_bearing_parts("SALES_DSO")
+    assert source == "not_union"
+    assert parts == []
+
+
+def test_a_union_whose_parts_cannot_be_read_is_a_gap_not_an_empty_list() -> None:
+    """Absent part rows must never read as "this provider has no parts".
+
+    The union still has parts; they could not be read. Reported as a limitation that says to treat
+    currency as unknown, because the alternative - checking the union's own empty ledger and saying
+    nothing is wrong - is precisely the D58 failure in a different costume.
+    """
+    rows = {**_ROWS, **_UNION_ROWS, "RSDCUBEMULTI": []}
+    result = _service(rows=rows).troubleshoot_missing_data("UNION_PROVIDER")
+    assert isinstance(result, Analysis), result
+
+    limitation = next(
+        (
+            entry
+            for entry in result.limitations
+            if "UNION_PROVIDER" in entry.scope and "could not be resolved" in entry.limitation
+        ),
+        None,
+    )
+    assert limitation is not None
+    assert "NOT as up to date" in limitation.limitation
+    assert limitation.reason == "metadata_dead_end"
+
+
+# --- a union whose parts disagree about how current they are (D33) ------------------------------
+#
+# The D58 fix made the parts get diagnosed. Nothing compared them. So a MultiProvider with one part
+# loaded today and three last loaded six to nine years ago produced four individually accurate
+# findings and no statement that one query unions them - which is the fact a reader needs, because a
+# report over that union silently mixes current and historic data.
+#
+# Measured on the reference system: two MultiProviders, six parts each, three of them holding
+# 1,081,275 rows between them at 2,442-3,191 days old beside two holding 34 million loaded the same
+# day. Both were reported as homogeneous.
+
+_REFERENCE_DAY = date(2026, 7, 30)
+_REFERENCE_TS = "20260730060000"
+
+#: D33's frozen-loader probe over RSTRAN: TRANID, OBJVERS, OBJSTAT, SOURCENAME, SOURCETYPE. Keyed on
+#: the non-active condition, which is what tells this read apart from the lineage reads above.
+_FROZEN_LOADER_FRAGMENT: dict[tuple[str, ...], list[tuple[Any, ...]]] = {
+    ("OBJVERS <> 'A'", "OBJSTAT = 'ACT'"): [("TRAN_FROZEN", "R", "ACT", "RETIRED_DSO", "ODSO")],
+}
+
+
+class _AgedConnection(ScriptedConnection):
+    """``RSSTATMANPART`` answered per provider, which the flat row fixture cannot do.
+
+    The finding is a comparison *between* parts, so a fixture returning one set of request rows for
+    every provider can only ever produce parts of identical age - which is the case the finding has
+    to
+    stay silent on. Ages are given in days behind the system-wide reference date, exactly as
+    ``data_age_days`` is derived.
+    """
+
+    def __init__(self, ages: dict[str, int], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._ages = ages
+
+    def execute_select(
+        self, sql: str, parameters: Sequence[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        if '"RSSTATMANPART"' not in sql:
+            return super().execute_select(sql, parameters)
+        self.statements += 1  # kept truthful: the budget counts this read like any other
+        return self._requests(sql, [str(p).strip() for p in (parameters or [])])
+
+    def _requests(self, sql: str, params: list[str]) -> list[tuple[Any, ...]]:
+        if "MAX(TIMESTAMP_ANF)" in sql:
+            # The honest "now": the newest request in the system, never today.
+            return [(_REFERENCE_TS,)]
+        provider = params[0] if params else ""
+        if provider not in self._ages:
+            return []
+        if "DTA_TYPE" in sql:
+            return [("CUBE",)]  # the object model the real cases have
+        if "TOTAL_COUNT" in sql:
+            return [(1,)]
+        day = _REFERENCE_DAY - timedelta(days=self._ages[provider])
+        stamp = day.strftime("%Y%m%d") + "060000"
+        # RNR, STATUS (@08@ green), TIMESTAMP_ANF, TIMESTAMP_VERB, ANZ_RECS, UPDMODE, OLTP, SOURCE
+        return [(f"REQ_{provider}", "@08@", stamp, stamp, 1000, "F", "", "")]
+
+
+def _mixed_union_risks(ages: dict[str, int], parts: list[str] | None = None) -> list[Any]:
+    rows = {**_ROWS, **_UNION_ROWS}
+    if parts is not None:
+        rows = {**rows, "RSDCUBEMULTI": [(name, i + 1) for i, name in enumerate(parts)]}
+    conn = _AgedConnection(ages, rows=rows)
+    cap = _capability()
+    service = AnalysisService(
+        AnalysisReaders(
+            system="qa",
+            capability=cap,
+            providers=ProvidersRepository(conn, cap),
+            lineage=LineageService(conn, cap),
+            transformations=TransformationsRepository(conn, cap),
+            queries=QueriesRepository(conn, cap),
+            chains=ChainsRepository(conn, cap),
+            load_closure=LoadClosureService(conn, cap),
+            health=HealthRepository(conn, cap),
+            hana=HanaRepository(conn, cap),
+            query_auth_exposure=lambda _query: pytest.fail("not reached in these tests"),
+        )
+    )
+    result = service.troubleshoot_missing_data("UNION_PROVIDER")
+    assert isinstance(result, Analysis), result
+    _assert_no_swallowed_failure(result, {})
+    return [r for r in result.risks if "unions parts of very different ages" in r.title]
+
+
+def test_a_union_whose_parts_are_years_apart_says_the_report_mixes_periods() -> None:
+    risks = _mixed_union_risks({"PART_ONE": 0, "PART_TWO": 2500})
+    assert len(risks) == 1, "the heterogeneous union must be stated once, about the union"
+
+    risk = risks[0]
+    assert risk.severity == "high"  # beyond a year: at least one part predates any current period
+    assert "UNION_PROVIDER" in risk.title
+    assert "PART_TWO (2500d)" in risk.recommendation
+    assert "PART_ONE" in risk.recommendation, "the current part is the comparison, so name it"
+    assert "retained history behind a live union is a normal design" in risk.recommendation
+    assert risk.metrics["age_spread_days"] == 2500
+    assert risk.metrics["part_ages_days"] == {"PART_ONE": 0, "PART_TWO": 2500}
+    assert risk.metrics["part_count"] == 2
+    # The claim rests on the stale part's own request rows, not on the union - which books none.
+    assert risk.evidence
+    assert all(p.source_table == "RSSTATMANPART" for p in risk.evidence)
+
+
+def test_a_union_whose_parts_are_all_current_raises_nothing() -> None:
+    """The discriminator. A flag that fires on every union is not a flag.
+
+    Without this the finding could be unconditional and every other assertion here would still pass.
+    """
+    assert _mixed_union_risks({"PART_ONE": 0, "PART_TWO": 1}) == []
+
+
+def test_a_spread_inside_a_year_is_reported_rather_than_raised() -> None:
+    """Two months apart is worth knowing and is not the same claim as nine years apart."""
+    risks = _mixed_union_risks({"PART_ONE": 0, "PART_TWO": 60})
+    assert len(risks) == 1
+    assert risks[0].severity == "medium"
+
+
+def test_one_dateable_part_cannot_establish_a_spread() -> None:
+    """A comparison needs two sides. A spread derived from one age would invent the other."""
+    assert _mixed_union_risks({"PART_ONE": 0}) == []
+
+
+def test_the_stale_parts_are_counted_against_the_whole_union_not_just_the_dateable_ones() -> None:
+    """A part whose ledger cannot be read is not evidence of currency either way.
+
+    ``part_count`` is the union's real membership while the ages cover only what could be dated, so
+    "1 of 3" says plainly that the third part was not comparable - which "1 of 1" would hide.
+    """
+    risks = _mixed_union_risks(
+        {"PART_ONE": 0, "PART_TWO": 900}, parts=["PART_ONE", "PART_TWO", "PART_MUTE"]
+    )
+    assert len(risks) == 1
+    assert risks[0].metrics["part_count"] == 3
+    assert "1 of 3 part(s)" in risks[0].recommendation
+    assert "PART_MUTE" not in risks[0].metrics["part_ages_days"]
+
+
+# --- "nothing loads this" is qualified where a frozen loader exists (D33) -----------------------
+
+
+def _no_loader_risks(frozen: bool, subject: str = "SALES_DSO") -> list[Any]:
+    fragments = dict(_FROZEN_LOADER_FRAGMENT) if frozen else {}
+    result = _service(fragments=fragments).troubleshoot_missing_data(subject)
+    assert isinstance(result, Analysis), result
+    _assert_no_swallowed_failure(result, {})
+    return [r for r in result.risks if "loads" in r.title or "no longer loaded" in r.title]
+
+
+def test_an_unexplained_orphan_is_still_reported_plainly() -> None:
+    risks = _no_loader_risks(frozen=False)
+    plain = [r for r in risks if r.title == "No walked process chain loads SALES_DSO"]
+    assert len(plain) == 1
+    assert plain[0].severity == "high"
+    # An absence still cites what was read to establish it, transformations included.
+    assert {p.source_table for p in plain[0].evidence} >= {"RSTRAN"}
+
+
+def test_a_frozen_loader_lowers_the_severity_and_names_what_to_check() -> None:
+    """Lowered, not raised - and that is the judgement, not an oversight.
+
+    A populated provider whose only inbound transformation sits at a non-active version was loaded
+    and no longer is. Told "no process chain loads this" at ``high``, a reader's reasonable next
+    step is to remove it, and on the reference system that means deleting 1,081,275 rows of
+    retained sales history. Reported at the same level as a genuine orphan, the category stops being
+    worth reading.
+    """
+    risks = _no_loader_risks(frozen=True)
+    assert not any(r.title.startswith("No walked process chain loads") for r in risks), (
+        "the plain sentence must be replaced, not printed alongside its own correction"
+    )
+
+    qualified = [r for r in risks if "no longer loaded, but it was" in r.title]
+    assert len(qualified) == 1
+    risk = qualified[0]
+    assert risk.severity == "medium"  # below the unexplained case, which is 'high'
+    assert "Do not treat this as an orphan" in risk.recommendation
+    assert "TRAN_FROZEN (version R, status ACT, from RETIRED_DSO)" in risk.recommendation
+    assert risk.metrics["objvers"] == ["R"]
+    # Rests on the frozen row itself rather than on an absence.
+    assert [p.source_table for p in risk.evidence] == ["RSTRAN"]
+    assert risk.affected_objects == ["SALES_DSO", "TRAN_FROZEN"]

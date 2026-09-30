@@ -116,6 +116,14 @@ def _infoobject_candidates(column: str) -> list[str]:
 #: A namespaced name is ``/NS/NAME`` - two slashes before the name itself.
 _NAMESPACE_SLASHES = 2
 
+#: Provider types that union other providers instead of holding their own rows.
+#:
+#: These are the ones where "check the request ledger" must be redirected to the parts, because the
+#: union itself has no requests to find and never will (D58). A virtual provider is not
+#: in this set: it reads through to a source system at query time, so it has neither requests nor
+#: parts, and expanding it would be inventing a hop that does not exist.
+_UNION_PROVIDER_TYPES = frozenset({"multiprovider", "compositeprovider"})
+
 
 def _first_text(texts: dict[str, str], *keys: str | None) -> str | None:
     """The first maintained text found under any of ``keys``, case-insensitively."""
@@ -1101,6 +1109,31 @@ class ProvidersRepository(Repository):
         )
 
     # --- CompositeProvider composition ---------------------------------------------------
+
+    def data_bearing_parts(self, name: str) -> tuple[list[str], str]:
+        """The parts of a union provider that can actually hold data, or ``([], reason)``.
+
+        Exists because "which object do I check the request ledger on?" has a different answer for a
+        union provider than for anything else, and getting that wrong is invisible (D58). A
+        MultiProvider and a CompositeProvider hold **no data and no requests of their own** - they
+        union their parts at query time - so a currency check aimed at one finds nothing and is
+        perfectly entitled to report nothing. The answer looks like a clean bill of health on a
+        provider whose parts may be months behind.
+
+        Returns ``(part names, source)`` where source is ``relational`` for a MultiProvider read
+        the part table, the composite reader's own label for a CompositeProvider, ``not_union`` when
+        the provider holds its own data and needs no expansion, or ``unresolved`` when it is a union
+        whose parts could not be read - which is a gap to report, never "it has no parts".
+        """
+        described = self.describe(name)
+        if not isinstance(described, Provider):
+            return [], "unresolved"
+        if described.object_type not in _UNION_PROVIDER_TYPES:
+            return [], "not_union"
+        parts = [p.name for p in described.part_providers if p.name]
+        if not parts:
+            return [], "unresolved"
+        return parts, described.composition_source
 
     def composite_parts(self, name: str) -> tuple[list[PartProviderRef], str, list[str]]:
         """Resolve a CompositeProvider's part providers.

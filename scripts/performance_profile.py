@@ -147,6 +147,10 @@ _CONSTANT = (
     "bw_system_profile",
     "bw_refresh_capabilities",
     "bw_capability_report",
+    # One bulk read of DD07L/DD07T for a fixed set of registered domains - 299 rows across 22
+    # domains, 0.22s measured on the reference system. The set is a property of this build, so the
+    # cost does not move with the size of the landscape.
+    "bw_check_code_decodes",
     "bw_access_report",
     "bw_support_matrix",
     "bw_performance_profile",

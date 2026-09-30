@@ -44,6 +44,7 @@ from mcp_server_sapbw.services.analysis import AnalysisReaders, AnalysisService
 from mcp_server_sapbw.services.analyzers import Analyzers
 from mcp_server_sapbw.services.assessment import AssessmentService
 from mcp_server_sapbw.services.docgen import DocGenerator
+from mcp_server_sapbw.services.domain_drift import DomainDriftService
 from mcp_server_sapbw.services.exit_analysis import ExitAnalysisService
 from mcp_server_sapbw.services.lineage import LineageService
 from mcp_server_sapbw.services.load_closure import LoadClosureService
@@ -74,6 +75,11 @@ _TABLES = {
     "global_variable": "RSZGLOBV",
     "object_dependencies": "OBJECT_DEPENDENCIES",
     "hana_views": "VIEWS",
+    # Declared so `bw_check_code_decodes` reads a dictionary rather than returning unsupported: a
+    # tool that answers "not available here" attributes no reads, and the support matrix derives
+    # what a tool needs from the reads this suite observes.
+    "dict_domain_values": "DD07L",
+    "dict_domain_text": "DD07T",
 }
 
 
@@ -109,20 +115,65 @@ class _Conn:
             return [(2,)] if "TOTAL_COUNT" in sql else [("CV1", "CALC"), ("CV2", "JOIN")]
         if "OBJECT_DEPENDENCIES" in sql:
             return [(0,)] if "TOTAL_COUNT" in sql else []
+        if "DD07L" in sql:  # dictionary domain values: DOMNAME, DOMVALUE_L, DDTEXT
+            # One registered domain carrying its measured BW 7.50 values, so the decode check runs
+            # against real rows. Every other domain comes back absent, which is a shape the report
+            # is built to express.
+            return [
+                ("RSPC_STATE", "G", "Successfully completed"),
+                ("RSPC_STATE", "F", "Completed"),
+                ("RSPC_STATE", "R", "Ended with errors"),
+                ("RSPC_STATE", "X", "Canceled"),
+            ]
         if "TOTAL_COUNT" in sql:
             return [(1,)]
         if "RSPCCHAINATTR" in sql:
             return [("DAILY_LOAD", "FINANCE", "ACT")]
         if "RSPCCHAINT" in sql:
             return [("DAILY_LOAD", "Daily finance load")]
-        if "RSPCCHAIN" in sql:  # steps: TYPE, VARIANTE, LNR, EVENTP_START/GREEN/RED
-            return [("LOADING", "DTP_1", 1, "", "", "")]
-        if "RSPCPROCESSLOG" in sql:  # per-step runtimes; empty is a valid measured window
-            return []
+        if "RSPCCHAIN" in sql:
+            if "DISTINCT CHAIN_ID" in sql:  # load closure: which chains hold a step (CHAIN_ID,)
+                return [("DAILY_LOAD",)]
+            if "LNR" in sql:  # chain structure: TYPE, VARIANTE, LNR, EVENTP_START/GREEN/RED
+                return [("LOADING", "DTP_1", 1, "", "", "")]
+            return [("LOADING", "DTP_1")]  # load closure's step list: TYPE, VARIANTE only
+        if "RSPCPROCESSLOG" in sql:
+            # Per-step runtimes: LOG_ID, TYPE, VARIANTE, INSTANCE, STATE, START/ENDTIMESTAMP.
+            # One green step and one that ended with errors, so the failed-step reporting (D65)
+            # is exercised through the MCP surface and not only in the repository tests.
+            return [
+                ("LOG01", "LOADING", "DTP_1", "INST1", "G", 20260630080000.0, 20260630081500.0),
+                ("LOG02", "LOADING", "DTP_1", "INST2", "R", 20260629080000.0, 20260629080200.0),
+            ]
         if "RSPCLOGCHAIN" in sql:
+            # Five different reads hit this table and they return five different shapes. The
+            # branches are ordered most-specific-first: a first attempt used looser markers and
+            # intercepted the chain-list and schedule-risk queries too, which is precisely the
+            # failure mode the transformation fixture warns about elsewhere in this file. A later
+            # attempt keyed the median-start query on ``ZEIT`` alone, which swallowed the run-header
+            # and contention reads as well - see ``_report_body`` for how that stayed invisible.
+            if "ANALYZED_STATUS" in sql:  # run headers: LOG_ID, DATUM, ZEIT, ANALYZED_STATUS
+                return [
+                    ("LOG01", "20260630", "080000", "G"),
+                    ("LOG02", "20260629", "080000", "R"),
+                ]
+            if "CHAIN_ID <> ?" in sql:  # contention scan: CHAIN_ID, DATUM, ZEIT
+                return []
             if "ZEIT" in sql:  # median-start-times query (CHAIN_ID, ZEIT)
                 return [("DAILY_LOAD", "080000")]
-            # run summary (GROUP BY): 30 runs across 30 days -> daily
+            if "COUNT(DISTINCT DATUM)" in sql:
+                # Cadence summary (D52): CHAIN_ID, runs, run days, first, last - FIVE columns, not
+                # the four the runtime summary returns.
+                return [("DAILY_LOAD", 30, 30, "20260601", "20260630")]
+            if "GROUP BY CHAIN_ID, DATUM" in sql:
+                # Distinct run days, one row per (chain, day). 30 consecutive days gives a median
+                # gap of 1.0, which makes the frequency *derived* daily rather than inferred.
+                return [("DAILY_LOAD", f"202606{day:02d}") for day in range(1, 31)]
+            if "MAX(DATUM)" in sql and "GROUP BY" not in sql:
+                # Reference date: the latest run in the system, the only honest "now" on a copied or
+                # frozen system. One column, no grouping.
+                return [("20260630",)]
+            # run summary (GROUP BY CHAIN_ID): 30 runs across 30 days -> daily
             return [("DAILY_LOAD", 30, "20260601", "20260630")]
         if "RSDODSOIOBJ" in sql:  # DSO fields
             return [("DOC", 1, "X"), ("AMOUNT", 2, "")]
@@ -176,7 +227,8 @@ class _Conn:
         if "RSZELTXREF" in sql:
             return []  # root has no children in this fixture
         if "RSZELTDIR" in sql:
-            return [("Q1UID", "REP", "QRY1", "X")]
+            # Five columns since D26: SUBDEFTP is the declared element type.
+            return [("Q1UID", "REP", "QRY1", "X", "REP")]
         if "RSZELTTXT" in sql:
             return [("Q1UID", "Qry1", "Query one description")]
         if "RSZRANGE" in sql or "RSZSELECT" in sql or "RSZGLOBV" in sql:
@@ -210,6 +262,11 @@ class _Conn:
             or "GROUP BY" in sql
         ):
             return []
+        if "OBJVERS <> 'A'" in sql:
+            # D33's frozen-loader probe: TRANID, OBJVERS, OBJSTAT, SOURCENAME, SOURCETYPE. Checked
+            # before the OBJSTAT branch below, which its WHERE would otherwise match. Empty here
+            # because this flow's loader is active; the populated case lives in test_load_closure.
+            return []
         if "OBJSTAT" in sql:  # get_transformation / get_routine_code header (12 cols)
             return [("ACT", "RSDS", "", "DS_A", "ADSO", "", "ADSO_T", "CODE1", "", "", "", "")]
         # Routine-register ownership scan: TRANID, endpoints, 5 routine slots. Checked after the
@@ -232,7 +289,13 @@ class FakeRuntime:
         self._cap = _capability(extra_tables)
         self._snapshot_store: SnapshotStore | None = None
 
-    def list_systems(self) -> list[SystemStatus]:
+    def list_systems(self, *, probe: bool = False) -> list[SystemStatus]:
+        """Two profiles: one reached, one that cannot be (D43).
+
+        The second is the case the real landscape produced and the tool could not express: a
+        profile whose credential is rejected. It is here so the client-level test sees a payload
+        carrying an ``unreachable`` status and a scrubbed reason, not only the happy path.
+        """
         identity = self.identity("qa")
         return [
             SystemStatus(
@@ -244,7 +307,22 @@ class FakeRuntime:
                 environment=identity.environment,
                 label=identity.label,
                 isolated_by_tenant=identity.isolated_by_tenant,
-            )
+            ),
+            SystemStatus(
+                name="prd",
+                status="unreachable" if probe else "configured",
+                detail=(
+                    "QueryError: (414, 'user is forced to change password: alter password "
+                    "required for user <redacted>')"
+                )
+                if probe
+                else None,
+                read_only_user=True,
+                tenant=identity.tenant,
+                environment="prod",
+                label="acme/prd (prod)",
+                isolated_by_tenant=identity.isolated_by_tenant,
+            ),
         ]
 
     def identity(self, system: str) -> StorageIdentity:
@@ -263,6 +341,18 @@ class FakeRuntime:
 
     def semantics(self, system: str) -> SemanticsRepository:
         return SemanticsRepository(_Conn(), self._cap)
+
+    def domain_drift(self, system: str) -> DomainDriftService:
+        """Missing until D71, which meant ``bw_check_code_decodes`` had no coverage at all.
+
+        The tool was registered, listed in ``tests/test_tool_surface._ARGS`` and called on every run
+        - and every call raised ``AttributeError`` here, came back as ``internal_error``, and was
+        accepted by the surface test because that test treated any body carrying an error code as a
+        documented failure. An unhandled exception is not a documented failure, and the test now
+        says
+        so.
+        """
+        return DomainDriftService(_Conn(), self._cap, None)
 
     def refresh_capabilities(self, system: str) -> CapabilityRecord:
         return self._cap
@@ -361,7 +451,9 @@ class FakeRuntime:
             self._snapshot_store = SnapshotStore(IN_MEMORY)
         return self._snapshot_store
 
-    def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
+    def exit_analysis(
+        self, ecc_system: str | None, bw_system: str | None = None
+    ) -> ExitAnalysisService | ConnectorUnavailable:
         """No source system is configured in the fixture, mirroring a BW-only install."""
         return ConnectorUnavailable(
             configured_profiles=[],
@@ -374,13 +466,41 @@ async def _call(tool: str, args: dict[str, Any]) -> Any:
         return await client.call_tool(tool, args)
 
 
-def test_list_systems_via_client() -> None:
-    server.set_runtime(FakeRuntime())
-    result = asyncio.run(_call("bw_list_systems", {}))
+def _systems(result: Any) -> Any:
     data = result.structured_content
     # structured output for a list is wrapped under "result"
-    systems = data["result"] if isinstance(data, dict) and "result" in data else data
-    assert systems[0]["name"] == "qa"
+    return data["result"] if isinstance(data, dict) and "result" in data else data
+
+
+def test_list_systems_via_client() -> None:
+    server.set_runtime(FakeRuntime())
+    systems = _systems(asyncio.run(_call("bw_list_systems", {})))
+    assert [s["name"] for s in systems] == ["qa", "prd"]
+    # Without probing, an unreached profile is 'configured' and claims nothing about reachability.
+    assert systems[1]["status"] == "configured"
+    assert systems[1]["detail"] is None
+
+
+def test_list_systems_can_report_a_profile_it_cannot_reach() -> None:
+    """D43: 'configured' and 'cannot connect' were the same answer, on the first tool anyone calls.
+
+    Found against a live landscape: the second profile's account was flagged "forced to change
+    password", and the tool reported both systems ``configured`` with no hint which was unusable. A
+    newcomer pointing this server at their own system would have learnt that only when some later
+    tool raised.
+
+    The reason is reported because it names the fix, and it is scrubbed because the driver puts the
+    user name in the same sentence.
+    """
+    server.set_runtime(FakeRuntime())
+    systems = _systems(asyncio.run(_call("bw_list_systems", {"probe": True})))
+    broken = next(s for s in systems if s["name"] == "prd")
+    assert broken["status"] == "unreachable"
+    assert broken["detail"] is not None
+    assert "change password" in broken["detail"], "the reason must name the fix"
+    assert "<redacted>" in broken["detail"], "the account name must not survive into the payload"
+    # A reachable profile is unaffected: one bad credential does not take the answer down.
+    assert next(s for s in systems if s["name"] == "qa")["status"] == "discovered"
 
 
 def test_capability_report_via_client_separates_absent_from_unimplemented() -> None:
@@ -561,6 +681,33 @@ def test_analyze_process_chain_via_client() -> None:
     assert body["kind"] == "process_chain"
     assert body["chain"]["chain_id"] == "DAILY_LOAD"
     assert any(step["section"] == "runtimes" for step in body["steps"])
+
+
+def test_analyze_process_chain_reports_cadence_and_the_basis_for_it() -> None:
+    """D52. The analysis carried no cadence at all, while `bw_list_chains` already computed one.
+
+    S03 names this as required evidence: cadence must be ``derived``/``observed_run_history`` when
+    there are enough runs and ``inferred``/``sparse_run_history`` when not. Found by running the
+    scenario against production, where the analysis reported no cadence field of any kind.
+
+    The basis is the point rather than the label. "daily" from two runs and "daily" from 1,690 are
+    different claims, and only the evidence distinguishes them - which is also what keeps the answer
+    honest about the trap this subject sets: the chain's **name** advertises a time that is not the
+    time it runs, so a cadence must never be readable from it.
+    """
+    server.set_runtime(FakeRuntime(extra_tables=_CHAIN_TABLES))
+    body = _report_body(
+        asyncio.run(_call("bw_analyze_process_chain", {"system": "qa", "chain_id": "DAILY_LOAD"}))
+    )
+    assert body.get("cadence") is not None, "the analysis must carry cadence, not just a runtime"
+    cadence = body["cadence"]
+    assert cadence["chain_id"] == "DAILY_LOAD"
+    assert cadence["frequency"], "a frequency with no value is not a cadence"
+    evidence = cadence.get("evidence") or {}
+    assert evidence.get("basis") in ("derived", "inferred"), evidence
+    assert evidence.get("method") in ("observed_run_history", "sparse_run_history"), evidence
+    # It must also be recorded as a section, so "how much did we manage to read" counts it.
+    assert any(step["section"] == "cadence" for step in body["steps"])
 
 
 def test_analyze_process_chain_reports_an_absent_table_as_unsupported() -> None:
@@ -787,8 +934,31 @@ async def _list_tool_names() -> list[str]:
 
 
 def _report_body(result: Any) -> Any:
+    """The payload a client receives - and an assertion that no reader failed on the way (D71).
+
+    ``_Run.section`` turns any reader exception into a recorded ``failed`` status so one broken
+    reader cannot cost the others. Right in production, a trap in a fixture: when this fake's rows
+    stop matching a reader's SELECT the section fails, the envelope still validates, and every test
+    that does not look at that particular section stays green. Three reads in this file had been
+    failing that way - the chain run-header read (intercepted by the median-start branch), the load
+    closure's step list (given the six-column structure row) and D33's frozen-loader probe (given
+    a three-column lineage row) - so the whole ``runtimes`` section of ``bw_analyze_process_chain``
+    was untested while its test passed.
+
+    Asserted here because every payload in this module comes through this function, so a fixture
+    that drifts out of shape now fails the test that uses it rather than the next person's audit.
+    """
     payload = result.structured_content
-    return payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    steps = body.get("steps") if isinstance(body, dict) else None
+    if isinstance(steps, list):
+        broken = [
+            f"{step.get('section')}/{step.get('tool')}: {step.get('detail')}"
+            for step in steps
+            if isinstance(step, dict) and step.get("status") == "failed"
+        ]
+        assert not broken, f"a reader raised and the section swallowed it: {broken}"
+    return body
 
 
 def test_check_load_latency_via_client() -> None:
@@ -910,7 +1080,7 @@ def test_extractor_exit_code_returns_the_inventory_when_configured() -> None:
 
     class EccRuntime(FakeRuntime):
         def exit_analysis(
-            self, ecc_system: str | None
+            self, ecc_system: str | None, bw_system: str | None = None
         ) -> ExitAnalysisService | ConnectorUnavailable:
             profile = EccProfile(
                 name="src",

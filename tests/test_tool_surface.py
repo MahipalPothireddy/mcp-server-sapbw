@@ -43,6 +43,7 @@ _ARGS: dict[str, dict[str, Any]] = {
     "bw_system_profile": {"system": _SYSTEM},
     "bw_refresh_capabilities": {"system": _SYSTEM},
     "bw_capability_report": {"system": _SYSTEM},
+    "bw_check_code_decodes": {"system": _SYSTEM},
     "bw_access_report": {"system": _SYSTEM},
     "bw_support_matrix": {},
     "bw_performance_profile": {},
@@ -136,8 +137,24 @@ def _call(tool: str, args: dict[str, Any]) -> Any:
 
 
 def _body(result: Any) -> Any:
+    """The payload, plus the D71 guard: a compound tool must not carry a swallowed reader failure.
+
+    The five compound tools record a reader exception as a ``failed`` section rather than raising,
+    so a fixture that drifts out of shape leaves the envelope valid and this file's "the call
+    completes and the reply is shaped" assertion satisfied. Three such failures were live in the
+    ``test_server`` fixture, which this module shares.
+    """
     payload = result.structured_content
-    return payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    body = payload["result"] if isinstance(payload, dict) and "result" in payload else payload
+    steps = body.get("steps") if isinstance(body, dict) else None
+    if isinstance(steps, list):
+        broken = [
+            f"{step.get('section')}/{step.get('tool')}: {step.get('detail')}"
+            for step in steps
+            if isinstance(step, dict) and step.get("status") == "failed"
+        ]
+        assert not broken, f"a reader raised and the section swallowed it: {broken}"
+    return body
 
 
 def test_every_registered_tool_has_arguments_here() -> None:
@@ -166,6 +183,15 @@ def test_tool_is_callable_over_the_protocol(tool: str) -> None:
         # A documented failure is a valid outcome on a fixture that has no such object; an
         # undocumented one is not.
         assert body.get("code"), f"{tool} failed without an error code: {body}"
+        # ...and `internal_error` is not a documented failure, it is an unhandled exception wearing
+        # the envelope (D71). Accepting it made this test pass for `bw_check_code_decodes` on every
+        # run while the call raised `AttributeError` before reaching any BW logic - the fake runtime
+        # had no accessor for it. A tool that cannot answer on this fixture must say so with a
+        # domain
+        # code; anything else means the wiring is broken, which is exactly what this file is for.
+        assert body["code"] != "internal_error", (
+            f"{tool} raised rather than answering: {body.get('message')}"
+        )
 
 
 @pytest.mark.parametrize("tool", sorted(_NEEDS_OUTPUT_DIR))

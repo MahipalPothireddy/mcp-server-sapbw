@@ -12,6 +12,14 @@ Two profile kinds live in the same file under separate keys:
 ``ecc_systems``
     ABAP source systems reachable over ADT/HTTP (:class:`EccProfile`), used only to read
     extractor-exit ABAP that BW itself does not hold. Optional; absent by default.
+``bi_systems``
+    A single path to a BI reporting inventory **exported to a file**. No credentials. The default
+    route for scenarios 9.7/9.8, and the one that keeps this server's trust boundary at "BW only".
+``bi_platforms``
+    Named **live** BI platforms (:class:`BiPlatformProfile`) with credentials - BOBJ over HTTP,
+    Tableau over its PostgreSQL repository. Optional and absent by default; configuring one is the
+    deliberate step past the BW-only boundary, which is why it is a separate key rather than extra
+    settings inside ``bi_systems``.
 """
 
 from __future__ import annotations
@@ -20,7 +28,8 @@ import os
 import re
 from collections.abc import Mapping, MutableMapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
@@ -306,6 +315,177 @@ def _build_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]) ->
         raise ProfileConfigError(f"profile '{name}' is invalid: {exc}") from exc
 
 
+#: Which BI platform a live profile talks to. ``bobj`` speaks HTTP (the BIPRWS RESTful service);
+#: ``tableau`` speaks PostgreSQL (the ``workgroup`` repository). They share nothing but the shape of
+#: the questions asked of them, which is why the connector interface is vendor-neutral and this
+#: discriminator lives in configuration rather than in the analyzers.
+BiPlatformKind = Literal["bobj", "tableau"]
+
+
+class BiPlatformProfile(BaseModel):
+    """One **live** BI platform this server may read report and dashboard metadata from.
+
+    **Why this is separate from ``bi_systems``.** ``bi_systems`` names a file exported from whatever
+    BI platform an organisation runs and takes no credentials at all - that is the default, and it
+    keeps this server's trust boundary at "read-only, BW only". A ``bi_platforms`` entry is the
+    deliberate step past that boundary: it means this process holds credentials for a third system
+    and opens outbound connections to it. Keeping the two blocks apart means a typo in one cannot be
+    read as the other, and an operator can tell at a glance whether BI credentials are configured.
+
+    **Read-only is enforced per transport, not assumed.** Neither platform's account is required to
+    be read-only by grant - most sites will not have one - so enforcement is pushed to the server
+    side of each protocol:
+
+    * Tableau: the connection sets ``default_transaction_read_only=on``, after which PostgreSQL
+      itself rejects INSERT/UPDATE/DELETE/TRUNCATE and DDL with SQLSTATE 25006. The database
+      refuses, so a bug in this server's SQL cannot write.
+    * BOBJ: GET only, exactly as the ADT connector does, with the single unavoidable exception of
+      the logon and logoff calls - both session lifecycle, neither touching BI content.
+
+    ``read_only_by_grant`` records whether the account is *also* locked down at the account level.
+    It defaults to ``False`` because that is the honest default, and it is reported in the
+    connector's status so nobody later reads the security notes and assumes more than is true.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    kind: BiPlatformKind
+    host: str
+    port: int = Field(gt=0, lt=65536)
+    user: str
+    password: SecretStr = Field(repr=False)
+    # Tableau only: the repository database, conventionally "workgroup".
+    database: str | None = None
+    # BOBJ only: the BIPRWS web-application root. Left unset on purpose - it moved between
+    # releases (the RESTful services were folded into the BOE web application in BI 4.3 SP03), so
+    # the connector probes the known candidates and reports which one answered rather than
+    # depending on configuration to be right about a version detail.
+    base_path: str | None = None
+    #: Site or tenant, where the platform has them. Reported, never used to choose a code path.
+    site: str | None = None
+    use_tls: bool = True
+    allow_plain_http: bool = False
+    ssl_validate_certificate: bool = True
+    timeout_seconds: float = Field(default=30.0, gt=0, le=600)
+    #: True only when the account itself cannot write. Declared, never inferred - and the transport
+    #: level enforcement above applies either way.
+    read_only_by_grant: bool = False
+    #: Ceiling on rows returned per repository/service read, so a large site cannot turn one call
+    #: into an unbounded transfer. Mirrors the bounded-read discipline the BW repositories use.
+    max_rows: int = Field(default=5000, ge=1, le=200000)
+
+    @model_validator(mode="after")
+    def _check_per_kind_requirements(self) -> BiPlatformProfile:
+        if not self.use_tls and not self.allow_plain_http:
+            raise ValueError(
+                f"BI platform '{self.name}' sets use_tls: false without allow_plain_http: true. "
+                "Sending a password over plain HTTP has to be an explicit, recorded choice."
+            )
+        if self.kind == "tableau" and not (self.database or "").strip():
+            raise ValueError(
+                f"BI platform '{self.name}' is kind 'tableau' and needs 'database' (the repository "
+                "database, conventionally 'workgroup'). Defaulting it would risk reading the wrong "
+                "database and reporting the result as authoritative."
+            )
+        return self
+
+    @property
+    def scheme(self) -> str:
+        return "https" if self.use_tls else "http"
+
+    def base_url(self, path: str) -> str:
+        """Absolute URL for a BIPRWS path. Only meaningful for ``kind='bobj'``."""
+        return f"{self.scheme}://{self.host}:{self.port}/{path.strip('/')}"
+
+
+#: Paths that are a *web UI* rather than an API root. Discarded when a URL is split,
+#: because adopting one as the service root points the connector at HTML. ``/BOE/BI``
+#: is the Fiorified BI Launch Pad - the page a person logs into - and it is the value
+#: most likely to be pasted in, precisely because it is the one in their browser.
+_BI_UI_PATHS: frozenset[str] = frozenset({"/boe/bi", "/boe/bilaunchpad", "/boe/portal", "/#"})
+
+
+def _split_host_url(value: str) -> tuple[str, int | None, bool | None, str | None]:
+    """Split ``host``-or-URL into ``(host, port, use_tls, base_path)``.
+
+    A bare host name passes through unchanged with three ``None``s, so nothing about the existing
+    configuration shape changes. A URL contributes whatever it actually specifies and
+    nothing it does not - an ``https://h:8443/BOE/BI`` gives host, port and TLS but
+    **no** base path,
+    because that path is a web UI and adopting it as the API root would aim the
+    connector at HTML.
+    """
+    if "://" not in value:
+        return value.strip(), None, None, None
+    parts = urlsplit(value.strip())
+    host = parts.hostname or value.strip()
+    scheme = (parts.scheme or "").lower()
+    use_tls = True if scheme == "https" else (False if scheme == "http" else None)
+    port = parts.port or (443 if scheme == "https" else 80 if scheme == "http" else None)
+    path = (parts.path or "").rstrip("/")
+    base_path = None if (not path or path.lower() in _BI_UI_PATHS) else path
+    return host, port, use_tls, base_path
+
+
+def _build_bi_platform_profile(
+    name: str, raw: Mapping[str, Any], env: Mapping[str, str]
+) -> BiPlatformProfile:
+    if not isinstance(raw, Mapping):
+        raise ProfileConfigError(f"BI platform '{name}' must be a mapping")
+
+    unknown = sorted(set(map(str, raw)) - set(BiPlatformProfile.model_fields))
+    if unknown:
+        raise ProfileConfigError(
+            f"BI platform '{name}' has unrecognised setting(s): {', '.join(unknown)}. "
+            "A misspelled option would otherwise be ignored without warning."
+        )
+
+    kind = str(raw.get("kind") or "").strip().lower()
+    if kind not in ("bobj", "tableau"):
+        raise ProfileConfigError(
+            f"BI platform '{name}' needs kind: 'bobj' or 'tableau' (got {kind!r}). The kind "
+            "decides the transport, so it cannot be guessed from the other settings."
+        )
+
+    resolved_host = _resolve_str(raw, "host", env, profile=name, required=True) or ""
+    # A URL is accepted where a host name is expected, and split rather than rejected.
+    #
+    # Not leniency for its own sake: what an operator has to hand is the URL they use
+    # in a browser, and that is what lands in the environment variable. Refusing it
+    # would be technically correct and would send them editing config to re-type
+    # information already present. The parsed scheme and port override the profile's
+    # own settings, because a URL saying https:8443 against a profile saying 6405 is a
+    # contradiction the URL should win - it is the more specific statement.
+    host, url_port, url_tls, url_path = _split_host_url(resolved_host)
+    try:
+        return BiPlatformProfile(
+            name=name,
+            kind=kind,  # type: ignore[arg-type]
+            host=host,
+            port=url_port if url_port is not None else _resolve_port(raw, env, profile=name),
+            user=_resolve_str(raw, "user", env, profile=name, required=True),  # type: ignore[arg-type]
+            password=SecretStr(_resolve_password(raw, env, profile=name)),
+            database=_resolve_str(raw, "database", env, profile=name, required=False),
+            # An explicit base_path still wins: it is the operator pinning the API
+            # root deliberately,
+            # whereas a path picked out of a URL is usually the web UI they happened to copy.
+            base_path=(
+                _resolve_str(raw, "base_path", env, profile=name, required=False) or url_path
+            ),
+            site=_resolve_str(raw, "site", env, profile=name, required=False),
+            use_tls=url_tls if url_tls is not None else bool(raw.get("use_tls", True)),
+            allow_plain_http=bool(raw.get("allow_plain_http", False)),
+            ssl_validate_certificate=bool(raw.get("ssl_validate_certificate", True)),
+            timeout_seconds=float(raw.get("timeout_seconds", 30.0)),
+            read_only_by_grant=bool(raw.get("read_only_by_grant", False)),
+            max_rows=int(raw.get("max_rows", 5000)),
+        )
+    except ValueError as exc:
+        # Safe to surface: pydantic names fields, and password is a SecretStr so it renders masked.
+        raise ProfileConfigError(f"BI platform '{name}' is invalid: {exc}") from exc
+
+
 def _build_ecc_profile(name: str, raw: Mapping[str, Any], env: Mapping[str, str]) -> EccProfile:
     if not isinstance(raw, Mapping):
         raise ProfileConfigError(f"ECC profile '{name}' must be a mapping")
@@ -374,6 +554,7 @@ class ProfileManager:
         self._profiles: dict[str, Profile] = self._load_systems(raw)
         self._ecc_profiles: dict[str, EccProfile] = self._load_ecc_systems(raw)
         self._bi_inventory: str | None = self._load_bi_systems(raw)
+        self._bi_platforms: dict[str, BiPlatformProfile] = self._load_bi_platforms(raw)
 
     @staticmethod
     def _load_local_dotenv(env: Mapping[str, str]) -> None:
@@ -464,6 +645,25 @@ class ProfileManager:
             str(raw_path), self._env, field="inventory_path", profile="bi_systems"
         )
 
+    def _load_bi_platforms(self, data: Mapping[str, Any]) -> dict[str, BiPlatformProfile]:
+        """Parse the optional ``bi_platforms`` block: named **live** BI systems with credentials.
+
+        Deliberately a different block from ``bi_systems``, which names an exported file and takes
+        no credentials. Two blocks rather than one overloaded block because the security properties
+        different: this one means the process holds third-party credentials and makes outbound
+        connections, and that should be visible in the configuration rather than inferred from which
+        keys happen to be present.
+        """
+        platforms = data.get("bi_platforms")
+        if platforms is None:
+            return {}
+        if not isinstance(platforms, Mapping):
+            raise ProfileConfigError("'bi_platforms' must be a mapping when present")
+        return {
+            str(name): _build_bi_platform_profile(str(name), raw, self._env)
+            for name, raw in platforms.items()
+        }
+
     def names(self) -> list[str]:
         """Configured profile names."""
         return sorted(self._profiles)
@@ -493,3 +693,26 @@ class ProfileManager:
         runs, so scenarios 9.7/9.8 work without this server holding BI credentials.
         """
         return self._bi_inventory
+
+    def bi_platform_names(self) -> list[str]:
+        """Configured live BI platform profile names (may be empty, and usually is)."""
+        return sorted(self._bi_platforms)
+
+    def get_bi_platform(self, name: str) -> BiPlatformProfile:
+        """Return a live BI platform profile, or raise :class:`ProfileNotFoundError`."""
+        try:
+            return self._bi_platforms[name]
+        except KeyError:
+            raise ProfileNotFoundError(name, self.bi_platform_names()) from None
+
+    def bi_platforms_of_kind(self, kind: BiPlatformKind) -> list[BiPlatformProfile]:
+        """Every configured platform of one kind, in name order.
+
+        A landscape can legitimately have both a BOBJ and a Tableau platform - this one does - so
+        the registry asks per kind rather than for "the" BI platform.
+        """
+        return [
+            profile
+            for name in self.bi_platform_names()
+            if (profile := self._bi_platforms[name]).kind == kind
+        ]

@@ -43,7 +43,7 @@ from ..models.analysis import (
     SkippedSection,
 )
 from ..models.capability import CapabilityRecord, ValidationStatus
-from ..models.chains import Chain, ChainRuntimes, LoadClosure
+from ..models.chains import Chain, ChainCadence, ChainRuntimes, LoadClosure
 from ..models.completeness import BoundHit, Completeness
 from ..models.ecc import ConnectorUnavailable
 from ..models.evidence import Evidence, EvidenceSummary, evidence_for, summarise
@@ -53,7 +53,7 @@ from ..models.lineage import ImpactAnalysis, LineageGraph
 from ..models.objects import BwObjectRef, normalise_object_type
 from ..models.provenance import Provenance, UnsupportedResult
 from ..models.providers import ObjectNotFound, Provider
-from ..models.queries import Query, QueryLineage, QueryUsage
+from ..models.queries import Query, QueryCondition, QueryLineage, QueryUsage
 from ..models.security import QueryAuthExposure
 from ..repositories.chains import ChainsRepository
 from ..repositories.hana import HanaRepository
@@ -98,6 +98,8 @@ _DIAGNOSE_CAP = 5
 _LOGIC_CAP = 25
 #: How many objects a summary sentence names before it says "and others".
 _NAMED_CHAINS = 3
+#: How many part providers a union-expansion sentence names before eliding (D58).
+_NAMED_PARTS = 6
 #: How many affected objects a risk lists. The full set is in `dependencies` / `consumers`.
 _RISK_OBJECTS = 10
 
@@ -115,6 +117,21 @@ _CHANGELOG_FACTOR = 3
 #: beyond _STALE_HIGH_DAYS it is raised.
 _STALE_DAYS = 1
 _STALE_HIGH_DAYS = 7
+#: Age spread across a union's parts at which the union is reported as mixing currencies (D33).
+#:
+#: Thirty days, reasoned rather than picked. A union whose parts differ by hours or days is normal -
+#: daily loads finish at different times, and a monthly part is legitimately four weeks behind its
+#: daily neighbours. What is worth a finding is a part that is behind by more than any ordinary
+#: cadence explains, because then a report over the union is mixing periods rather than lagging.
+#: Measured on the reference system the real cases are not close to the line: the spread is
+#: 2,442-3,191 days against parts loaded the same day.
+_MIXED_CURRENCY_SPREAD_DAYS = 30
+#: Spread above which the mixed union is raised rather than reported. A year means at least one part
+#: predates every reporting period a current query is likely to compare against.
+_MIXED_CURRENCY_HIGH_DAYS = 365
+#: How many parts must be dateable before their ages can be compared at all. Below this there is no
+#: spread to report, and reporting one from a single age would be inventing the other side (D33).
+_COMPARABLE_PARTS = 2
 
 
 @dataclass(frozen=True)
@@ -777,6 +794,14 @@ class AnalysisService:
             f"{', '.join(definition.providers) or 'no resolved provider'} and holds "
             f"{len(definition.elements)} element(s) and {len(definition.variables)} variable(s)."
         )
+        if definition.conditions:
+            # Split on/off in the narrative rather than giving a single count: "4 conditions" reads
+            # as "this report is filtered" when all four are switched off (D26).
+            live = sum(1 for c in definition.conditions if c.active)
+            run.say(
+                f"It defines {len(definition.conditions)} condition(s) or exception(s), "
+                f"{live} of them active."
+            )
 
         lineage = self._add_query_lineage(run, query)
         usage = self._add_query_usage(run, query)
@@ -837,6 +862,7 @@ class AnalysisService:
                 "truncated",
             )
 
+        cadence = self._add_cadence(run, chain_id)
         runtimes = self._add_runtimes(run, chain_id, days=days)
         load = self._add_chain_loads(run, chain_id)
         self._chain_risks(run, chain, runtimes=runtimes, load=load)
@@ -847,6 +873,7 @@ class AnalysisService:
             subject_name=chain.chain_id,
             title=f"Process chain analysis: {chain.chain_id}",
             chain=chain,
+            cadence=cadence,
             runtimes=runtimes,
             load=load,
             next_actions=self._chain_actions(chain, runtimes=runtimes),
@@ -969,10 +996,20 @@ class AnalysisService:
             self._add_lineage(run, target, depth=2, direction="upstream")
             run.say(f"{target} is treated as a provider; its feeding objects were traced upstream.")
 
+        # `union_members` records which parts came from which union, so the parts can afterwards be
+        # compared *against each other* (D33). Diagnosing each correctly and in isolation is not
+        # enough: a union holding one part loaded today and another frozen in 2018 produced two
+        # accurate findings and no statement that they disagreed, which is what "reported as
+        # homogeneous" means.
+        providers, union_members = self._expand_union_providers(run, providers)
         checked = 0
+        health_by_provider: dict[str, ProviderHealth] = {}
         for provider in providers[:_DIAGNOSE_CAP]:
             checked += 1
-            self._diagnose_provider(run, provider)
+            diagnosed = self._diagnose_provider(run, provider)
+            if diagnosed is not None:
+                health_by_provider[provider] = diagnosed
+        self._mixed_currency_risks(run, union_members, health_by_provider)
         if len(providers) > _DIAGNOSE_CAP:
             run.limit(
                 "currency",
@@ -1047,7 +1084,24 @@ class AnalysisService:
         root = graph.root_id
         for edge in graph.edges:
             advisory = edge.confidence == "advisory"
-            if edge.dst == root and edge.src != root:
+            if edge.src == root and edge.dst == root:
+                # A self-transformation: the object reads itself to write itself. Both branches
+                # below exclude it by construction, so it was silently absent from an object's own
+                # dependency list even though BW declares the transformation and the worksheet
+                # ground truth lists it as an inbound source. It is also the shape behind the
+                # stale-lookup and destructive-re-run hazards, so it is the last thing to drop.
+                run.relate(
+                    run.dependencies,
+                    _ref_for(graph, edge.src),
+                    "upstream",
+                    via=edge.transformation_id,
+                    advisory=advisory,
+                    evidence=edge.evidence,
+                    note=edge.note
+                    or "self-transformation: this object is its own source, so a re-run reads what "
+                    "the previous run wrote",
+                )
+            elif edge.dst == root and edge.src != root:
                 run.relate(
                     run.dependencies,
                     _ref_for(graph, edge.src),
@@ -1100,6 +1154,20 @@ class AnalysisService:
                 # the evidence has to say the same thing. Left unset, the strongest half of the
                 # consumer list arrived carrying no basis at all while the weakest half did.
                 evidence=evidence_for("lineage_edge", "exact"),
+            )
+        for consumer in impact.declared_lookup_consumers:
+            run.relate(
+                run.consumers,
+                _ref_for(impact.graph, consumer),
+                "consumer_lookup",
+                # Not advisory, and that is the whole point of the separate relationship: BW records
+                # this read in the transformation's rule metadata and lists it under its own
+                # where-used. Filing it beside the ABAP-parsed consumers would understate it.
+                advisory=False,
+                evidence=evidence_for("lineage_edge", "declared_lookup"),
+                note="a transformation declares a lookup of this object in its rule metadata, so a "
+                "change here changes that transformation's result even though this object is not "
+                "its source",
             )
         for consumer in impact.routine_lookup_consumers:
             run.relate(
@@ -1167,7 +1235,10 @@ class AnalysisService:
         )
         if load is None:
             return None
-        run.done("loading_chains", count=len(load.loading_chains))
+        # `detail` names the provider because this section now runs once per part of a union (D58).
+        # Three rows reading "loading_chains: 2 record(s)" with nothing to tell them apart is not a
+        # readable answer, and the currency rows beside them already carry the provider.
+        run.done("loading_chains", count=len(load.loading_chains), detail=name)
         run.absorb("loading_chains", load.caveats)
         for cadence in load.loading_chains:
             # Not advisory: that the chain loads this provider is declared on the DTP. Only its
@@ -1193,8 +1264,12 @@ class AnalysisService:
             )
         if load.loading_chains:
             named = load.loading_chains[:_NAMED_CHAINS]
+            # Named rather than "It is loaded by", because a union's parts each get one of these
+            # sentences (D58) and three consecutive subjectless ones leave the reader unable to tell
+            # which chain loads which part - which is the whole point when one part is stale and the
+            # others are current.
             run.say(
-                "It is loaded by "
+                f"{name} is loaded by "
                 + ", ".join(f"{c.chain_id} ({c.frequency})" for c in named)
                 + ("." if len(load.loading_chains) <= _NAMED_CHAINS else ", and others.")
             )
@@ -1318,7 +1393,11 @@ class AnalysisService:
             "security",
             "bw_get_query_auth_exposure",
             lambda: self._r.query_auth_exposure(query),
-            tables=("auth_value",),
+            # Plural. The singular form is not a capability key, so `physical()` fell through to its
+            # fallback and the audit row cited "auth_value" - a table that exists on no BW
+            # system (D60). A citation naming a non-table is worse than none, because it reads
+            # as authoritative; the guard in tests/test_section_tables.py now makes that impossible.
+            tables=("auth_values",),
         )
         if exposure is None:
             return None
@@ -1342,6 +1421,52 @@ class AnalysisService:
             )
             return None
         return self._add_loading_chains(run, providers[0])
+
+    def _add_cadence(self, run: _Run, chain_id: str) -> ChainCadence | None:
+        """How often this chain actually runs, and on what basis (D52).
+
+        The reader already computed this - ``bw_list_chains`` returns a frequency per chain - and
+        the analysis simply never carried it, so the tool S03 nominates reported no cadence at all
+        while the scenario names it as required evidence. Plumbing, not a missing capability.
+
+        The basis is what makes it worth reporting rather than a bare label. ``ChainCadence`` has
+        ``evidence`` derived from its own confidence: ``derived``/``observed_run_history`` when
+        there are enough runs to mean something, ``inferred``/``sparse_run_history`` when not. A
+        without that distinction invites "daily" from two runs to be read exactly like "daily" from
+        eighty-eight.
+
+        And it is never read from the name. The chain that exposed this is called "... 6 AM CST" and
+        actually starts at 05:30 - the name reaches the answer only as the chain's description.
+        """
+        cadences = run.step(
+            "cadence",
+            "bw_list_chains",
+            lambda: self._r.chains.get_cadence([chain_id]),
+            tables=("log_chain",),
+        )
+        if not cadences:
+            return None
+        cadence = cadences.get(chain_id)
+        if cadence is None:
+            run.note_section(
+                "cadence",
+                "bw_list_chains",
+                "empty",
+                tables=("log_chain",),
+                detail="no run history for this chain, so no cadence could be observed",
+            )
+            return None
+        run.done("cadence", count=cadence.run_count)
+        if cadence.note:
+            run.absorb("cadence", [cadence.note])
+        basis = cadence.evidence.basis if cadence.evidence else "unstated"
+        run.say(
+            f"It runs {cadence.frequency} ({basis} from {cadence.run_count} run(s) over "
+            f"{cadence.run_days} day(s))"
+            + (", and has not run within the window for that cadence." if cadence.active is False
+               else ".")
+        )
+        return cadence
 
     def _add_runtimes(self, run: _Run, chain_id: str, *, days: int) -> ChainRuntimes | None:
         runtimes = run.step(
@@ -1392,12 +1517,227 @@ class AnalysisService:
             run.say(f"It loads {len(load.providers_loaded)} provider(s).")
         return load
 
-    def _diagnose_provider(self, run: _Run, provider: str) -> None:
-        """The load-failure question, per feeding provider: did the data arrive, and did it load?"""
+    def _tables_evidence(
+        self, name: str, logicals: Sequence[str], outcome: str
+    ) -> list[Provenance]:
+        """Cite the tables a conclusion was drawn from, when no single row carries it (D59).
+
+        Needed because not every fact in a risk comes from one row. "No process chain loads this
+        object" is a conclusion from an exhaustive read finding nothing, and a consumer count is a
+        conclusion from a graph walk. Both are facts, both are alarming, and both need a source: a
+        reader has to be able to tell "we walked the chain graph and the DTP register and found
+        nothing" from a lookup that silently failed. ``outcome`` records which of those it was.
+
+        Tables the connected release lacks are skipped rather than cited, so a citation never
+        names something that was never read.
+        """
+        evidence: list[Provenance] = []
+        for logical in logicals:
+            status = self._r.capability.table(logical)
+            if status is None or not status.present or not status.resolved_name:
+                continue
+            evidence.append(
+                Provenance(
+                    source_table=status.resolved_name,
+                    source_key={"searched_for": name, "result": outcome},
+                )
+            )
+        return evidence
+
+    def _absence_evidence(self, name: str, logicals: Sequence[str]) -> list[Provenance]:
+        """Cite the tables read to establish that something is *not* there."""
+        return self._tables_evidence(name, logicals, "no matching row")
+
+    def _consumer_evidence(self, name: str, impact: ImpactAnalysis | None) -> list[Provenance]:
+        """Cite what established a consumer set.
+
+        The consumer objects themselves cannot be cited, and mypy said so before I could talk myself
+        into it: ``RelatedObject`` carries an ``Evidence`` record and ``ImpactAnalysis`` none at
+        all. ``Evidence`` says *how firmly* a link was established, not *which row* established
+        it, and treating one as the other would have produced a citation that looked precise and was
+        not. So the tables the walk covered are cited instead, which is the true statement.
+        """
+        _ = impact  # kept in the signature: the reader identity is what the citation describes
+        return self._tables_evidence(
+            name,
+            ("transformation", "object_dependencies", "query_provider"),
+            "walked for consumers",
+        )
+
+    def _health_evidence(self, health: ProviderHealth) -> list[Provenance]:
+        """Cite what a volume-or-currency claim rests on, most specific source first.
+
+        ``ProviderHealth`` has no provenance of its own; its *parts* do. A currency claim comes from
+        a request row, a volume claim from a generated table's row count, and where neither exists
+        the ledgers that were read are named - because "this provider holds no rows" has to be
+        distinguishable from "nothing could be read about this provider".
+        """
+        if health.last_request is not None:
+            return list(_as_list(health.last_request.provenance))
+        if health.tables:
+            return [p for table in health.tables for p in _as_list(table.provenance)]
+        return self._tables_evidence(
+            health.provider,
+            ("request_status", "adso_request", "cs_tables"),
+            "read for volume and currency",
+        )
+
+    def _mixed_currency_risks(
+        self,
+        run: _Run,
+        union_members: dict[str, list[str]],
+        health_by_provider: dict[str, ProviderHealth],
+    ) -> None:
+        """Say when a union's parts disagree about how current they are (D33).
+
+        The parts were always diagnosed correctly; nothing compared them. So a MultiProvider whose
+        parts were one loaded today and three last loaded six to nine years ago produced four
+        accurate findings and no statement that a single query unions them - which is the fact a
+        reader needs, because a report over that union silently mixes current and historic data.
+
+        Measured on the reference system: two MultiProviders each hold six parts, of which **three
+        hold 1,081,275 rows between them at 2,442-3,191 days old** while two others hold 34 million
+        rows loaded the same day. Both were reported as homogeneous.
+
+        Deliberately *not* a severity escalation of the per-part findings. The owner confirmed the
+        old parts are retained legacy sales history read only when a report asks for history, so the
+        finding is that the union is heterogeneous - which a reader must know - and not that
+        anything is broken.
+        """
+        for union, parts in union_members.items():
+            ages = {
+                part: health.data_age_days
+                for part in parts
+                if (health := health_by_provider.get(part)) is not None
+                and health.data_age_days is not None
+            }
+            known = sorted(ages.values())
+            if len(known) < _COMPARABLE_PARTS or known[-1] - known[0] < _MIXED_CURRENCY_SPREAD_DAYS:
+                continue
+            stale = sorted(
+                (part for part, age in ages.items() if age >= _MIXED_CURRENCY_SPREAD_DAYS),
+                key=lambda part: -(ages[part] or 0),
+            )
+            current = sorted(part for part, age in ages.items() if age < _STALE_DAYS)
+            frozen_rows = sum(
+                (health_by_provider[part].active_records or 0)
+                for part in stale
+                if part in health_by_provider
+            )
+            run.risk(
+                "missing_data",
+                "high" if known[-1] > _MIXED_CURRENCY_HIGH_DAYS else "medium",
+                f"{union} unions parts of very different ages, so a report over it mixes current "
+                "and historic data",
+                f"{len(stale)} of {len(parts)} part(s) are far behind the others"
+                + (f" and hold {frozen_rows:,} row(s) between them" if frozen_rows else "")
+                + f": {', '.join(f'{p} ({ages[p]}d)' for p in stale[:_NAMED_PARTS])}"
+                + (f", against {', '.join(current[:_NAMED_PARTS])} loaded within a day" if current
+                   else "")
+                + ". Confirm this is intended - retained history behind a live union is a normal "
+                "design - and check which parts a report actually reads before comparing figures "
+                "across periods.",
+                objects=[union, *stale[:_RISK_OBJECTS]],
+                # Each stale part's own health provenance, so the claim rests on the request rows
+                # that date it rather than on the union, which has no ledger of its own (D58/D59).
+                evidence=[
+                    p
+                    for part in stale[:_RISK_OBJECTS]
+                    if part in health_by_provider
+                    for p in self._health_evidence(health_by_provider[part])
+                ],
+                metrics={
+                    "part_count": len(parts),
+                    "part_ages_days": dict(sorted(ages.items())),
+                    "age_spread_days": known[-1] - known[0],
+                    "stale_part_rows": frozen_rows,
+                },
+            )
+
+    def _expand_union_providers(
+        self, run: _Run, providers: Sequence[str]
+    ) -> tuple[list[str], dict[str, list[str]]]:
+        """Replace each union provider with the parts that actually hold data (D58).
+
+        Without this, the central question of the whole tool goes unanswered on any report built on
+        a MultiProvider or CompositeProvider - which is most of them. A union provider holds no rows
+        and books no requests: it unions its parts when the query runs. So a currency check aimed at
+        one finds nothing, a loading-chain lookup finds nothing, and both report exactly that. The
+        payload then reads ``currency: no records found`` and ``loading_chains: no records``
+        alongside ``confidence: high, 6 of 6 sections complete``, which is the most dangerous answer
+        shape available: a silence that looks like a clean bill of health.
+
+        Measured on the validation subject - a query on a MultiProvider whose three parts were one
+        current and two sixty-six days behind, loaded by a monthly chain that had missed two cycles.
+        The readers were never the problem: asked about a part directly, ``bw_get_provider_health``
+        returns the age and ``bw_get_load_closure`` names the chain and its cadence. Only the choice
+        of object was wrong.
+
+        The union itself is dropped rather than diagnosed alongside its parts, because a request
+        ledger has nothing to say about it and including it only adds a finding that says nothing.
+        An unresolvable composition is the one case that stays loud: the parts exist and could not
+        be read, which is a gap, and is emphatically not "this provider has no parts".
+        """
+        expanded: list[str] = []
+        members: dict[str, list[str]] = {}
+        for provider in providers:
+            try:
+                parts, source = self._r.providers.data_bearing_parts(provider)
+            except Exception:
+                # A failure to classify must not lose the provider: diagnosing the union directly is
+                # a worse answer than diagnosing its parts, but it is far better than skipping it.
+                expanded.append(provider)
+                continue
+            if source == "not_union":
+                expanded.append(provider)
+                continue
+            if not parts:
+                run.limit(
+                    f"currency:{provider}",
+                    f"{provider} unions other providers but its parts could not be resolved, so "
+                    "currency was checked on the union itself, which holds no requests of its own. "
+                    "Treat this as unknown, NOT as up to date.",
+                    "metadata_dead_end",
+                )
+                expanded.append(provider)
+                continue
+            run.say(
+                f"{provider} unions {len(parts)} part provider(s) and holds no data of its own, so "
+                f"currency was checked on each part: {', '.join(parts[:_NAMED_PARTS])}"
+                + (", and others." if len(parts) > _NAMED_PARTS else ".")
+            )
+            run.limit(
+                f"currency:{provider}",
+                f"{provider} is a union provider, so its own request ledger is empty by design "
+                f"({source} composition). The {len(parts)} part provider(s) were checked instead. "
+                "A report over a union can be stale in one part while the others are current.",
+                "reader_caveat",
+            )
+            members[provider] = list(parts)
+            expanded.extend(parts)
+        # Order-preserving dedupe: two unions can share a part - measured on the validation subject,
+        # where the same two cubes sat under two different MultiProviders - and diagnosing a part
+        # twice would double every risk it raises.
+        seen: set[str] = set()
+        unique: list[str] = []
+        for provider in expanded:
+            if provider not in seen:
+                seen.add(provider)
+                unique.append(provider)
+        return unique, members
+
+    def _diagnose_provider(self, run: _Run, provider: str) -> ProviderHealth | None:
+        """The load-failure question, per feeding provider: did the data arrive, and did it load?
+
+        Returns the health record so the caller can compare parts of the same union against each
+        other (D33). Previously returned ``None``: every part was diagnosed correctly and in
+        isolation, so a union holding one current part and one frozen years ago produced two
+        accurate findings and no statement that they disagreed.
+        """
         gate = self._r.health.require_health()
         if gate is not None:
             run.step("currency", "bw_get_provider_health", lambda: gate, tables=("request_status",))
-            return
+            return None
         health = run.step(
             "currency",
             "bw_get_provider_health",
@@ -1405,10 +1745,15 @@ class AnalysisService:
             tables=("request_status", "cs_tables"),
         )
         if health is None:
-            return
+            return None
         run.done("currency", count=health.request_count, detail=provider)
         run.absorb(f"currency:{provider}", health.caveats)
         last = health.last_request
+        # The health record's own provenance is what every risk below rests on, so it is resolved
+        # once. Where a risk turns on one specific request row, that row's provenance is cited
+        # instead: "this cube last loaded 66 days ago" is a claim about a single ledger entry, and
+        # citing the whole reader would be vaguer than the fact deserves (D59).
+        health_evidence = self._health_evidence(health)
         if health.unloaded:
             run.risk(
                 "missing_data",
@@ -1417,6 +1762,7 @@ class AnalysisService:
                 f"Check whether {provider} has ever been loaded, and run its DTP before looking "
                 "at anything downstream.",
                 objects=[provider],
+                evidence=health_evidence,
             )
         # "unknown" is excluded deliberately: an undecoded status code is not evidence of a failure,
         # and reporting it as one would send the reader after a load that may have been fine.
@@ -1441,6 +1787,11 @@ class AnalysisService:
                 "Compare that against the cadence of the chain that loads it: a provider lagging "
                 "the rest of the system explains a report showing yesterday's numbers.",
                 objects=[provider],
+                # The age is computed from the newest successful request, so that row is what a
+                # reader has to open to check the number. This is the risk D59 was found on.
+                evidence=list(_as_list(health.last_successful_request.provenance))
+                if health.last_successful_request is not None
+                else health_evidence,
                 metrics={"data_age_days": health.data_age_days},
             )
         if health.failed_request_count:
@@ -1450,18 +1801,84 @@ class AnalysisService:
                 f"{provider} has {health.failed_request_count} failed request(s) on record",
                 "Check whether a failed request left a partial load in place.",
                 objects=[provider],
+                evidence=health_evidence,
                 metrics={"failed_request_count": health.failed_request_count},
             )
         load = self._add_loading_chains(run, provider)
         if load is not None and not load.loading_chains:
-            run.risk(
-                "missing_data",
-                "high",
-                f"No walked process chain loads {provider}",
-                "Confirm how it is loaded: a DTP run outside a chain has no schedule, so nothing "
-                "guarantees the data is ever refreshed.",
-                objects=[provider],
+            self._no_loader_risk(run, provider, load, health=health, severity="high")
+        return health
+
+    def _no_loader_risk(
+        self,
+        run: _Run,
+        provider: str,
+        load: LoadClosure,
+        *,
+        health: ProviderHealth | None,
+        severity: Severity,
+    ) -> None:
+        """Raise "nothing loads this" - qualified by a frozen loader where one exists (D33).
+
+        One helper for both risk sites, because they said the same thing in two places and only one
+        of them would otherwise have been corrected.
+
+        **What the qualification is for.** A populated provider whose only inbound transformation
+        sits at a non-active version is not an orphan: it was loaded and no longer is. Told the
+        plain sentence, a reader's next step is to remove it - and on the reference system that
+        would mean deleting **1,081,275 rows** of deliberately retained sales history from a
+        decommissioned source. So the frozen loader is named, and the severity is *lowered* rather
+        than raised: a deliberate retention is less alarming than an unexplained orphan, and
+        reporting it at the same level as a genuine one trains a reader to skip the category.
+        """
+        frozen = load.inactive_loaders
+        rows = health.active_records if health is not None else None
+        if frozen:
+            named = ", ".join(
+                f"{loader.tran_id} (version {loader.objvers}, status {loader.objstat or '?'}"
+                + (f", from {loader.source_name}" if loader.source_name else "")
+                + ")"
+                for loader in frozen[:_NAMED_CHAINS]
             )
+            run.risk(
+                "missing_data" if severity == "high" else "object",
+                # Deliberately below the unexplained case: this one has an explanation, and the
+                # explanation is usually "the source was decommissioned and the data is kept".
+                "medium" if severity == "high" else "low",
+                f"{provider} is no longer loaded, but it was: its loader exists at a non-active "
+                "version",
+                f"Do not treat this as an orphan. {len(frozen)} transformation(s) target it and "
+                f"are excluded because they are not the active version: {named}. Confirm whether "
+                "the source was decommissioned and the data is retained on purpose"
+                + (f" - it still holds {rows:,} row(s)." if rows else ".")
+                + " Mission rule 6 reads the active version only, so the exclusion is correct; "
+                "what would be wrong is reading it as never having been loaded.",
+                objects=[provider, *[loader.tran_id for loader in frozen[:_RISK_OBJECTS]]],
+                # The frozen rows themselves, which is the whole point: this claim rests on specific
+                # RSTRAN rows rather than on an absence.
+                evidence=[
+                    p for loader in frozen[:_RISK_OBJECTS] for p in _as_list(loader.provenance)
+                ],
+                metrics={
+                    "inactive_loaders": len(frozen),
+                    "objvers": sorted({loader.objvers for loader in frozen}),
+                    "active_records": rows,
+                },
+            )
+            return
+        run.risk(
+            "missing_data" if severity == "high" else "object",
+            severity,
+            f"No walked process chain loads {provider}",
+            "Confirm how it is loaded: a DTP run outside a chain has no schedule, so nothing "
+            "guarantees the data is ever refreshed.",
+            objects=[provider],
+            # An absence still cites what was read to establish it. "We walked the chain graph, the
+            # DTP register and the transformation catalogue and found no loader at any version" is a
+            # checkable claim; "nothing loads this" on its own is not. `transformation` joined the
+            # list when the non-active read did (D33) - a citation must name everything consulted.
+            evidence=self._absence_evidence(provider, ("chain_edges", "dtp", "transformation")),
+        )
 
     def _add_suspect_logic(self, run: _Run, providers: Sequence[str]) -> None:
         """Which inbound transformations carry routines - the layer to read once loads look fine."""
@@ -1494,6 +1911,7 @@ class AnalysisService:
                 "Read the routine source for these before concluding the source data is wrong: "
                 "routine logic can drop or overwrite records, and metadata cannot say which.",
                 objects=with_routines[:_RISK_OBJECTS],
+                evidence=[p for item in items for p in _as_list(item.provenance)][:_RISK_OBJECTS],
                 detail="Routine analysis is a static parse and a lower bound; dynamic calls are "
                 "not followed.",
             )
@@ -1527,14 +1945,9 @@ class AnalysisService:
                 evidence=list(_as_list(definition.provenance)),
             )
         if load is not None and not load.loading_chains:
-            run.risk(
-                "object",
-                "medium",
-                f"No walked process chain loads {definition.name}",
-                "Confirm how it is loaded. A DTP run outside a chain has no observable schedule, "
-                "so nothing here can say when its data is current.",
-                objects=[definition.name],
-            )
+            # Same helper as the missing-data path (D33), so the qualification cannot be applied in
+            # one place and forgotten in the other - which is how the two sentences drifted before.
+            self._no_loader_risk(run, definition.name, load, health=health, severity="medium")
         modes = {c.frequency for c in (load.loading_chains if load else [])}
         if len(modes) > 1:
             run.risk(
@@ -1544,6 +1957,11 @@ class AnalysisService:
                 "Check which chain wins on a day when both run; a provider fed at two cadences can "
                 "hold data of two different ages at once.",
                 objects=[definition.name],
+                evidence=[
+                    p
+                    for cadence in (load.loading_chains if load else [])
+                    for p in _as_list(cadence.provenance)
+                ][:_RISK_OBJECTS],
                 metrics={"cadences": sorted(modes)},
             )
         if health is not None and health.changelog_records > max(health.active_records, 1) * 3:
@@ -1555,6 +1973,7 @@ class AnalysisService:
                 f"{health.changelog_records / max(health.active_records, 1):.1f}x the active table "
                 "and is charged to memory on a HANA system.",
                 objects=[definition.name],
+                evidence=self._health_evidence(health),
                 metrics={
                     "active_records": health.active_records,
                     "changelog_records": health.changelog_records,
@@ -1568,6 +1987,7 @@ class AnalysisService:
                 "Check bw_find_unused_providers and bw_get_hana_crossings before acting: "
                 "consumption from outside BW is not visible here.",
                 objects=[definition.name],
+                evidence=self._consumer_evidence(definition.name, impact),
             )
 
     def _query_risks(
@@ -1601,6 +2021,7 @@ class AnalysisService:
                 "Expect two users to see different numbers legitimately. Compare their analysis "
                 "authorisations before treating a discrepancy as a data fault.",
                 objects=[name],
+                evidence=list(_as_list(security.provenance)),
                 metrics={"characteristics": security.auth_relevant_characteristics[:_RISK_OBJECTS]},
             )
         if security is not None and security.uncovered_characteristics:
@@ -1613,6 +2034,7 @@ class AnalysisService:
                 "Every user without a catch-all authorisation is blocked from this query until an "
                 f"authorisation covers {', '.join(uncovered)}.",
                 objects=[name, *uncovered],
+                evidence=list(_as_list(security.provenance)),
             )
         exit_variables = list(lineage.customer_exit_variables) if lineage else []
         if exit_variables:
@@ -1623,6 +2045,7 @@ class AnalysisService:
                 "Read the ABAP exit to know the effective selection; metadata can name these but "
                 "cannot resolve their values.",
                 objects=exit_variables[:_RISK_OBJECTS],
+                evidence=list(_as_list(lineage.provenance)) if lineage else [],
             )
         if not definition.providers:
             run.risk(
@@ -1632,6 +2055,90 @@ class AnalysisService:
                 "Without a provider nothing can say what this report reads or when its data is "
                 "current; check RSZCOMPIC for this COMPUID.",
                 objects=[name],
+                evidence=self._absence_evidence(definition.compuid, ("query_provider",)),
+            )
+        self._condition_risks(run, definition, name)
+
+    @staticmethod
+    def _condition_risks_detail(condition: QueryCondition) -> str:
+        """One active condition: what it is, how it cuts, and whether the cut-off is knowable.
+
+        The operator code is reported even when it has no label, because the two ranking operators
+        this landscape uses are not declared fixed values of SAP's own domain and a blank is worse
+        than a raw code. A variable threshold means the cut-off is not in metadata at all.
+        """
+        label = condition.description or condition.name or condition.eltuid
+        if condition.alert_levels:
+            # An exception has no single operator: it has bands, and the severity of each is what a
+            # reader needs. Naming them beats naming a threshold it does not have (D41).
+            bands = ", ".join(
+                level.level.label or level.level.code for level in condition.alert_levels
+            )
+            scope = condition.evaluation_scope
+            where = f" on {scope.label}" if scope and scope.label else ""
+            return f"{label}: {len(condition.alert_levels)} band(s) ({bands}){where}"
+        operator = condition.operator.code if condition.operator else "operator unknown"
+        suffix = (
+            " with a threshold resolved per execution"
+            if condition.threshold_source and condition.threshold_source.runtime_resolved
+            else ""
+        )
+        return f"{label}: {operator}{suffix}"
+
+    def _condition_risks(self, run: _Run, definition: Query, name: str) -> None:
+        """Conditions change which rows a reader sees while changing no figure (D26).
+
+        That is exactly why they belong in the risks and not only in the definition. An active Top N
+        suppresses rows silently: the query totals stop matching the provider and nothing in the
+        result says a filter did it. An *inactive* one is the opposite problem - harmless today, and
+        one checkbox away from changing every number a report consumer compares week to week - so it
+        is reported at ``info`` rather than dropped.
+        """
+        # A condition suppresses rows; an exception colours them. Only the first stops totals
+        # reconciling, so they are raised separately rather than counted together (D41).
+        suppressing = [c for c in definition.conditions if c.active and c.kind == "condition"]
+        colouring = [c for c in definition.conditions if c.active and c.kind == "exception"]
+        inactive = [c for c in definition.conditions if not c.active]
+        if suppressing:
+            labels = [c.description or c.name or c.eltuid for c in suppressing]
+            run.risk(
+                "query",
+                "medium",
+                f"{len(suppressing)} active condition(s) suppress rows in {name}",
+                "Totals here will not reconcile against the provider, and nothing in the result "
+                "says a condition did it. Check these before treating a gap as a load fault.",
+                objects=[name, *labels[:_RISK_OBJECTS]],
+                evidence=[
+                    p for c in suppressing[:_RISK_OBJECTS] for p in _as_list(c.provenance)
+                ],
+                detail="; ".join(
+                    self._condition_risks_detail(c) for c in suppressing[:_RISK_OBJECTS]
+                ),
+            )
+        if colouring:
+            run.risk(
+                "query",
+                "info",
+                f"{len(colouring)} active exception(s) colour results in {name}",
+                "Figures are unaffected, so this never explains a reconciliation gap. It does "
+                "explain why a value looks flagged, and the band thresholds are the thing to read "
+                "before changing what counts as acceptable.",
+                objects=[name],
+                evidence=[p for c in colouring[:_RISK_OBJECTS] for p in _as_list(c.provenance)],
+                detail="; ".join(
+                    self._condition_risks_detail(c) for c in colouring[:_RISK_OBJECTS]
+                ),
+            )
+        if inactive:
+            run.risk(
+                "query",
+                "info",
+                f"{len(inactive)} condition(s) or exception(s) are defined on {name} but off",
+                "They change nothing today. Activating one changes which rows every consumer of "
+                "this report sees, or how they are flagged, without changing any figure - so treat "
+                "it as a content change.",
+                objects=[name],
+                evidence=[p for c in inactive[:_RISK_OBJECTS] for p in _as_list(c.provenance)],
             )
 
     def _chain_risks(
@@ -1655,17 +2162,59 @@ class AnalysisService:
             return
         rate = runtimes.success_rate
         if runtimes.total_runs and rate is not None and rate < _UNRELIABLE_RATE:
+            # The recommendation used to say "investigate the failing step" against a payload that
+            # never named one, so the reader's only lead was `bottleneck_steps` - ranked by
+            # duration,
+            # which on a chain that fails fast is a different step entirely (D65). Now the step is
+            # named, with how often it failed and how long it ran before doing so.
+            failing = runtimes.failed_steps
+            if failing:
+                named = ", ".join(
+                    f"{step.variant or step.process_type} "
+                    f"({step.occurrences}x, {step.state_label.lower()}"
+                    + (f", up to {step.longest_s:.0f}s" if step.longest_s is not None else "")
+                    + ")"
+                    for step in failing[:_NAMED_CHAINS]
+                )
+                recommendation = (
+                    f"Start with the step(s) that actually failed: {named}. "
+                    "These are ranked by how often they failed, not by how long they ran - the "
+                    "slowest step is reported separately and is often not the one that broke."
+                )
+            else:
+                recommendation = (
+                    "No individual step is recorded as failed in the step log for "
+                    "the runs examined, so the failure is at run level (or outside "
+                    "the step window). Check the run log in RSPC directly before "
+                    "relying on anything this chain loads."
+                )
             run.risk(
                 "process_chain",
                 "critical" if rate < _FAILING_RATE else "high",
                 f"{chain.chain_id} succeeded on only {rate:.0%} of its runs",
-                "Investigate the failing step before relying on anything this chain loads.",
-                objects=[chain.chain_id],
-                evidence=list(_as_list(runtimes.provenance)),
+                recommendation,
+                objects=[
+                    chain.chain_id,
+                    *[s.variant for s in failing[:_RISK_OBJECTS] if s.variant],
+                ],
+                # The failing steps' own rows, most specific first: each carries its LOG_ID, TYPE
+                # and
+                # STATE, which is what someone would search RSPC for. Falls back to the chain-level
+                # provenance when no step failed, because then that is genuinely all this rests on.
+                evidence=(
+                    [p for step in failing[:_RISK_OBJECTS] for p in _as_list(step.provenance)]
+                    or list(_as_list(runtimes.provenance))
+                ),
                 metrics={
                     "success_rate": rate,
                     "total_runs": runtimes.total_runs,
                     "successful_runs": runtimes.successful_runs,
+                    "failed_steps": len(failing),
+                    "failed_step_occurrences": sum(s.occurrences for s in failing),
+                    # Counted so a zero failed-step list is not read as "nothing else was wrong":
+                    # skipped and still-running steps are neither successes nor failures.
+                    "indeterminate_steps": runtimes.indeterminate_steps,
+                    "steps_examined": runtimes.steps_examined,
                 },
             )
         stats = runtimes.duration_seconds
@@ -1682,26 +2231,65 @@ class AnalysisService:
                 "medium",
                 f"{chain.chain_id} runtime varies widely between runs",
                 "Treat the p95 rather than the median as the planning number, and check the "
-                "observed overlaps: a chain whose duration triples is usually contending with "
-                "another one.",
+                "contention count below: a chain whose duration triples is usually sharing the "
+                "window with something else.",
                 objects=[chain.chain_id],
+                evidence=list(_as_list(runtimes.provenance)),
                 metrics={"median_s": median, "p95_s": p95},
             )
-        if runtimes.observed_overlap_runs:
+        # Two separate findings, because they were one number wearing the other's caption (D64). A
+        # chain overlapping *itself* is a scheduling fault in that chain; a chain sharing its window
+        # with *others* is contention, and only the second explains a duration that is not the
+        # chain's own cost. The old single risk was titled "at the same time as another chain" and
+        # driven by the self-overlap count, so on a chain contending heavily it reported nothing.
+        if runtimes.self_overlap_runs:
+            run.risk(
+                "process_chain",
+                "high",
+                f"{chain.chain_id} starts again before its previous run has finished",
+                "Check its schedule against its p95 duration: overlapping runs of one chain can "
+                "load the same target twice at once, and its durations are not independent.",
+                objects=[chain.chain_id],
+                evidence=list(_as_list(runtimes.provenance)),
+                metrics={"self_overlap_runs": runtimes.self_overlap_runs},
+            )
+        if runtimes.contended_runs:
             run.risk(
                 "process_chain",
                 "medium",
                 f"{chain.chain_id} was observed running at the same time as another chain",
                 "Its measured durations reflect contention rather than intrinsic cost; do not read "
-                "them as a fixed property.",
-                objects=[chain.chain_id],
-                metrics={"observed_overlap_runs": runtimes.observed_overlap_runs},
+                "them as a fixed property. Contending chains: "
+                + ", ".join(runtimes.contending_chains[:_NAMED_CHAINS]),
+                objects=[chain.chain_id, *runtimes.contending_chains[:_RISK_OBJECTS]],
+                evidence=list(_as_list(runtimes.provenance)),
+                metrics={
+                    "contended_runs": runtimes.contended_runs,
+                    "contending_chains": len(runtimes.contending_chains),
+                },
             )
+        # Slowest and failed are stated as two separate sentences, and the wording keeps them apart
+        # on purpose. They are different questions, and on the validation subject they happened to
+        # have the same answer - its failing loads hung for ~23.5 hours before dying - which is
+        # exactly what hid D65. On a chain that fails fast they differ, and a reader who was handed
+        # only the slowest step would be looking at the wrong one.
         if runtimes.bottleneck_steps:
             slowest = runtimes.bottleneck_steps[0]
             run.say(
-                f"The slowest step is {slowest.variant or slowest.process_type} at "
-                f"{slowest.duration_s:.0f}s."
+                f"The longest-running step is {slowest.variant or slowest.process_type} at "
+                f"{slowest.duration_s:.0f}s (longest, not necessarily failing)."
+            )
+        if runtimes.failed_steps:
+            worst = runtimes.failed_steps[0]
+            duration = f", running up to {worst.longest_s:.0f}s" if worst.longest_s else ""
+            run.say(
+                f"The step that failed most often is {worst.variant or worst.process_type}: "
+                f"{worst.occurrences} failure(s), {worst.state_label.lower()}{duration}."
+            )
+        elif runtimes.steps_examined and runtimes.success_rate not in (None, 1.0):
+            run.say(
+                f"No step is recorded as failed across the {runtimes.steps_examined} step(s) "
+                "examined, so the failure is recorded at run level rather than against a step."
             )
         modes = {p.update_mode for p in (load.providers_loaded if load else []) if p.update_mode}
         if len(modes) > 1:
@@ -1712,6 +2300,11 @@ class AnalysisService:
                 "Confirm the sequencing: a full load and a delta load writing the same targets in "
                 "one chain depend on running in the right order.",
                 objects=[chain.chain_id],
+                evidence=[
+                    p
+                    for loaded in (load.providers_loaded if load else [])[:_RISK_OBJECTS]
+                    for p in _as_list(loaded.provenance)
+                ],
             )
 
     def _change_risks(
@@ -1726,6 +2319,7 @@ class AnalysisService:
                 "Review each one by hand before transporting: these were found by parsing ABAP or "
                 "by resolving a generated table name, and BW will not warn you about them.",
                 objects=[c.ref.name for c in advisory[:10]],
+                evidence=self._consumer_evidence(name, impact),
             )
         queries = [c for c in run.consumers if c.relationship == "consumer_query"]
         if queries:
@@ -1736,6 +2330,7 @@ class AnalysisService:
                 "Re-run each report and compare figures; a shared restricted key figure or "
                 "structure changes every consumer at once.",
                 objects=[c.ref.name for c in queries[:10]],
+                evidence=self._consumer_evidence(name, impact),
             )
         calcviews = [c for c in run.consumers if c.relationship == "consumer_calcview"]
         if calcviews:
@@ -1746,6 +2341,7 @@ class AnalysisService:
                 "Coordinate the change with the HANA side: a calc view reads the generated table "
                 "directly, so a field change breaks it with no BW activation warning.",
                 objects=[c.ref.name for c in calcviews[:10]],
+                evidence=self._consumer_evidence(name, impact),
             )
         if load is not None and load.loading_chains:
             run.risk(
@@ -1756,6 +2352,11 @@ class AnalysisService:
                 "Re-run them in dependency order: "
                 + ", ".join(c.chain_id for c in load.loading_chains[:5]),
                 objects=[c.chain_id for c in load.loading_chains[:5]],
+                evidence=[
+                    p
+                    for cadence in load.loading_chains[:_RISK_OBJECTS]
+                    for p in _as_list(cadence.provenance)
+                ],
             )
         if impact is None:
             run.risk(
@@ -1765,6 +2366,7 @@ class AnalysisService:
                 "Do not transport on the strength of this analysis; resolve the reported "
                 "limitation first.",
                 objects=[name],
+                evidence=self._absence_evidence(name, ("transformation", "dtp")),
             )
 
     # --- next actions ---------------------------------------------------------------------

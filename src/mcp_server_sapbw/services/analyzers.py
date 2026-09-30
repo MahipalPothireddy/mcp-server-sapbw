@@ -20,6 +20,8 @@ Design constraints honoured here:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from ..connectors.base import ConnectorRegistry
@@ -27,7 +29,7 @@ from ..connectors.bi import BiConnector
 from ..connectors.ecc import EccConnector
 from ..models.chains import FrequencyClass, ScheduleMatrixEntry
 from ..models.completeness import COMPLETE, Completeness, bounded
-from ..models.ecc import ExitBranch, ExitInventory
+from ..models.ecc import ExitBranch, ExitInventory, TableOwner
 from ..models.findings import Finding, ScenarioReport, Severity
 from ..models.objects import BwObjectRef, normalise_object_type
 from ..models.provenance import Provenance, UnsupportedResult
@@ -121,6 +123,139 @@ def _clean(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+#: Distinct development packages at or above which an exit's reads are flagged as spanning owners.
+#:
+#: **Three, reasoned from the measured population rather than picked.** On the reference system an
+#: exit reading two packages is the ordinary case and almost always one functional area talking to
+#: itself - a billing extractor reading sales documents sits in ``VF`` and ``VA``, which is not a
+#: coordination risk. At three the reads genuinely leave one area: the industry-solution extractor
+#: that prompted this touches five (``VF``, ``VZ``, ``VA``, ``VKOK`` and its own namespace).
+#: Flagging
+#: at two would fire on most of the 25 satellite programs and make the scenario unreadable, which is
+#: the failure mode that matters - a finding nobody triages is worth less than no finding.
+_CROSS_PACKAGE_OWNERS = 3
+
+#: Packages named in a recommendation before it elides.
+_NAMED_PACKAGES = 4
+
+
+@dataclass(frozen=True)
+class _Ownership:
+    """What was established about who owns the tables one exit reads.
+
+    Keyword-only on construction at every site, so the four positional-looking fields cannot be
+    silently transposed - ``resolved`` and ``spans_owners`` are both booleans, and
+    swapping them would
+    turn "no cross-area read" into "ownership unknown" with nothing failing.
+    """
+
+    resolved: bool
+    by_package: dict[str, list[str]]
+    unresolved: list[str]
+    spans_owners: bool
+    detail: str
+    recommendation: str
+
+
+def _describe_ownership(reads: Sequence[str], owners: dict[str, TableOwner]) -> _Ownership:
+    """Group an exit's table reads by owning package and say whether they cross areas (D67).
+
+    Mission §9.6 asks for a *flag*, and this is what produces it. The previous recommendation -
+    "confirm the table(s) belong to this functional area" - handed the analyst their own question
+    back while both halves of the comparison sat in the finding's metrics.
+
+    **Advisory, and labelled so.** A package is a development-organisation unit: it usually tracks
+    functional ownership and is not guaranteed to, and some packages are shared infrastructure -
+    change documents, address services - so reading one is not reaching into another team's business
+    data. The finding therefore names the packages and their descriptions and lets a reviewer see
+    that for themselves, rather than asserting a verdict the evidence cannot carry.
+    """
+    if not reads:
+        return _Ownership(
+            resolved=False,
+            by_package={},
+            unresolved=[],
+            spans_owners=False,
+            detail="",
+            recommendation="",
+        )
+    by_package: dict[str, list[str]] = {}
+    unresolved: list[str] = []
+    for table in reads:
+        owner = owners.get(table.upper())
+        if owner is None or not owner.package:
+            unresolved.append(table.upper())
+            continue
+        by_package.setdefault(owner.package.upper(), []).append(table.upper())
+    if not by_package:
+        return _Ownership(
+            resolved=False,
+            by_package={},
+            unresolved=unresolved,
+            spans_owners=False,
+            detail="",
+            recommendation="",
+        )
+
+    described = {
+        package: (
+            next(
+                (
+                    owners[t.upper()].package_description
+                    for t in tables
+                    if owners.get(t.upper()) and owners[t.upper()].package_description
+                ),
+                None,
+            )
+        )
+        for package, tables in by_package.items()
+    }
+    ordered = sorted(by_package.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    spans = len(by_package) >= _CROSS_PACKAGE_OWNERS
+
+    def label(package: str) -> str:
+        text = described.get(package)
+        return f"{package} ({text})" if text else package
+
+    summary = "; ".join(
+        f"{label(package)}: {', '.join(sorted(tables))}" for package, tables in ordered
+    )
+    detail = (
+        f" Ownership was read from the source system: these reads span {len(by_package)} "
+        f"development package(s) — {summary}."
+    )
+    if unresolved:
+        detail += (
+            f" {len(unresolved)} table(s) could not be attributed to a package "
+            f"({', '.join(sorted(unresolved)[:6])}), so the owner count is a lower bound."
+        )
+
+    if spans:
+        others = ", ".join(label(package) for package, _ in ordered[:_NAMED_PACKAGES])
+        recommendation = (
+            f" This exit reads data owned by {len(by_package)} different development packages "
+            f"({others}), so a change to any of them can break this extractor and the teams "
+            "involved need to know about each other. Confirm the cross-area reads are intended and "
+            "record the dependency. Advisory: a package is a development-organisation unit, so it "
+            "tracks functional ownership closely but not perfectly, and some packages (change "
+            "documents, address services) are shared infrastructure rather than "
+            "another team's data."
+        )
+    else:
+        recommendation = (
+            f" These reads stay within {len(by_package)} development package(s) ({summary}), so no "
+            "cross-area coordination risk is indicated."
+        )
+    return _Ownership(
+        resolved=True,
+        by_package=by_package,
+        unresolved=unresolved,
+        spans_owners=spans,
+        detail=detail,
+        recommendation=recommendation,
+    )
 
 
 def _exit_index(exits: Any) -> dict[str, list[Any]]:
@@ -1008,10 +1143,15 @@ class Analyzers(Repository):
         candidates = [item.datasource for item in inventory.enhanced if item.datasource]
         exits = None if reason else self._exit_evidence(candidates)
         exit_index = _exit_index(exits)
+        # Ownership resolved once for the whole report rather than per finding: the same tables
+        # recur
+        # across DataSources (49 distinct tables across 25 satellite programs on the reference
+        # system), so per-finding resolution would repeat most of the reads.
+        owners = self._table_owners(exits)
 
         satellite_index = _satellite_index(exits)
         findings = [
-            self._enhancement_finding(item, exit_index, satellite_index, reason)
+            self._enhancement_finding(item, exit_index, satellite_index, reason, owners)
             for item in inventory.enhanced
         ]
         caveats = [
@@ -1035,6 +1175,26 @@ class Analyzers(Repository):
                     "DataSources BW reports as enhanced, so a satellite program serving a "
                     "DataSource with no appended field is not probed and would not appear here."
                 )
+        if owners:
+            packages = {o.package.upper() for o in owners.values() if o.package}
+            caveats.append(
+                f"Table ownership was read from the source system's repository: {len(owners)} "
+                f"table(s) attributed to {len(packages)} development package(s). A read is flagged "
+                f"as crossing functional areas at {_CROSS_PACKAGE_OWNERS} or more "
+                "packages, because two is the ordinary case and almost always one "
+                "area talking to itself. **Advisory**: "
+                "a package is a development-organisation unit, so it tracks functional ownership "
+                "closely but not perfectly, and some packages (change documents, address services) "
+                "are shared infrastructure rather than another team's data."
+            )
+        elif exits is not None:
+            caveats.append(
+                "Table ownership could not be read from the source system, so findings name the "
+                "tables an exit reads without saying who owns them. Ownership is "
+                "never inferred from "
+                "table-name prefixes: a naming convention cannot support an accusation about "
+                "ownership, and it would misfile customer and industry-solution tables."
+            )
         return ScenarioReport(
             scenario="9.6",
             title=SCENARIO_TITLES["9.6"],
@@ -1044,6 +1204,55 @@ class Analyzers(Repository):
             connector_required=inventory.connector_required if reason else None,
             caveats=caveats,
         )
+
+    def _table_owners(self, exits: ExitInventory | None) -> dict[str, TableOwner]:
+        """Which development package each table an exit reads belongs to (D67).
+
+        **The read that turns scenario 9.6 from a question into a finding.** Mission §9.6 requires
+        an
+        enhancement reading another team's data to be *flagged*; with no ownership
+        signal the analyzer
+        could only list the tables and hand the judgement back, which is defect D67 exactly.
+
+        Resolved from the source system's own repository rather than guessed from
+        table-name prefixes.
+        That alternative was considered and rejected: a prefix rule would misfile customer and
+        industry-solution tables, which are a large share of the reads here, and "this reads another
+        team's data" is an accusation about ownership that a naming convention cannot support.
+
+        Returns an empty mapping when the connector is absent or the read fails, in which case the
+        findings fall back to naming the tables without an owner - a smaller answer, never a guessed
+        one.
+        """
+        if exits is None:
+            return {}
+        connector = self._registry.get("ecc")
+        if not isinstance(connector, EccConnector):
+            return {}
+        tables = sorted(
+            {
+                table.upper()
+                for source in exits.exits
+                for branch in source.branches
+                for table in branch.table_reads
+            }
+            | {table.upper() for satellite in exits.satellites for table in satellite.table_reads}
+        )
+        if not tables:
+            return {}
+        try:
+            owners = connector.resolve_owners(tables)
+            texts = connector.resolve_package_texts(
+                sorted({o.package for o in owners.values() if o.package})
+            )
+        except Exception:
+            # Same rule as the exit read itself: a source-system problem degrades the finding, it
+            # does not fail a BW scenario.
+            return {}
+        for owner in owners.values():
+            if owner.package:
+                owner.package_description = texts.get(owner.package.upper())
+        return owners
 
     def _exit_evidence(self, datasources: list[str] | None = None) -> ExitInventory | None:
         """Read the extractor-exit ABAP, or ``None`` when the connector cannot supply it."""
@@ -1063,6 +1272,7 @@ class Analyzers(Repository):
         exit_index: dict[str, list[Any]],
         satellite_index: dict[str, list[Any]],
         reason: str | None,
+        owners: dict[str, TableOwner] | None = None,
     ) -> Finding:
         entries = exit_index.get(item.datasource, [])
         satellites = satellite_index.get(item.datasource, [])
@@ -1093,7 +1303,7 @@ class Analyzers(Repository):
         )
         if confirmed:
             suffix, severity, recommendation = self._exit_evidence_detail(
-                entries, live_satellites, metrics, severity
+                entries, live_satellites, metrics, severity, owners
             )
             detail += suffix
         elif reason is None:
@@ -1118,8 +1328,10 @@ class Analyzers(Repository):
         live_satellites: list[Any],
         metrics: dict[str, Any],
         severity: Severity,
+        owners: dict[str, TableOwner] | None = None,
     ) -> tuple[str, Severity, str]:
         """Describe what the exit code does for one DataSource, and re-rate it accordingly."""
+        owners = owners or {}
         reads, per_record, resolved = _exit_risk(entries)
         satellite_names = sorted(s.program_name for s in live_satellites)
         code_ids = sorted({code_id for code_id, _ in entries})
@@ -1164,6 +1376,14 @@ class Analyzers(Repository):
                 "an sy-subrc check counts as guarded and is not detected."
             )
 
+        # Ownership, which is what lets this say who the tables belong to instead of asking (D67).
+        ownership = _describe_ownership(reads, owners)
+        if ownership.resolved:
+            metrics["exit_table_packages"] = ownership.by_package
+            metrics["exit_distinct_owners"] = len(ownership.by_package)
+            metrics["exit_owners_unresolved"] = ownership.unresolved
+            detail += ownership.detail
+
         recommendation = (
             "Review the source-system exit for this DataSource: confirm which tables it reads (a "
             "read into another team's data is a coordination risk) and whether it does per-record "
@@ -1178,14 +1398,22 @@ class Analyzers(Repository):
             )
             recommendation = (
                 "Rework the per-record SELECT(s) in the exit into a single set-based read before "
-                "the loop (FOR ALL ENTRIES or a sorted buffer table). Confirm the table(s) read "
-                f"belong to this functional area: {', '.join(reads) or 'none'}."
-            )
+                "the loop (FOR ALL ENTRIES or a sorted buffer table)."
+            ) + ownership.recommendation
         elif resolved:
             recommendation = (
-                "Confirm the table(s) the exit code reads belong to this functional area — a read "
-                f"into another team's data is a coordination risk: {', '.join(reads) or 'none'}."
+                ownership.recommendation.lstrip()
+                if ownership.resolved
+                else (
+                    "Confirm the table(s) the exit code reads belong to this functional area — a "
+                    f"read into another team's data is a coordination risk: "
+                    f"{', '.join(reads) or 'none'}."
+                )
             )
+        if ownership.spans_owners:
+            # Raised because the finding now *states* a cross-area read rather than asking about
+            # one.
+            severity = "high" if severity in ("low", "medium") else severity
         return detail, severity, recommendation
 
     @staticmethod

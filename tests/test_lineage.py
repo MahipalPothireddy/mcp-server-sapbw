@@ -27,6 +27,11 @@ SCHEMA = "TESTSCHEMA"
 _TABLES = {
     "transformation": "RSTRAN",
     "transformation_step_rout": "RSTRANSTEPROUT",
+    # The typed rule-step tables. BW records a declared lookup here and nowhere else, and a
+    # declared lookup has no SELECT to parse, so an ABAP-only reader cannot see it (D15).
+    "transformation_step_master": "RSTRANSTEPMASTER",
+    "transformation_step_dso": "RSTRANSTEPODSO",
+    "transformation_step_adso": "RSTRANSTEPADSO",
     "routine_source": "RSAABAP",
     "dtp": "RSBKDTP",
     # The provider catalogue, so an object no transformation touches can still be typed.
@@ -50,10 +55,13 @@ _TRANS_BY_SOURCE = {
     "DS_SALES": [("SALES_DSO", "ODSO", "TR1")],
     "SALES_DSO": [("SALES_CUBE", "CUBE", "TR2")],
     "SALES_CUBE": [(_QUERY_ELEMENT, "ELEM", "TR3")],
+    # BW stores TR4's source as the DTP id, so this is how the row reads from the source side too.
+    "DTP_CUBE_SELF": [("SALES_CUBE", "CUBE", "TR4")],
 }
 _TRANS_BY_TARGET = {
     "SALES_DSO": [("DS_SALES", "RSDS", "TR1")],
-    "SALES_CUBE": [("SALES_DSO", "ODSO", "TR2")],
+    # TR4 is the self-transformation whose stored source is a DTP id, not an object (see _SELF_DTP).
+    "SALES_CUBE": [("SALES_DSO", "ODSO", "TR2"), ("DTP_CUBE_SELF", "DTPA", "TR4")],
     _QUERY_ELEMENT: [("SALES_CUBE", "CUBE", "TR3")],
 }
 # TRANID -> header row (12 cols): OBJSTAT, SRCTYPE, SRCSUB, SRCNAME, TGTTYPE, TGTSUB, TGTNAME,
@@ -62,14 +70,57 @@ _HEADER = {
     "TR1": ("ACT", "RSDS", "", "DS_SALES", "ODSO", "", "SALES_DSO", "", "", "", "", ""),
     "TR2": ("ACT", "ODSO", "", "SALES_DSO", "CUBE", "", "SALES_CUBE", "CODE_TR2", "", "", "", ""),
     "TR3": ("ACT", "CUBE", "", "SALES_CUBE", "ELEM", "", _QUERY_ELEMENT, "", "", "", "", ""),
+    "TR4": ("ACT", "DTPA", "", "DTP_CUBE_SELF", "CUBE", "", "SALES_CUBE", "", "", "", "", ""),
 }
+# --- DTPs (D18) ---------------------------------------------------------------------------------
+#
+# Tuples are (DTP id, other object, other TLOGO, UPDMODE). The id is carried because BW routinely
+# runs several active DTPs between one pair - a repair/init full beside the regular delta - and
+# collapsing them to one edge threw the ids away, so a load path could not be named. On the
+# production ADSO that found D18, eight inbound DTPs were reported as one.
+#
+# SALES_DSO -> SALES_CUBE has two: the regular delta and a repair full.
 _DTP_BY_SRC = {
-    "DS_SALES": [("SALES_DSO", "ODSO", "F")],
-    "SALES_DSO": [("SALES_CUBE", "CUBE", "D")],
+    "DS_SALES": [("DTP_DS_TO_DSO", "SALES_DSO", "ODSO", "F")],
+    "SALES_DSO": [
+        ("DTP_DSO_TO_CUBE", "SALES_CUBE", "CUBE", "D"),
+        ("DTP_DSO_TO_CUBE_REPAIR", "SALES_CUBE", "CUBE", "F"),
+    ],
+    "SALES_CUBE": [("DTP_CUBE_SELF", "SALES_CUBE", "CUBE", "F")],
 }
 _DTP_BY_TGT = {
-    "SALES_DSO": [("DS_SALES", "RSDS", "F")],
-    "SALES_CUBE": [("SALES_DSO", "ODSO", "D")],
+    "SALES_DSO": [("DTP_DS_TO_DSO", "DS_SALES", "RSDS", "F")],
+    "SALES_CUBE": [
+        ("DTP_DSO_TO_CUBE", "SALES_DSO", "ODSO", "D"),
+        ("DTP_DSO_TO_CUBE_REPAIR", "SALES_DSO", "ODSO", "F"),
+        ("DTP_CUBE_SELF", "SALES_CUBE", "CUBE", "F"),
+    ],
+    # ERR_TARGET is loaded by a normal DTP and by an error DTP whose SRC is that DTP's name.
+    "ERR_TARGET": [
+        ("DTP_ERR_PARENT", "ERR_SOURCE", "ODSO", "D"),
+        ("DTP_ERR_CHILD", "DTP_ERR_PARENT", "DTPA", "F"),
+    ],
+}
+
+# A self-transformation, stored the way BW stores one: SOURCETYPE is 'DTPA' and SOURCENAME is the
+# *DTP's* technical name, not an object. Resolving it needs RSBKDTP. Left unresolved the graph gains
+# a node named after a DTP where the real source object belongs - which is what D18 reported on
+# production, a DTP id sitting in the dependency list where the ADSO's own name should have been.
+_SELF_DTP = "DTP_CUBE_SELF"
+
+# An error DTP and the parent whose error stack it reads. BW stores the error DTP's SRC as the
+# parent DTP's *name*, so this is the second place a DTP id lands where an object belongs - reached
+# through the DTP reader, not the transformation reader, which is why fixing one did not fix both.
+_PARENT_DTP = "DTP_ERR_PARENT"
+_ERROR_DTP = "DTP_ERR_CHILD"
+
+_DTP_HEADER = {  # DTP id -> (SRC, SRCTLOGO, TGT, TGTTLOGO, UPDMODE)
+    "DTP_DS_TO_DSO": ("DS_SALES", "RSDS", "SALES_DSO", "ODSO", "F"),
+    "DTP_DSO_TO_CUBE": ("SALES_DSO", "ODSO", "SALES_CUBE", "CUBE", "D"),
+    "DTP_DSO_TO_CUBE_REPAIR": ("SALES_DSO", "ODSO", "SALES_CUBE", "CUBE", "F"),
+    _SELF_DTP: ("SALES_CUBE", "CUBE", "SALES_CUBE", "CUBE", "F"),
+    _PARENT_DTP: ("ERR_SOURCE", "ODSO", "ERR_TARGET", "ADSO", "D"),
+    _ERROR_DTP: (_PARENT_DTP, "DTPA", "ERR_TARGET", "ADSO", "F"),
 }
 _RSAABAP = {
     "CODE_TR2": [
@@ -78,6 +129,27 @@ _RSAABAP = {
         "ENDMETHOD.",
     ]
 }
+
+# --- declared lookups (D15) -------------------------------------------------------------------
+#
+# TR2 (SALES_DSO -> SALES_CUBE) declares two lookups in BW's typed rule-step tables. Neither object
+# is mentioned anywhere in _RSAABAP, and that is the whole point: BW states these reads outright, so
+# a reader that only parses ABAP SELECTs is blind to them however good its parser is.
+#
+# RATE_ADSO is the analogue of the production case behind D15 - BW's own 'Used by:' list names the
+# transformation, our consumer list did not.
+_LOOKUP_ADSO = "RATE_ADSO"
+_LOOKUP_IOBJ = "COST_CENTRE"
+
+# RULEID, STEPID, ADSONM, BEHAVIOR, CONSTANT   ('C' = substitute a constant on a miss)
+_ADSO_STEP_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {
+    "TR2": [(2, 1, _LOOKUP_ADSO, "C", "0.00")]
+}
+# RULEID, STEPID, IOBJNM, MPER, DATEIOBJNM, CONSTANT
+_MASTER_STEP_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {
+    "TR2": [(3, 1, _LOOKUP_IOBJ, "2", "POSTING_DATE", "")]
+}
+_DSO_STEP_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {}
 
 
 class ScriptedConnection:
@@ -89,6 +161,13 @@ class ScriptedConnection:
             return self._dtp(sql, params)
         if "RSTRANSTEPROUT" in sql:
             return []  # no field routines in this landscape
+        # Checked before RSTRAN: every one of these names contains it as a substring.
+        if "RSTRANSTEPADSO" in sql:
+            return self._step_lookup(sql, params, _ADSO_STEP_LOOKUPS, "ADSONM")
+        if "RSTRANSTEPODSO" in sql:
+            return self._step_lookup(sql, params, _DSO_STEP_LOOKUPS, "ODSOBJECT")
+        if "RSTRANSTEPMASTER" in sql:
+            return self._step_lookup(sql, params, _MASTER_STEP_LOOKUPS, "IOBJNM")
         if "RSAABAP" in sql:
             return self._rsaabap(sql, params)
         if "RSDCUBEIOBJ" in sql:
@@ -106,24 +185,64 @@ class ScriptedConnection:
 
     @staticmethod
     def _dtp(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        # Resolving a DTPA-typed transformation endpoint: DTP id -> its own source.
+        if "DTP IN (" in sql:
+            requested = {str(p) for p in params}
+            return [
+                (dtp, row[0], row[1], row[2], row[3])  # DTP, SRC, SRCTLOGO, TGT, TGTTLOGO
+                for dtp, row in sorted(_DTP_HEADER.items())
+                if dtp in requested
+            ]
         # Batched frontier prefetch: keyed by the whole BFS level, so the key column is selected
         # too and every row says which requested name it belongs to.
         if "SRC IN (" in sql:
             return [
-                (name, t, ty, um)
+                (name, t, ty, um, d)
                 for name in map(str, params)
-                for t, ty, um in _DTP_BY_SRC.get(name, [])
+                for d, t, ty, um in _DTP_BY_SRC.get(name, [])
             ]
         if "TGT IN (" in sql:
             return [
-                (name, s, ty, um)
+                (name, s, ty, um, d)
                 for name in map(str, params)
-                for s, ty, um in _DTP_BY_TGT.get(name, [])
+                for d, s, ty, um in _DTP_BY_TGT.get(name, [])
             ]
         name = str(params[0])
         if "SRC = ?" in sql:
-            return [(t, ty, um) for t, ty, um in _DTP_BY_SRC.get(name, [])]
-        return [(s, ty, um) for s, ty, um in _DTP_BY_TGT.get(name, [])]
+            return [(t, ty, um, d) for d, t, ty, um in _DTP_BY_SRC.get(name, [])]
+        return [(s, ty, um, d) for d, s, ty, um in _DTP_BY_TGT.get(name, [])]
+
+    @staticmethod
+    def _step_lookup(
+        sql: str,
+        params: list[Any],
+        rows_by_tran: dict[str, list[tuple[Any, ...]]],
+        name_column: str,
+    ) -> list[tuple[Any, ...]]:
+        """Serve a typed rule-step table in its three query shapes.
+
+        The stored tuple is ``(RULEID, STEPID, <object>, ...)`` - the order the per-transformation
+        reader selects. The reverse and batched shapes select different columns, so each is
+        projected explicitly rather than returned wholesale; a fixture that ignored the column list
+        would let a wrong ``build_select`` pass.
+        """
+        if f"{name_column} = ?" in sql:  # reverse: who looks this object up?
+            wanted = str(params[0])
+            return [
+                (tran_id, row[0], row[1])  # TRANID, RULEID, STEPID
+                for tran_id, rows in sorted(rows_by_tran.items())
+                for row in rows
+                if str(row[2]) == wanted
+            ]
+        if "TRANID IN (" in sql:  # batched forward: what do these transformations look up?
+            requested = {str(p) for p in params}
+            return [
+                (tran_id, row[2], row[0], row[1])  # TRANID, <object>, RULEID, STEPID
+                for tran_id, rows in sorted(rows_by_tran.items())
+                if tran_id in requested
+                for row in rows
+            ]
+        return list(rows_by_tran.get(str(params[0]), []))  # per-transformation forward read
 
     @staticmethod
     def _rsaabap(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
@@ -196,8 +315,15 @@ def test_downstream_lineage_declared_edges() -> None:
     assert {"DS_SALES", "SALES_DSO", "SALES_CUBE"} <= names
     by_pair = {(e.src, e.dst): e for e in graph.edges}
     assert by_pair[("DS_SALES", "SALES_DSO")].update_mode == "full"
-    assert by_pair[("SALES_DSO", "SALES_CUBE")].update_mode == "delta"
+    assert by_pair[("DS_SALES", "SALES_DSO")].update_modes == ["full"]
     assert by_pair[("DS_SALES", "SALES_DSO")].transformation_id == "TR1"
+    # SALES_DSO -> SALES_CUBE carries a delta and a repair full (see the DTP fixture), so the scalar
+    # is 'full': it is the more operationally significant of the two, which is the D13 rule. This
+    # asserted 'delta' while the landscape had one DTP on the pair; the second one was added for
+    # D18, and reading 'delta' now would mean the repair load had been dropped.
+    both = by_pair[("SALES_DSO", "SALES_CUBE")]
+    assert set(both.update_modes) == {"full", "delta"}
+    assert both.update_mode == "full"
 
 
 def test_upstream_lineage_includes_routine_lookup() -> None:
@@ -229,6 +355,164 @@ def test_impact_analysis_finds_routine_embedded_consumer() -> None:
     ]
     assert consumer_edges and consumer_edges[0].confidence == "advisory"
     assert impact.affected_object_count >= 1
+
+
+# --- declared lookups (D15) -------------------------------------------------------------------
+#
+# The routine tests above cover the heuristic half of lookup discovery. These cover the exact half:
+# a lookup BW *declares* in RSTRANSTEPADSO/ODSO/MASTER, with no SELECT anywhere for a parser to
+# find. Round 2 of the S01 human verification found BW's own 'Used by:' list naming a transformation
+# that our consumer list omitted entirely, because lineage only ever asked the ABAP parser.
+
+
+def test_impact_analysis_finds_declared_lookup_consumer() -> None:
+    """D15: a transformation declaring a lookup against the root is a consumer of it.
+
+    RATE_ADSO has no declared data-flow edge and appears in no ABAP, so the routine parser cannot
+    reach it. Only RSTRANSTEPADSO records that TR2 reads it, and TR2's target is SALES_CUBE.
+    """
+    impact = _service().impact_analysis(_LOOKUP_ADSO, depth=3)
+    assert not isinstance(impact, UnsupportedResult)
+
+    names = {n.name for n in impact.graph.nodes}
+    assert "SALES_CUBE" in names, "the transformation declaring the lookup was not reported"
+
+    edges = [
+        e
+        for e in impact.graph.edges
+        if e.kind == "declared_lookup" and e.src == _LOOKUP_ADSO and e.dst == "SALES_CUBE"
+    ]
+    assert edges, "expected a declared_lookup edge to the looking-up transformation's target"
+    edge = edges[0]
+    # The distinction that matters: BW states this, so it is exact, not a lower bound.
+    assert edge.derivation == "declared"
+    assert edge.confidence == "exact"
+    assert edge.transformation_id == "TR2"
+    assert edge.evidence is not None
+    assert edge.evidence.basis == "observed"
+    assert edge.evidence.method == "declared_lookup_rule"
+    assert edge.evidence.completeness == "complete"
+    # It must not be filed under the advisory routine bucket, which is what a caller filters on to
+    # decide how far to trust an edge.
+    assert _LOOKUP_ADSO not in impact.routine_lookup_consumers
+    assert "SALES_CUBE" not in impact.routine_lookup_consumers
+
+
+def test_declared_lookup_consumers_cover_master_data_reads() -> None:
+    """A master-data read is the same relation against an InfoObject, and must behave the same."""
+    impact = _service().impact_analysis(_LOOKUP_IOBJ, depth=3)
+    assert not isinstance(impact, UnsupportedResult)
+    edges = [e for e in impact.graph.edges if e.kind == "declared_lookup"]
+    assert any(e.src == _LOOKUP_IOBJ and e.dst == "SALES_CUBE" for e in edges)
+    assert all(e.confidence == "exact" for e in edges)
+
+
+def test_upstream_lineage_reports_declared_lookups_as_exact() -> None:
+    """The same relation upstream: what SALES_CUBE's inbound transformation reads.
+
+    Both halves must appear and stay distinguishable - the ABAP-derived LOOKUP_DSO as advisory, the
+    BW-declared RATE_ADSO as exact. Reporting a declared read as advisory understates what is known.
+    """
+    graph = _service().get_lineage("SALES_CUBE", direction="upstream", depth=3)
+    assert not isinstance(graph, UnsupportedResult)
+
+    names = {n.name for n in graph.nodes}
+    assert _LOOKUP_ADSO in names
+    assert "LOOKUP_DSO" in names  # the routine-parsed one still works
+
+    by_kind = {(e.kind, e.src): e for e in graph.edges if e.dst == "SALES_CUBE"}
+    declared = by_kind.get(("declared_lookup", _LOOKUP_ADSO))
+    assert declared is not None
+    assert declared.confidence == "exact"
+    assert declared.derivation == "declared"
+
+    routine = by_kind.get(("routine_lookup", "LOOKUP_DSO"))
+    assert routine is not None
+    assert routine.confidence == "advisory"
+
+
+def test_declared_lookups_are_absent_when_the_release_lacks_the_step_tables() -> None:
+    """An empty result must mean 'none declared', never 'this release could not be asked'."""
+    present = set(_TABLES) - {
+        "transformation_step_master",
+        "transformation_step_dso",
+        "transformation_step_adso",
+    }
+    impact = _service(present).impact_analysis(_LOOKUP_ADSO, depth=3)
+    assert not isinstance(impact, UnsupportedResult)
+    assert not [e for e in impact.graph.edges if e.kind == "declared_lookup"]
+    assert any("declared lookup" in c.lower() for c in impact.caveats), (
+        "a release that cannot be asked about declared lookups must say so"
+    )
+
+
+# --- DTP reporting (D18) --------------------------------------------------------------------------
+
+
+def test_a_dtp_sourced_self_transformation_names_the_object_not_the_dtp() -> None:
+    """D18: BW stores a self-transformation's source as a DTP id; the graph reported it verbatim.
+
+    On the production ADSO that found this, the dependency list held a DTP technical name where the
+    ADSO's own name belonged - a DTP is not a data source, so the answer named the wrong class of
+    thing. RSBKDTP resolves it: the DTP's SRC is the real source object.
+    """
+    graph = _service().get_lineage("SALES_CUBE", direction="upstream", depth=2)
+    assert not isinstance(graph, UnsupportedResult)
+    names = {n.name for n in graph.nodes}
+    assert _SELF_DTP not in names, "a DTP id is standing in for a source object"
+    # TR4 is SALES_CUBE -> SALES_CUBE, so resolving it must yield the self-loop.
+    self_edges = [e for e in graph.edges if e.transformation_id == "TR4"]
+    assert self_edges, "the self-transformation disappeared instead of being resolved"
+    assert all(e.src == "SALES_CUBE" for e in self_edges)
+
+
+def test_the_resolved_endpoint_still_names_the_dtp_it_came_from() -> None:
+    """Resolving must not lose the DTP: it is how an operator finds the load to re-run."""
+    graph = _service().get_lineage("SALES_CUBE", direction="upstream", depth=2)
+    assert not isinstance(graph, UnsupportedResult)
+    edge = next(e for e in graph.edges if e.transformation_id == "TR4")
+    assert _SELF_DTP in edge.dtp_ids
+
+
+def test_every_dtp_between_a_pair_is_named_not_just_one() -> None:
+    """D18's other half: SALES_DSO -> SALES_CUBE runs a delta and a repair full.
+
+    The pair is deliberately one edge - that is the D13 fix, which accumulates update modes rather
+    than letting row order pick one - but the DTP ids were discarded, so no load could be named.
+    """
+    graph = _service().get_lineage("SALES_DSO", direction="downstream", depth=1)
+    assert not isinstance(graph, UnsupportedResult)
+    edge = next(e for e in graph.edges if e.src == "SALES_DSO" and e.dst == "SALES_CUBE")
+    assert set(edge.dtp_ids) == {"DTP_DSO_TO_CUBE", "DTP_DSO_TO_CUBE_REPAIR"}
+    assert edge.dtp_ids == sorted(edge.dtp_ids), "capped/compared reads need a stated order"
+    # The D13 behaviour must survive: both modes present, full reported as the significant one.
+    assert set(edge.update_modes) == {"full", "delta"}
+    assert edge.update_mode == "full"
+
+
+def test_an_error_dtp_endpoint_is_dereferenced_like_a_transformation_one() -> None:
+    """The other path that puts a DTP name where an object belongs.
+
+    An error DTP's own endpoint is the *parent* DTP's error stack, so RSBKDTP hands back a DTP name.
+    Fixing only the transformation case left this one reporting a load as a data source - which is
+    what the first re-seal after the D18 fix still showed on production.
+    """
+    graph = _service().get_lineage("ERR_TARGET", direction="upstream", depth=2)
+    assert not isinstance(graph, UnsupportedResult)
+    names = {n.name for n in graph.nodes}
+    assert _PARENT_DTP not in names, "a DTP id is standing in for a source object"
+    assert "ERR_SOURCE" in names, "the parent DTP's own source was not resolved through"
+    edge = next(e for e in graph.edges if e.dst == "ERR_TARGET" and e.src == "ERR_SOURCE")
+    # Both the error DTP and the parent it reads through stay nameable.
+    assert _ERROR_DTP in edge.dtp_ids
+    assert _PARENT_DTP in edge.dtp_ids
+
+
+def test_dtp_ids_are_empty_rather_than_wrong_when_the_release_has_no_dtp_table() -> None:
+    present = set(_TABLES) - {"dtp"}
+    graph = _service(present).get_lineage("DS_SALES", direction="downstream", depth=1)
+    assert not isinstance(graph, UnsupportedResult)
+    assert all(e.dtp_ids == [] for e in graph.edges)
 
 
 def test_unsupported_without_transformation() -> None:
@@ -373,14 +657,20 @@ _FAN_BY_TARGET = {
 # pairs on a production system. Full is listed *first* so that a last-row-wins implementation - the
 # D13 behaviour - reports 'delta' and fails the assertions below, rather than arriving at 'full' by
 # luck of the ordering.
+# Tuples are (other, TLOGO, UPDMODE, DTP id) here - the shape the reader returns - because these
+# fixtures are consumed positionally by the statement-count tests below.
 _FAN_DTP_BY_SRC = {
-    "HUB": [("A1", "ODSO", "F"), ("A1", "ODSO", "D"), ("A2", "ODSO", "D")],
-    "A1": [("B1", "CUBE", "D")],
+    "HUB": [
+        ("A1", "ODSO", "F", "DTP_HUB_A1_REPAIR"),
+        ("A1", "ODSO", "D", "DTP_HUB_A1"),
+        ("A2", "ODSO", "D", "DTP_HUB_A2"),
+    ],
+    "A1": [("B1", "CUBE", "D", "DTP_A1_B1")],
 }
 _FAN_DTP_BY_TGT = {
-    "A1": [("HUB", "ODSO", "F"), ("HUB", "ODSO", "D")],
-    "A2": [("HUB", "ODSO", "D")],
-    "B1": [("A1", "ODSO", "D")],
+    "A1": [("HUB", "ODSO", "F", "DTP_HUB_A1_REPAIR"), ("HUB", "ODSO", "D", "DTP_HUB_A1")],
+    "A2": [("HUB", "ODSO", "D", "DTP_HUB_A2")],
+    "B1": [("A1", "ODSO", "D", "DTP_A1_B1")],
 }
 
 
@@ -429,17 +719,19 @@ class FanOutConnection:
 
     @staticmethod
     def _dtp(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        if "DTP IN (" in sql:
+            return []  # no DTP-sourced transformations in this landscape
         if "SRC IN (" in sql:
             return [
-                (name, t, ty, um)
+                (name, t, ty, um, d)
                 for name in map(str, params)
-                for t, ty, um in _FAN_DTP_BY_SRC.get(name, [])
+                for t, ty, um, d in _FAN_DTP_BY_SRC.get(name, [])
             ]
         if "TGT IN (" in sql:
             return [
-                (name, s, ty, um)
+                (name, s, ty, um, d)
                 for name in map(str, params)
-                for s, ty, um in _FAN_DTP_BY_TGT.get(name, [])
+                for s, ty, um, d in _FAN_DTP_BY_TGT.get(name, [])
             ]
         name = str(params[0]) if params else ""
         if "SRC = ?" in sql:

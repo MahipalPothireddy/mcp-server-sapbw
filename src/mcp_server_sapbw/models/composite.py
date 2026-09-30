@@ -285,3 +285,48 @@ def composite_mapping_evidence(part_kind: CompositePartKind) -> Evidence:
             "name."
         ),
     )
+
+
+def multiprovider_identification_evidence(*, renamed: bool) -> Evidence:
+    """Evidence for a hop taken through a MultiProvider's InfoObject identification.
+
+    Exact rather than advisory, and for the same reason the CompositeProvider hop is: this is BW's
+    own stored identification on ``RSDICMULTIIOBJ``, read row by row, not a naming convention
+    applied to the provider's field. ``renamed`` is surfaced because it is the case a same-name
+    assumption would have got wrong, so a reader can see that the mapping was actually consulted
+    rather than guessed - measured at 66 of 5,372 active rows on the reference system.
+    """
+    return evidence_for(
+        "multiprovider_identification",
+        "declared",
+        detail=(
+            "Read from the MultiProvider's own InfoObject identification on RSDICMULTIIOBJ, which "
+            "names the part providing this field and the field's name inside that part."
+            + (
+                " Identification maps it to a DIFFERENTLY named field in the part, so following the"
+                " provider's own field name into the part would have been wrong here."
+                if renamed
+                else " Identification maps it to the same field name in the part."
+            )
+        ),
+    )
+
+
+def reference_characteristic_evidence() -> Evidence:
+    """Evidence for a hop that crosses from a reference characteristic to the one it references.
+
+    Exact rather than advisory, for the same reason the two hops above are: ``RSDCHA.CHABASNM``
+    states the reference outright. Nothing here is derived from a table name - which matters,
+    because the *constructed* route to the same fact is the one that gets it wrong (a reference
+    characteristic's master-data table does not carry its own name), and that was the whole of D35.
+    """
+    return evidence_for(
+        "reference_characteristic",
+        "declared",
+        detail=(
+            "RSDCHA.CHABASNM names the characteristic this one references. A reference "
+            "characteristic owns no master data: its attribute, SID, text and view tables belong "
+            "to the referenced characteristic, and no transformation loads into it, so the field "
+            "populated there."
+        ),
+    )

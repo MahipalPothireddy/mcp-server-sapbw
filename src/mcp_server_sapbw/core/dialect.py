@@ -74,6 +74,20 @@ def _record_read(logical: str) -> None:
         observed.add(logical)
 
 
+def record_capability_read(logical: str) -> None:
+    """Record a read of ``logical`` that did not go through :meth:`SqlDialect.build_select`.
+
+    The escape hatch for the handful of statements the builder cannot express - an aliased join, for
+    instance. Without it the capability contract reports such a table as *declared but never read*,
+    which is the opposite of the truth, and would push someone to delete a load-bearing table.
+
+    Call it with the same logical name the statement resolves, and take the physical name from the
+    capability record rather than writing a literal - otherwise the contract measures one thing
+    while the SQL does another.
+    """
+    _record_read(logical)
+
+
 @contextmanager
 def record_reads() -> Iterator[set[str]]:
     """Collect the logical tables read inside the block.
@@ -145,14 +159,24 @@ def record_tool_reads(tool: str) -> Iterator[None]:
 
 
 def needs_active_version(physical_table: str) -> bool:
-    """True when a physical table name belongs to an OBJVERS-versioned family.
+    """True when a physical table name belongs to an OBJVERS-versioned family, **by name**.
 
-    Member tables in ``_NO_OBJVERS_TABLES`` match the prefix but have no OBJVERS column, so they
-    are excluded (injecting ``OBJVERS = 'A'`` there would reference a non-existent column).
+    The fallback for when the column list was never measured. It is a naming convention and it was
+    wrong in both directions (D49): ``RSPC*``, ``RSEC*``, ``RSA*`` and the 3.x ``RSUPD*``/``RSTS*``
+    families all carry ``OBJVERS`` and match none of the four prefixes, so **30 declared tables got
+    no filter at all**; and three tables match a prefix without having the column, which is why
+    :data:`_NO_OBJVERS_TABLES` exists. :meth:`SqlDialect.active_version_column` prefers the measured
+    column set and only falls back here.
     """
     if physical_table.upper() in _NO_OBJVERS_TABLES:
         return False
     return _ACTIVE_VERSION_PREFIX.match(physical_table) is not None
+
+
+#: The version column. :meth:`SqlDialect._active_version_needed` skips injection when a ``where``
+#: already constrains it. Matching on the column name rather than a full condition is deliberate: a
+#: reader filtering ``OBJVERS IN ('A','M')`` on purpose must not get ``= 'A'`` bolted underneath.
+_OBJVERS = "OBJVERS"
 
 
 def quote_ident(name: str) -> str:
@@ -220,6 +244,76 @@ class SqlDialect:
             return physical, f"{quote_ident(status.schema_name)}.{quote_ident(physical)}"
         return physical, quote_ident(physical)
 
+    def _active_version_needed(
+        self, logical: str, physical: str, conditions: Sequence[str]
+    ) -> bool:
+        """Whether to inject ``OBJVERS = 'A'``, deciding from the measured column set (D49).
+
+        Mission Rule 6 is "active version only unless explicitly comparing", and it was enforced by
+        a **name prefix** - ``RSD``/``RSO``/``RSZ``/``RSTRAN``. That got it wrong both ways. Thirty
+        declared tables carry ``OBJVERS`` and match no prefix, so the filter was simply absent:
+        process chains, analysis authorisations, the ABAP source table and the BW 3.x stack.
+        Measured on the reference system this is not cosmetic - ``RSPCCHAIN`` holds 3,616 active
+        rows out of 15,960, and **129 chain steps exist in the modified version and not the active
+        one, 111 of them load steps**, so a load closure could attribute loads a chain never
+        performs. The symptom that exposed it was a step-category total of exactly double the step
+        count. In the other direction, three tables match a prefix and lack the column, which is
+        what :data:`_NO_OBJVERS_TABLES` was invented to patch.
+
+        Reading the column set instead makes the decision a measurement. Twenty-five call sites
+        already added the condition by hand and stay correct; the condition is skipped when the
+        ``where`` already constrains the column, so those do not get it twice - and a reader that
+        deliberately asks for several versions is not overruled.
+
+        Falls back to the name prefix when the columns were never measured, so a release whose
+        ``DD03L`` could not be read behaves exactly as before.
+        """
+        if any(_OBJVERS in condition.upper() for condition in conditions):
+            return False
+        status = self._capability.table(logical) if self._capability else None
+        if status is not None and status.columns_known:
+            return status.has_column(_OBJVERS)
+        return needs_active_version(physical)
+
+    def _check_columns(
+        self, logical: str, physical: str, columns: Sequence[str] | None
+    ) -> None:
+        """Refuse a SELECT naming a column this release does not have (D45).
+
+        Only **bare upper-case identifiers** are checked. A ``columns`` list legitimately contains
+        expressions the dialect passes through verbatim - measured across the source: ``COUNT(*)``,
+        ``MAX(DATUM)``, ``SUM(MEMORY_SIZE_IN_TOTAL)``, ``DISTINCT CHAIN_ID``, ``LENGTH(CDATA)`` and
+        table-qualified names like ``V.DOMNAME``, 59 of them in all. Validating those would break
+        every aggregate read in the server, so anything that is not a plain identifier is left alone
+        and stays the caller's responsibility.
+
+        Silent when the column list was never measured, which is what makes this safe to add to a
+        path every read goes through: an unreadable ``DD03L`` degrades to today's behaviour rather
+        than to a server that refuses everything.
+
+        The error names the table, the column and the release, because the failure this replaces was
+        ``invalid column name: PARENT_AREA: line 1 col 18`` - true, and useless for deciding whether
+        the release is different or the server is wrong.
+        """
+        if self._capability is None or not columns:
+            return
+        status = self._capability.table(logical)
+        if status is None or not status.columns_known:
+            return
+        missing = [
+            column
+            for column in columns
+            if column.isidentifier() and column == column.upper()
+            and not status.has_column(column)
+        ]
+        if missing:
+            raise DialectError(
+                f"{physical} on {self._capability.bw_release} has no column(s) "
+                f"{', '.join(missing)} (logical table '{logical}'). This is a release difference, "
+                "not a malformed query: check the dictionary for the equivalent column on this "
+                "release rather than assuming the name used on another one."
+            )
+
     def build_select(
         self,
         *,
@@ -238,12 +332,13 @@ class SqlDialect:
         """
         _record_read(from_logical)
         physical, qualified = self._resolve(from_logical)
+        self._check_columns(from_logical, physical, columns)
         column_list = ", ".join(columns) if columns else "*"
         conditions: list[str] = list(where or [])
         out_params: list[Any] = list(params or [])
 
-        if not compare_versions and needs_active_version(physical):
-            conditions.append("OBJVERS = 'A'")
+        if not compare_versions and self._active_version_needed(from_logical, physical, conditions):
+            conditions.append(f"{_OBJVERS} = 'A'")
 
         parts = [f"SELECT {column_list} FROM {qualified}"]
         if conditions:

@@ -19,7 +19,14 @@ from mcp_server_sapbw.repositories.chains import ChainsRepository
 from mcp_server_sapbw.services.load_closure import LoadClosureService, cadence_of
 
 SCHEMA = "TESTSCHEMA"
-_TABLES = {"chain_edges": "RSPCCHAIN", "dtp": "RSBKDTP", "log_chain": "RSPCLOGCHAIN"}
+_TABLES = {
+    "chain_edges": "RSPCCHAIN",
+    "dtp": "RSBKDTP",
+    "log_chain": "RSPCLOGCHAIN",
+    # Read only when no active DTP loads a provider, to tell "never had a loader" apart from "had
+    # one, frozen years ago" (D33).
+    "transformation": "RSTRAN",
+}
 
 # chain -> [(TYPE, VARIANTE)]
 _STEPS: dict[str, list[tuple[str, str]]] = {
@@ -56,11 +63,31 @@ _RUN_DAYS: dict[str, list[str]] = {
 }
 _REFERENCE = "20260730"
 
+# Inbound transformations by target: (TRANID, OBJVERS, OBJSTAT, SOURCENAME, SOURCETYPE). Shaped
+# after
+# the three measured production cases, which each hold one RSTRAN row at OBJVERS 'R' with OBJSTAT
+# 'ACT' and no DTP row at any version, against 6,483 targets whose only inbound transformation is
+# unactivated delivered content. Both shapes are here because the whole design of the D33 probe is
+# the line between them.
+_TRANSFORMATIONS: dict[str, list[tuple[str, str, str, str, str]]] = {
+    # The real case: a loader that used to run, against a provider still holding rows.
+    "FROZEN_CUBE": [("TRAN_FROZEN", "R", "ACT", "RETIRED_DSO", "ODSO")],
+    # BW-delivered content nobody activated. True, and useless to report.
+    "SHELF_CUBE": [("TRAN_DELIVERED", "D", "INA", "SHELF_SRC", "ODSO")],
+    # An active transformation with no DTP: loaded by something other than a DTP, not frozen.
+    "ROUTINE_FED_DSO": [("TRAN_LIVE", "A", "ACT", "STG_DSO", "ODSO")],
+}
+
 
 class ScriptedConnection:
+    def __init__(self) -> None:
+        #: Recorded so "this read did not happen" can be asserted rather than assumed.
+        self.statements: list[str] = []
+
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
+        self.statements.append(sql)
         params = [str(p).strip() for p in (parameters or [])]
         if "RSPCLOGCHAIN" in sql:
             return self._log_chain(sql, params)
@@ -68,6 +95,8 @@ class ScriptedConnection:
             return self._chain_steps(sql, params)
         if "RSBKDTP" in sql:
             return self._dtp(sql, params)
+        if "RSTRAN" in sql:
+            return self._transformation(sql, params)
         return []
 
     @staticmethod
@@ -106,8 +135,36 @@ class ScriptedConnection:
         wanted = [p for p in params if p in _DTPS]
         return [(d, *_DTPS[d]) for d in wanted]
 
+    @staticmethod
+    def _transformation(sql: str, params: list[str]) -> list[tuple[Any, ...]]:
+        """Applies the conditions the statement actually carries, like a database would.
 
-def _capability() -> CapabilityRecord:
+        Returning every row for the target regardless of the ``WHERE`` would make the narrowing
+        untestable: the ``OBJSTAT`` condition could be deleted and these tests would stay green
+        while
+        the real system went from 576 targets to 6,483.
+
+        The active-version assertion is the more important half. Mission Rule 6 has the dialect
+        inject ``OBJVERS = 'A'`` on every ``RSTRAN`` read, and this one opts out by naming
+        ``OBJVERS`` in its own ``WHERE``. If that opt-out ever stops working the live statement
+        contradicts itself and returns nothing, while a fixture that ignored the clause would keep
+        answering - a false pass on exactly the mechanism the feature depends on.
+        """
+        assert "OBJVERS = 'A'" not in sql, (
+            "the dialect injected the active-version filter into the non-active loader read, so on "
+            f"a real system it would return nothing: {sql}"
+        )
+        rows: list[tuple[str, ...]] = list(_TRANSFORMATIONS.get(params[0] if params else "", []))
+        if "OBJVERS <> 'A'" in sql:
+            rows = [r for r in rows if r[1] != "A"]
+        if "OBJSTAT = 'ACT'" in sql:
+            rows = [r for r in rows if r[2] == "ACT"]
+        return list(rows)
+
+
+def _capability(present: set[str] | None = None) -> CapabilityRecord:
+    """``present`` narrows the record, so a release without one table can be exercised."""
+    names = present if present is not None else set(_TABLES)
     return CapabilityRecord(
         system="qa",
         bw_release="7.50",
@@ -116,17 +173,19 @@ def _capability() -> CapabilityRecord:
         tables={
             logical: TableStatus(
                 logical_name=logical,
-                resolved_name=physical,
-                present=True,
-                schema_name=SCHEMA,
+                resolved_name=physical if logical in names else None,
+                present=logical in names,
+                schema_name=SCHEMA if logical in names else None,
             )
             for logical, physical in _TABLES.items()
         },
     )
 
 
-def _service() -> LoadClosureService:
-    return LoadClosureService(ScriptedConnection(), _capability())
+def _service(
+    connection: ScriptedConnection | None = None, present: set[str] | None = None
+) -> LoadClosureService:
+    return LoadClosureService(connection or ScriptedConnection(), _capability(present))
 
 
 def _chains() -> ChainsRepository:
@@ -236,3 +295,96 @@ def test_governing_cadence_is_the_most_frequent_chain() -> None:
     assert governing is not None
     assert governing.chain_id == "SUB_A"  # 2 runs/day beats weekly
     assert cadence_of([]) is None
+
+
+# --- a provider whose only loader is frozen (D33) ----------------------------------------------
+#
+# "No DTP targets this provider, so it may be virtual, routine-filled, or InfoPackage-loaded" is a
+# true sentence and, on a populated provider, a misleading one. Measured on the reference system:
+# three InfoCubes holding 1,081,275 rows between them, 2,442-3,191 days old, each with exactly one
+# inbound transformation at OBJVERS 'R' / OBJSTAT 'ACT' and no DTP row at any version. Told the
+# plain
+# sentence, a reader's next step is to delete them; the rows are retained sales history from a
+# decommissioned source.
+
+
+def test_a_frozen_loader_is_named_rather_than_left_as_three_guesses() -> None:
+    closure = _service().provider_to_chains("FROZEN_CUBE")
+    assert not isinstance(closure, UnsupportedResult)
+
+    assert closure.loading_chains == []  # Rule 6 still governs the answer above
+    assert [loader.tran_id for loader in closure.inactive_loaders] == ["TRAN_FROZEN"]
+    frozen = closure.inactive_loaders[0]
+    assert (frozen.objvers, frozen.objstat) == ("R", "ACT")
+    assert frozen.source_name == "RETIRED_DSO"
+
+    detail = " ".join(closure.caveats)
+    assert "non-active version (R)" in detail
+    assert "RETIRED_DSO" in detail, "the retired source is the first thing to check"
+    assert "not unloaded by design" in detail
+    # The plain sentence must survive alongside it: the three innocent explanations are still live
+    # possibilities, and replacing them would overstate what a frozen row proves.
+    assert any("it may be loaded by an InfoPackage" in c for c in closure.caveats)
+
+
+def test_unactivated_delivered_content_is_not_reported_as_a_frozen_loader() -> None:
+    """The narrowing, which is the whole design.
+
+    "Any non-active inbound transformation" is 6,483 targets on the reference system, nearly all
+    OBJVERS 'D' with OBJSTAT 'INA' - content shipped by SAP that nobody activated. Requiring
+    OBJSTAT 'ACT' cuts it to 576, of which ten hold rows. A finding that fires 6,483 times is not a
+    finding.
+    """
+    closure = _service().provider_to_chains("SHELF_CUBE")
+    assert not isinstance(closure, UnsupportedResult)
+
+    assert closure.inactive_loaders == []
+    assert closure.caveats == [c for c in closure.caveats if "non-active version" not in c]
+    assert any("no DTP targets this provider" in c for c in closure.caveats)
+
+
+def test_an_active_transformation_with_no_dtp_is_not_a_frozen_loader() -> None:
+    """A live transformation loaded by something other than a DTP is not evidence of a stoppage.
+
+    Guards the ``OBJVERS <> 'A'`` half of the filter specifically: without it this provider would be
+    reported as "no longer loaded, but it was" while its loader is the current active version.
+    """
+    closure = _service().provider_to_chains("ROUTINE_FED_DSO")
+    assert not isinstance(closure, UnsupportedResult)
+
+    assert closure.inactive_loaders == []
+    assert not any("non-active version" in c for c in closure.caveats)
+
+
+def test_the_frozen_loader_cites_the_transformation_row_it_was_read_from() -> None:
+    """Mission Rule 3. The claim is about a specific row, so it has to name one."""
+    closure = _service().provider_to_chains("FROZEN_CUBE")
+    assert not isinstance(closure, UnsupportedResult)
+
+    provenance = closure.inactive_loaders[0].provenance
+    assert provenance is not None
+    assert provenance.source_table == "RSTRAN"
+    assert provenance.source_key == {
+        "TRANID": "TRAN_FROZEN",
+        "OBJVERS": "R",
+        "TARGETNAME": "FROZEN_CUBE",
+    }
+
+
+def test_a_release_without_rstran_still_answers_rather_than_failing() -> None:
+    """The probe is an addition to the answer, so its absence must cost only itself."""
+    closure = _service(present=set(_TABLES) - {"transformation"}).provider_to_chains("FROZEN_CUBE")
+    assert not isinstance(closure, UnsupportedResult)
+
+    assert closure.inactive_loaders == []
+    assert any("no DTP targets this provider" in c for c in closure.caveats)
+
+
+def test_a_provider_with_a_working_loader_never_pays_for_the_frozen_probe() -> None:
+    """Reached only when the active read came back empty, so a healthy provider costs nothing."""
+    conn = ScriptedConnection()
+    closure = _service(conn).provider_to_chains("STG_DSO")
+    assert not isinstance(closure, UnsupportedResult)
+
+    assert closure.loading_chains, "the fixture must resolve a loader for this to mean anything"
+    assert not any("RSTRAN" in sql for sql in conn.statements)

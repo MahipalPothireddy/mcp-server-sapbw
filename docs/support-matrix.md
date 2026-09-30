@@ -29,9 +29,9 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 
 | Release | verified | expected | unverified | needs_connector | unknown |
 |---|---|---|---|---|---|
-| `BW 7.40` | 0 | 0 | 59 | 2 | 0 |
-| `BW 7.50` | 43 | 16 | 0 | 2 | 0 |
-| `BW/4HANA 2.0` | 0 | 0 | 59 | 2 | 0 |
+| `BW 7.40` | 0 | 0 | 60 | 2 | 0 |
+| `BW 7.50` | 44 | 16 | 0 | 2 | 0 |
+| `BW/4HANA 2.0` | 0 | 0 | 60 | 2 | 0 |
 
 ## Per tool
 
@@ -48,6 +48,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_assess_landscape` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_text`, `dso_header`, `dtp`, `element_text`, `hana_views`, `log_chain`, `query_dir`, `query_provider`, `transformation` |
 | `bw_cache_status` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_capability_report` | `unverified` | `verified` | `unverified` | `not_validated` | - |
+| `bw_check_code_decodes` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_check_load_latency` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `transformation` |
 | `bw_check_schedule_risk` | `needs_connector` | `needs_connector` | `needs_connector` | `integration_tested` | `chain_attr`, `chain_text`, `log_chain` |
 | `bw_compare_snapshots` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_header` |
@@ -67,7 +68,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_get_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_get_load_closure` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_edges` |
 | `bw_get_provider_health` | `unverified` | `verified` | `unverified` | `not_validated` | - |
-| `bw_get_query` | `unverified` | `verified` | `unverified` | `integration_tested` | `element_dir`, `element_range`, `element_text`, `element_xref`, `query_dir`, `query_provider` |
+| `bw_get_query` | `unverified` | `verified` | `unverified` | `integration_tested` | `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider` |
 | `bw_get_query_auth_exposure` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_query_lineage` | `unverified` | `verified` | `unverified` | `integration_tested` | `element_dir`, `element_range`, `element_select`, `element_xref`, `query_dir`, `query_provider` |
 | `bw_get_query_usage` | `unverified` | `verified` | `unverified` | `integration_tested` | `query_dir` |

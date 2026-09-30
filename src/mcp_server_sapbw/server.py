@@ -30,6 +30,7 @@ from . import __version__
 from .connectors.base import ConnectorRegistry
 from .connectors.bi import FileBiConnector
 from .connectors.ecc import EccConnector
+from .connectors.external_bi import BiConnectorError, BobjConnector, TableauConnector
 from .core.access import build_access_report
 from .core.budget import (
     DEFAULT_MAX_QUERIES,
@@ -40,7 +41,7 @@ from .core.budget import (
 )
 from .core.cache import SqliteCache
 from .core.capabilities import CapabilityResolver
-from .core.connection import ReadOnlyConnection, ReadOnlyConnectionPool
+from .core.connection import ReadOnlyConnection, ReadOnlyConnectionPool, SecretScrubber
 from .core.dialect import record_tool_reads
 from .core.identity import Environment, StorageIdentity
 from .core.logging import configure as configure_logging
@@ -64,6 +65,7 @@ from .models.chains import (
 )
 from .models.completeness import COMPLETE, bounded
 from .models.diagram import DiagramFormat, DiagramResult
+from .models.domains import DomainDriftReport
 from .models.ecc import ConnectorUnavailable, ExitInventory
 from .models.errors import (
     BwError,
@@ -128,6 +130,7 @@ from .services.diagram import (
     render_svg,
 )
 from .services.docgen import DocGenerator, DocGenResult
+from .services.domain_drift import DomainDriftService
 from .services.exit_analysis import ExitAnalysisService
 from .services.lineage import LineageService
 from .services.load_closure import LoadClosureService
@@ -199,7 +202,19 @@ class SystemStatus(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    status: Literal["configured", "discovered"]
+    #: ``configured`` - declared in the profile file, never contacted.
+    #: ``discovered`` - connected and capability discovery completed.
+    #: ``unreachable`` - a connection was attempted and failed. This value exists because without
+    #: it a profile with a broken credential is indistinguishable from one nobody has touched yet,
+    #: and this is the first tool a new adopter calls. Found on a live landscape whose second
+    #: profile was flagged "forced to change password": the tool reported both systems
+    #: ``configured`` and gave no hint which one could not be used (D43).
+    status: Literal["configured", "discovered", "unreachable"]
+    #: Why a profile is unreachable, scrubbed of host, user and password by the same
+    #: :class:`~.core.connection.SecretScrubber` the connection layer uses. Present only for
+    #: ``unreachable``; the point is to name the fix ("the account must change its password")
+    #: without naming the account.
+    detail: str | None = None
     release: str | None = None
     read_only_user: bool = True
     #: Which customer or landscape this profile belongs to. ``None`` is normal for a single-customer
@@ -383,7 +398,7 @@ class AuthListResult(BaseModel):
 class Runtime(Protocol):
     """The surface the tools depend on (implemented by ServerRuntime; faked in tests)."""
 
-    def list_systems(self) -> list[SystemStatus]: ...
+    def list_systems(self, *, probe: bool = False) -> list[SystemStatus]: ...
     def identity(self, system: str) -> StorageIdentity: ...
     def capability(self, system: str) -> CapabilityRecord: ...
     def access_report(self, system: str) -> AccessReport: ...
@@ -403,6 +418,7 @@ class Runtime(Protocol):
     def docgen(self, system: str) -> DocGenerator: ...
     def load_closure(self, system: str) -> LoadClosureService: ...
     def health(self, system: str) -> HealthRepository: ...
+    def domain_drift(self, system: str) -> DomainDriftService: ...
     def sources(self, system: str) -> SourcesRepository: ...
     def threex(self, system: str) -> ThreeXRepository: ...
     def security(self, system: str) -> SecurityRepository: ...
@@ -414,7 +430,7 @@ class Runtime(Protocol):
     def snapshots(self, system: str) -> SnapshotService: ...
     def snapshot_store(self, system: str) -> SnapshotStore | None: ...
     def exit_analysis(
-        self, ecc_system: str | None
+        self, ecc_system: str | None, bw_system: str | None = None
     ) -> ExitAnalysisService | ConnectorUnavailable: ...
 
 
@@ -436,6 +452,9 @@ class ServerRuntime:
         self._resolver = resolver
         self._cache_dir = cache_dir
         self._capabilities: dict[str, CapabilityRecord] = {}
+        #: system -> scrubbed reason its last connection attempt failed. Kept so a profile that
+        #: cannot be reached is reported as such rather than as merely "configured" (D43).
+        self._unreachable: dict[str, str] = {}
         # system -> (capability fingerprint, open cache). Retired when the fingerprint changes.
         self._caches: dict[str, tuple[str, SqliteCache]] = {}
         # system -> open snapshot store. Deliberately NOT keyed on the capability fingerprint: a
@@ -459,10 +478,42 @@ class ServerRuntime:
         """Who a profile belongs to: the tenant, the alias, and the declared environment."""
         return self._profiles.get(system).identity
 
+    def _scrub_failure(self, system: str, error: BaseException) -> str:
+        """Why a connection failed, with host, user and password removed.
+
+        The driver puts the user name straight into its message - the live failure that prompted
+        this read ``forced to change password: alter password required for user <name>``. That
+        sentence is the most useful thing to show someone setting the server up, and the name in it
+        is the one thing that must not be shown, so it is scrubbed rather than suppressed.
+        """
+        try:
+            profile = self._profiles.get(system)
+            # The password is a SecretStr, so its plain value must be asked for explicitly - which
+            # is the point of the type, and why it is only ever unwrapped here, to be scrubbed out.
+            scrubber = SecretScrubber(
+                [profile.host, profile.user, profile.password.get_secret_value()]
+            )
+            text = scrubber.scrub(str(error))
+        except Exception:
+            # If even building the scrubber fails, say nothing about the cause rather than risk
+            # emitting an unscrubbed driver message.
+            return f"{type(error).__name__} (detail withheld: it could not be scrubbed safely)"
+        return f"{type(error).__name__}: {text}"
+
     def capability(self, system: str, *, refresh: bool = False) -> CapabilityRecord:
         record = self._capabilities.get(system)
         if refresh or record is None or record.is_expired():
-            record = self._resolver.resolve(self._profiles.get(system), self._connection(system))
+            try:
+                record = self._resolver.resolve(
+                    self._profiles.get(system), self._connection(system)
+                )
+            except Exception as exc:
+                # Remember why, scrubbed, so bw_list_systems can report this profile as unreachable
+                # instead of leaving it indistinguishable from one nobody has contacted (D43). The
+                # exception still propagates: a caller that asked for capability wanted it.
+                self._unreachable[system] = self._scrub_failure(system, exc)
+                raise
+            self._unreachable.pop(system, None)
             self._capabilities[system] = record
         return record
 
@@ -691,7 +742,36 @@ class ServerRuntime:
                 configured.append(bi)
             else:
                 _LOG.warning("BI inventory not usable: %s", bi.status().detail)
+        configured.extend(self._bi_platform_connectors())
         return ConnectorRegistry(configured)
+
+    def _bi_platform_connectors(self) -> list[Any]:
+        """Live BI platform connectors, one per configured ``bi_platforms`` entry.
+
+        Appended *after* the file inventory deliberately. ``ConnectorRegistry.bi()`` prefers the
+        vendor-neutral ``bi`` kind, which is what ``FileBiConnector`` registers as, so an
+        organisation that has exported an inventory keeps getting that answer and the live platforms
+        serve the questions the export does not cover. Registering live connectors ahead of it would
+        silently change which source an existing configuration reads from.
+
+        Construction is lazy in the useful sense: neither connector opens anything here. BOBJ logs
+        on at first :meth:`probe`, Tableau connects at first query, so building a registry for a
+        call that never touches BI costs no outbound connection.
+        """
+        connectors: list[Any] = []
+        for name in self._profiles.bi_platform_names():
+            profile = self._profiles.get_bi_platform(name)
+            try:
+                if profile.kind == "bobj":
+                    connectors.append(BobjConnector(profile))
+                else:
+                    connectors.append(TableauConnector(profile))
+            except BiConnectorError as exc:
+                # A misconfigured platform must not take the whole registry down: the other
+                # connectors, and every BW-only tool, are unaffected. Scrubbed by construction -
+                # BiConnectorError never carries host or credentials.
+                _LOG.warning("BI platform '%s' not usable: %s", name, exc)
+        return connectors
 
     def analyzers(self, system: str) -> Analyzers:
         return Analyzers(
@@ -742,19 +822,36 @@ class ServerRuntime:
         self._snapshot_stores[system] = store
         return store
 
-    def exit_analysis(self, ecc_system: str | None) -> ExitAnalysisService | ConnectorUnavailable:
+    def exit_analysis(
+        self, ecc_system: str | None, bw_system: str | None = None
+    ) -> ExitAnalysisService | ConnectorUnavailable:
+        """The extractor-exit reader, or a statement of why no source system could be resolved.
+
+        ``bw_system`` is forwarded so the ``serves`` declaration is honoured here as it is for the
+        connector-gated scenarios. Defect D66: this passed only ``ecc_system``, so on a landscape
+        with four source systems configured the tool declined unless the caller named one -- and
+        said the BW-to-source mapping "is not recorded in the profiles file", which stopped being
+        true when ``serves`` was added. Two paths resolving the same connector by different rules is
+        the shape of D61, and the fix is the same: one derivation, used everywhere.
+        """
         names = self._profiles.ecc_names()
-        connector = self._ecc_connector(ecc_system)
+        connector = self._ecc_connector(ecc_system, bw_system=bw_system)
         if not connector.is_configured():
-            detail = (
-                "no ABAP source system is configured; add an 'ecc_systems' entry to profiles.yaml "
-                "to read extractor-exit ABAP over ADT"
-                if not names
-                else (
-                    f"{len(names)} source systems are configured; name one in 'ecc_system' "
-                    "(which source system feeds a BW system is not recorded in the profiles file)"
+            if not names:
+                detail = (
+                    "no ABAP source system is configured; add an 'ecc_systems' entry to "
+                    "profiles.yaml to read extractor-exit ABAP over ADT"
                 )
-            )
+            else:
+                served = (
+                    f" None of them declares 'serves: [{bw_system}]'."
+                    if bw_system is not None
+                    else " Pass 'system' as well and the profile declaring 'serves' is used."
+                )
+                detail = (
+                    f"{len(names)} source systems are configured and none could be resolved; "
+                    f"name one in 'ecc_system'.{served}"
+                )
             return ConnectorUnavailable(configured_profiles=names, detail=detail)
         return ExitAnalysisService(connector)
 
@@ -762,6 +859,10 @@ class ServerRuntime:
         return LoadClosureService(
             self._connection(system), self.capability(system), self._cache(system)
         )
+
+    def domain_drift(self, system: str) -> DomainDriftService:
+        """Never cached: the whole point is to read the connected dictionary, now."""
+        return DomainDriftService(self._connection(system), self.capability(system), None)
 
     def health(self, system: str) -> HealthRepository:
         return HealthRepository(
@@ -887,16 +988,39 @@ class ServerRuntime:
             self._pool.close_all()
         _LOG.info("runtime closed: sessions and cache handles released")
 
-    def list_systems(self) -> list[SystemStatus]:
+    def list_systems(self, *, probe: bool = False) -> list[SystemStatus]:
+        """Configured profiles and their status.
+
+        ``probe=False`` (the default) reports only what is already known, so the tool stays cheap
+        enough to auto-approve. It still reports ``unreachable`` for a profile whose connection has
+        already failed this session, because that is remembered rather than re-discovered.
+
+        ``probe=True`` connects to every profile that has not been reached yet. That is the explicit
+        "check my setup" action, and it is the one a newcomer needs: it turns "two systems are
+        configured" into "one works, one needs its password changed" (D43).
+        """
         result: list[SystemStatus] = []
         for name in self._profiles.names():
             profile = self._profiles.get(name)
+            if probe and name not in self._capabilities and name not in self._unreachable:
+                # Failures are recorded by capability(); suppressing here is what makes one broken
+                # credential a per-profile fact instead of taking the whole answer down.
+                with suppress(Exception):
+                    self.capability(name)
             record = self._capabilities.get(name)
+            failure = self._unreachable.get(name)
             identity = profile.identity
+            if record is not None:
+                status: Literal["configured", "discovered", "unreachable"] = "discovered"
+            elif failure is not None:
+                status = "unreachable"
+            else:
+                status = "configured"
             result.append(
                 SystemStatus(
                     name=name,
-                    status="discovered" if record is not None else "configured",
+                    status=status,
+                    detail=failure,
                     release=record.bw_release if record is not None else None,
                     read_only_user=profile.read_only_user,
                     tenant=identity.tenant,
@@ -1045,9 +1169,15 @@ def _clamp_page(limit: int, offset: int) -> tuple[int, int]:
 
 
 @_readonly_tool
-def bw_list_systems() -> list[SystemStatus]:
-    """List configured connection profiles and their discovery status."""
-    return runtime().list_systems()
+def bw_list_systems(probe: bool = False) -> list[SystemStatus]:
+    """List configured connection profiles and their status.
+
+    Set ``probe=True`` to connect to every profile not yet reached, which turns "two systems are
+    configured" into "one works, one cannot be reached and here is why". Use it when setting the
+    server up against a new landscape. It costs one connection per unreached profile, so it is off
+    by default and the cheap form stays safe to auto-approve.
+    """
+    return runtime().list_systems(probe=probe)
 
 
 @_readonly_tool
@@ -1081,6 +1211,28 @@ def bw_capability_report(system: str) -> CapabilityReport:
     one of them is a gap in this server.
     """
     return build_report(runtime().capability(system))
+
+
+@_readonly_tool
+def bw_check_code_decodes(system: str) -> DomainDriftReport | UnsupportedResult:
+    """Whether this system's dictionary still declares the codes the server decodes (D44).
+
+    Run this first on a landscape the server has not seen before. Everything else the server says
+    about element types, layout codes, alert levels, aggregation behaviour, request status and rule
+    types rests on code-to-meaning tables that were read from **one** BW 7.50 dictionary at build
+    time and frozen into source. This reads the connected system's own ``DD07L``/``DD07T`` and diffs
+    them, so a decode that no longer matches is reported rather than applied silently.
+
+    The finding to look for is ``code_unmapped`` at ``high``: the dictionary declares a value the
+    server does not map, which means a row carrying it lands in a fallback and is reported as though
+    it were understood. That exact failure once put 24.4% of a query's element-tree edges into a
+    catch-all bucket with nothing to indicate it.
+
+    A clean result means "this system agrees with the reference system", which is **not** the same
+    as "these decodes are right" - and it covers only the registered domains, not all. Both
+    limits come back in ``limitations`` rather than being left implicit.
+    """
+    return runtime().domain_drift(system).check()
 
 
 @_readonly_tool
@@ -1948,6 +2100,7 @@ def bw_list_extractor_enhancements(
 @_readonly_tool
 def bw_get_extractor_exit_code(
     ecc_system: str | None = None,
+    system: str | None = None,
     include_source: bool = False,
     datasources: list[str] | None = None,
 ) -> ExitInventory | ConnectorUnavailable:
@@ -1971,10 +2124,13 @@ def bw_get_extractor_exit_code(
     is reported as a caveat.
 
     The connection is GET-only and takes no ADT locks. ``ecc_system`` names an ``ecc_systems``
-    profile and may be omitted when exactly one is configured. Full ABAP is opt-in via
-    ``include_source`` and is capped; the analysis always covers the whole include.
+    profile; omit it and the source system is resolved from ``system`` -- the profile declaring
+    ``serves: [<that BW system>]`` -- or, failing that, from the sole configured profile. Passing
+    neither on a landscape with several source systems returns a statement of why, not a guess.
+    Full ABAP is opt-in via ``include_source`` and is capped; the analysis always covers the whole
+    include.
     """
-    service = runtime().exit_analysis(ecc_system)
+    service = runtime().exit_analysis(ecc_system, bw_system=system)
     if isinstance(service, ConnectorUnavailable):
         return service
     return service.inventory(include_source=include_source, datasources=datasources)
