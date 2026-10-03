@@ -1,0 +1,88 @@
+# Publish the synthetic lineage example to GitHub Pages.
+#
+# WHY THIS EXISTS: the example is a single self-contained HTML file, and GitHub does not render
+# HTML inline in a repository view. Without Pages it has to be downloaded to be read, which is a
+# poor first impression of the one artefact that shows what this server actually produces.
+#
+# WHAT IT PUBLISHES: two files. `lineage-report.html` (as the site index) and `preview.png`. Not
+# the repository. That is deliberate and should stay that way - a Pages site is a public surface,
+# and the only thing in this repository intended for one is the example, whose landscape is
+# entirely synthetic. The README, CHANGELOG and docs discuss findings measured on a real
+# landscape; none of that belongs on a public URL.
+#
+# PREREQUISITE: Pages must be enabled with Actions as the source
+# (Settings -> Pages -> Build and deployment -> Source: GitHub Actions). Until then this workflow
+# runs and fails at the deploy step, which is why it is not triggered by every push. Note that
+# Pages on a *private* repository needs GitHub Pro, Team or Enterprise Cloud; on the Free plan it
+# becomes available when the repository is made public.
+name: Pages (example output)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/interactive-lineage/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one in flight: a half-applied deploy would leave the
+# published site in a state that matches no commit.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Rebuild from source rather than trusting the committed file. This doubles as a staleness
+      # guard: if someone edits sample_landscape.py and forgets to regenerate, the diff below
+      # fails the build instead of publishing a page that disagrees with its own source.
+      - name: Rebuild the example
+        run: python examples/interactive-lineage/build.py
+
+      - name: Fail if the committed HTML is stale
+        run: |
+          if ! git diff --exit-code -- examples/interactive-lineage/lineage-report.html; then
+            echo "::error::lineage-report.html does not match sample_landscape.py." \
+                 "Run: python examples/interactive-lineage/build.py — then commit the result."
+            exit 1
+          fi
+
+      # The leak check runs in ci.yml over the whole tree. Running it again here is cheap and
+      # means nothing reaches a public URL without it, even if this workflow is triggered alone.
+      - name: Customer-metadata leak check
+        run: python scripts/customer_metadata_scan.py
+
+      - name: Stage only the example
+        run: |
+          mkdir -p _site
+          cp examples/interactive-lineage/lineage-report.html _site/index.html
+          cp examples/interactive-lineage/preview.png _site/preview.png
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -5,8 +5,19 @@ connect, what the transformations do, and what the HANA calculation views comput
 
 **Open [`lineage-report.html`](lineage-report.html) in a browser.** It is one self-contained file —
 CSS, JavaScript and data inlined — so it works from the local filesystem with no network access
-and nothing to install. GitHub will not render it inline; download it or use a raw-HTML preview
-service.
+and nothing to install.
+
+GitHub does not render HTML inline in a repository view, so reading it here means downloading it.
+`.github/workflows/pages.yml` publishes it as a browsable page instead, and it deploys on any push
+that touches this directory — but only once Pages is switched on under **Settings → Pages → Build
+and deployment → Source: GitHub Actions**. Until then the workflow fails at its deploy step, which
+is harmless but visible. Note that Pages on a private repository needs GitHub Pro, Team or
+Enterprise Cloud; on the Free plan it becomes available when the repository is made public.
+
+The workflow publishes **only this example** — the report and its preview image, not the
+repository. That is deliberate. A Pages site is a public surface, and the example's landscape is
+the only thing here that is synthetic by construction; the README, CHANGELOG and `docs/` discuss
+findings measured against a real system.
 
 ![The lineage diagram](preview.png)
 
