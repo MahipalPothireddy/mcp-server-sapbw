@@ -7,11 +7,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, get_args
 
 from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
-from mcp_server_sapbw.models.provenance import UnsupportedResult
-from mcp_server_sapbw.models.providers import ObjectNotFound, Provider
+from mcp_server_sapbw.models.provenance import Provenance, UnsupportedResult
+from mcp_server_sapbw.models.providers import (
+    CompositionSource,
+    ObjectNotFound,
+    Provider,
+)
 from mcp_server_sapbw.repositories.providers import ProvidersRepository
 
 SCHEMA = "TESTSCHEMA"
@@ -565,3 +570,61 @@ def test_unreadable_key_figure_aggregation_is_unknown_not_unrestricted() -> None
     provider = _described("AMOUNT_KYF", present)
     assert provider.aggregation is None
     assert any("unknown rather than unrestricted" in c for c in provider.caveats)
+
+
+# --- the model must accept every value the resolver can return (D75) ----------------------------
+
+
+def test_every_composition_source_the_resolver_returns_is_accepted_by_the_model() -> None:
+    """Found by a user asking for the lineage of one BEx query, which crashed.
+
+    ``composite_parts`` returns ``declared_model`` for a CompositeProvider whose composition comes
+    from BW's own stored model - the common case on the reference landscape, 109 of them - and
+    ``Provider.composition_source`` listed four values that did not include it. So
+    ``bw_describe_object`` raised a ``ValidationError``, and anything built on it - including
+    ``data_bearing_parts``, and so the union expansion the whole D58 fix rests on - raised too.
+
+    **The mechanism is the part worth keeping.** Both call sites passing the value carried
+    ``# type: ignore[arg-type]``. The type checker had found this exact mismatch and the comment
+    silenced it, so mypy stayed clean on 97 files while the runtime crashed on a real object. The
+    ignores are gone and both sides share one alias; this test is the backstop for the case where a
+    seventh value is added to the resolver and the alias is forgotten.
+    """
+    # Every literal is asserted, not a sample: the defect was a value present in one place and
+    # absent from the other, so a sample would have had a 4-in-6 chance of passing.
+    returned = set(get_args(CompositionSource))
+    assert returned, "the alias resolved to no literals, so this test proves nothing"
+    for value in sorted(returned):
+        provider = Provider(
+            name="UNION_THING",
+            object_type="compositeprovider",
+            composition_source=value,
+            provenance=[Provenance(source_table="RSOHCPR", source_key={"HCPRNM": "UNION_THING"})],
+        )
+        assert provider.composition_source == value
+
+    # And the two the resolver actually returns for a CompositeProvider, named explicitly so a
+    # rename of either is a failure here rather than a surprise on a live system.
+    assert {"declared_model", "calc_view", "none"} <= returned
+
+
+def test_no_call_site_silences_the_composition_source_check() -> None:
+    """A guard on the mechanism, not the symptom.
+
+    The value was wrong for as long as it was, because the one tool that would have caught it was
+    told not to. Re-adding an ``arg-type`` ignore on these call sites would restore exactly that
+    blindness, so the source is asserted to carry none.
+    """
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "mcp_server_sapbw"
+        / "repositories"
+        / "providers.py"
+    ).read_text(encoding="utf-8")
+    offenders = [
+        line.strip()
+        for line in source.splitlines()
+        if "composition_source" in line and "type: ignore" in line
+    ]
+    assert not offenders, f"a type-check suppression is back on this field: {offenders}"

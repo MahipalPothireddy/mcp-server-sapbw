@@ -204,6 +204,22 @@ class PartProviderRef(BaseModel):
         return self
 
 
+#: How ``Provider.part_providers`` was derived. **Every value the resolver can actually return must
+#: be here** (D75). It listed four while the resolver returned six, and both call sites passing the
+#: value carried ``# type: ignore[arg-type]`` - so the type checker found this exact mismatch and
+#: the comment silenced it, turning a compile-time error into a ``ValidationError`` raised by
+#: ``bw_describe_object`` on the most common provider type on the reference landscape. The alias
+#: exists so the model and the resolver cannot drift again: both are annotated with it.
+CompositionSource = Literal[
+    "relational",  # RSDCUBEMULTI, i.e. a MultiProvider's declared parts
+    "xml",  # parsed from the CompositeProvider's stored XML definition
+    "calc_view",  # resolved from the dependencies of the generated HANA calc view
+    "declared_model",  # BW's own stored CompositeProvider model
+    "unresolved",  # a composition exists but could not be read - reported, never implied empty
+    "none",  # the object has no composition by nature
+]
+
+
 class Provider(BaseModel):
     """Universal deep-dive for any InfoProvider or InfoObject.
 
@@ -235,7 +251,7 @@ class Provider(BaseModel):
     # which case a caveat says so rather than implying it has none.
     attributes: list[AttributeRef] = Field(default_factory=list)
     part_providers: list[PartProviderRef] = Field(default_factory=list)
-    composition_source: Literal["relational", "xml", "calc_view", "none"] = "none"
+    composition_source: CompositionSource = "none"
     # Only for a key-figure InfoObject: how its number combines and in what unit. Absent for every
     # other object type, and for a key figure whose RSDKYF row could not be read.
     aggregation: KeyFigureAggregation | None = None

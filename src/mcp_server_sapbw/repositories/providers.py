@@ -39,6 +39,7 @@ from ..models.evidence import evidence_for
 from ..models.provenance import UnsupportedResult
 from ..models.providers import (
     AttributeRef,
+    CompositionSource,
     InfoObjectKind,
     ObjectNotFound,
     PartProviderRef,
@@ -641,7 +642,8 @@ class ProvidersRepository(Repository):
         provider_type = classify_cube_type(cubetype)
         fields = self._cube_fields(name)
         parts: list[PartProviderRef] = []
-        composition: str = "none"
+        # Annotated with the alias rather than `str`, which is what let the mismatch through here.
+        composition: CompositionSource = "none"
         if provider_type == "multiprovider" and self.capability.is_available("multiprovider_part"):
             parts = self._multiprovider_parts(name)
             composition = "relational"
@@ -664,7 +666,7 @@ class ProvidersRepository(Repository):
             application=_clean(appl),
             fields=fields,
             part_providers=parts,
-            composition_source=composition,  # type: ignore[arg-type]
+            composition_source=composition,
             description=description,
             provenance=[self.provenance("cube_header", {"INFOCUBE": name, "OBJVERS": "A"})],
         )
@@ -758,7 +760,7 @@ class ProvidersRepository(Repository):
             application=_clean(appl),
             fields=fields,
             part_providers=parts,
-            composition_source=composition,  # type: ignore[arg-type]
+            composition_source=composition,
             caveats=caveats,
             description=description,
             provenance=[self.provenance("composite_header", {"HCPRNM": name, "OBJVERS": "A"})],
@@ -1135,7 +1137,9 @@ class ProvidersRepository(Repository):
             return [], "unresolved"
         return parts, described.composition_source
 
-    def composite_parts(self, name: str) -> tuple[list[PartProviderRef], str, list[str]]:
+    def composite_parts(
+        self, name: str
+    ) -> tuple[list[PartProviderRef], CompositionSource, list[str]]:
         """Resolve a CompositeProvider's part providers.
 
         Two routes, tried in order:
