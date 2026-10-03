@@ -6,6 +6,63 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — a connection drop returned both network endpoints to the caller
+
+The scrubber removed the profile's host string by literal replacement, which cannot catch an
+address the process never configured. `hdbcli` volunteers exactly that: a transport failure names
+the *resolved* server address, the client's own address and both ports — `System call 'recv'
+failed ... {198.51.100.10:62939 -> 203.0.113.67:30215}`. So a genuine connection drop put both
+endpoints into the tool response and into the log, which is the one thing the security model says
+never happens.
+
+Any IPv4-with-optional-port shape is now masked whether or not it matches the configured host.
+Numeric error codes (`rc=10054`, `(-10807,`) do not match that shape and are deliberately left
+intact, because they are what makes the failure diagnosable — scrubbing is meant to remove
+identifiers, not to make an error useless.
+
+### Fixed — the query catalogue counted every version of every query
+
+`RSZCOMPDIR` holds one row per *version* of a component and the catalogue did not filter
+`OBJVERS`, so modified and delivered versions were counted alongside active ones. Measured on the
+reference system: **2,373 rows for 1,069 active queries** (1,069 active, 890 modified, the
+remainder delivered). Every count, every page and every total derived from that read was inflated
+by roughly a factor of two, which is the failure mode the active-version rule exists to prevent.
+Now `OBJVERS = 'A'` and `OBJSTAT = 'ACT'`, and not optional.
+
+### Fixed — an ADSO found in routine ABAP was reported as master data
+
+The lineage walk typed a dependency resolved out of routine source as
+`"dso" if kind == "dso" else "infoobject"`. Anything that was not a classic DSO — an Advanced DSO,
+an InfoCube — therefore arrived as an InfoObject, and was coloured as master data in every
+rendered diagram. The map is now exhaustive over the kinds the dependency model declares, and an
+unresolved kind becomes `unknown` rather than a type nobody read. Only the routine-derived path
+was affected; the declared path always decoded its kind properly, which is why this survived.
+
+A CompositeProvider part edge is now also confirmed against the parsed stored model when the walk
+arrives from the *consumer* side, so the same relationship carries the same confidence whichever
+end it was reached from. Memoised per provider, since one walk meets the same CompositeProvider
+once per part.
+
+### Fixed — long edges in a rendered diagram were drawn through the boxes between
+
+An edge spanning more than one column took a straight line across whatever lay in its path. Those
+edges now route through free corridors, with a vertical slack band above and below the columns and
+turns taken inside the gutters either side, and two edges between the same pair of nodes are drawn
+apart rather than on top of one another.
+
+### Added — a provider page names what consumes it
+
+Generated provider documentation stopped at the provider. It now names the CompositeProvider
+consuming it and the report above that, so a page answers "who breaks if I change this" without a
+second lookup.
+
+Smaller, in the same pass: field lineage states both things that can be true of a hop (it fans out
+*and* it may be advisory, which the note previously treated as alternatives); the Tableau
+connector classifies a connection's class and target as calc view, BW provider or unknown; the SQL
+dialect refuses a SELECT naming a column the connected release does not have (D45); and the
+section-table guard names defect D60 in its failure message. A repository-wide `ruff format` pass
+is included and carries no behaviour.
+
 ### Fixed — a CompositeProvider a calculation view reads was dropped, and its parts promoted
 
 Reported by a customer checking a generated lineage document against their own system. A view
