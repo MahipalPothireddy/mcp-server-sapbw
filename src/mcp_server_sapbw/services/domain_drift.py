@@ -476,7 +476,7 @@ class DomainDriftService(Repository):
         table = self.physical(logical)
         status = self.capability.table(logical)
         schema = status.schema_name if status is not None else None
-        return f'{quote_ident(schema)}.{quote_ident(table)}' if schema else quote_ident(table)
+        return f"{quote_ident(schema)}.{quote_ident(table)}" if schema else quote_ident(table)
 
     def _limitations(self) -> list[str]:
         limits = [
@@ -495,5 +495,3 @@ class DomainDriftService(Repository):
                 "checked on this system."
             )
         return limits
-
-

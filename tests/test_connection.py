@@ -241,6 +241,41 @@ def test_secret_scrubber_longest_first() -> None:
     assert scrubber.scrub("abcdef and abc") == "<redacted> and <redacted>"
 
 
+def test_scrubber_masks_endpoints_the_driver_volunteers() -> None:
+    """A transport failure names addresses this process never configured.
+
+    Verbatim from a real connection drop during a documentation run, with the addresses changed:
+    hdbcli reports the *resolved* server address and the client's own address, neither of which is
+    the profile's host string - so literal replacement of known secrets left both in the message
+    that was returned to the caller and written to the log. Mission Rule 5 says connection details
+    do not reach an error message, which a list of known strings cannot deliver on its own.
+    """
+    scrubber = SecretScrubber(["bw-host.invalid", "BWUSER", "s3cret"])
+    message = (
+        "(-10807, \"Connection down: [89006] System call 'recv' failed, rc=10054:"
+        "An existing connection was forcibly closed by the remote host "
+        '{198.51.100.10:62939 -> 203.0.113.67:30215 TenantName:(none) ConnectionID:329853}")'
+    )
+    scrubbed = scrubber.scrub(message)
+    assert "198.51.100.10" not in scrubbed
+    assert "203.0.113.67" not in scrubbed
+    assert "62939" not in scrubbed and "30215" not in scrubbed
+    assert scrubbed.count("<redacted-endpoint>") == 2
+    # The diagnosable part survives: without the codes the message says only "it broke".
+    assert "rc=10054" in scrubbed
+    assert "-10807" in scrubbed
+    assert "[89006]" in scrubbed
+    assert "ConnectionID:329853" in scrubbed
+
+
+def test_scrubber_still_masks_a_configured_host_that_is_not_an_address() -> None:
+    """The pattern adds to the list, it does not replace it: a named host still gets masked."""
+    scrubber = SecretScrubber(["bw-host.invalid", "BWUSER"])
+    assert scrubber.scrub("connect to bw-host.invalid as BWUSER") == (
+        "connect to <redacted> as <redacted>"
+    )
+
+
 # --- Reconnect on transport loss -----------------------------------------------------------
 #
 # A whole-system analysis run does not fit in one database session: the reference system closed the session ~34

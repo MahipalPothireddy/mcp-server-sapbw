@@ -523,7 +523,8 @@ def test_a_followed_subroutine_stops_counting_as_an_unfollowed_call() -> None:
     assert not any(r.object_name.lower() == "routine_0013" for r in forms)
     # The function module inside the body is a different matter: it genuinely was not followed, and
     # naming it is the useful form of a lower bound.
-    modules = [r.object_name.upper() for r in field.unresolved_refs
-               if r.call_kind == "function_module"]
+    modules = [
+        r.object_name.upper() for r in field.unresolved_refs if r.call_kind == "function_module"
+    ]
     assert "CONVERT_TO_STAT_CURRENCY" in modules
     assert field.complexity.call_count == len(field.unresolved_refs)

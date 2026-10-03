@@ -135,9 +135,9 @@ class FakeConnection:
         self.closed = True
 
 
-def tableau_with(script: dict[str, list[tuple[Any, ...]]]) -> tuple[
-    TableauConnector, dict[str, Any]
-]:
+def tableau_with(
+    script: dict[str, list[tuple[Any, ...]]],
+) -> tuple[TableauConnector, dict[str, Any]]:
     """A connector wired to a scripted connection, plus the kwargs it was opened with."""
     seen: dict[str, Any] = {}
 
@@ -330,8 +330,16 @@ def test_raw_schedule_codes_are_carried_but_not_decoded() -> None:
 
 @pytest.mark.parametrize(
     ("minutes", "expected"),
-    [(0, "00:00"), (60, "01:00"), (390, "06:30"), (1439, "23:59"), (1440, None), (-1, None),
-     (None, None), ("x", None)],
+    [
+        (0, "00:00"),
+        (60, "01:00"),
+        (390, "06:30"),
+        (1439, "23:59"),
+        (1440, None),
+        (-1, None),
+        (None, None),
+        ("x", None),
+    ],
 )
 def test_minutes_past_midnight_render_as_a_clock(minutes: Any, expected: str | None) -> None:
     assert _minutes_to_clock(minutes) == expected
@@ -998,9 +1006,7 @@ def test_the_fallback_probe_is_credential_free_by_construction() -> None:
 
 def test_a_profile_that_already_allows_plain_http_does_not_probe_twice() -> None:
     """Nothing to establish: the profile has already accepted an unencrypted channel."""
-    session, asked = _session_with_fallback(
-        _RaisingClient(), use_tls=False, allow_plain_http=True
-    )
+    session, asked = _session_with_fallback(_RaisingClient(), use_tls=False, allow_plain_http=True)
     probe = session.logon()
 
     assert asked == []

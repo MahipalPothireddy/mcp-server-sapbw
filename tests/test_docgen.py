@@ -18,7 +18,12 @@ from mcp_server_sapbw.models.capability import CapabilityRecord, TableStatus
 from mcp_server_sapbw.models.chains import LoadedProvider
 from mcp_server_sapbw.models.description import Description
 from mcp_server_sapbw.models.hana import HanaCrossing, HanaCrossingReport
-from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
+from mcp_server_sapbw.models.lineage import (
+    ImpactAnalysis,
+    LineageEdge,
+    LineageGraph,
+    LineageNode,
+)
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.models.providers import AttributeRef, Provider
 from mcp_server_sapbw.models.queries import ElementProperties, Query, QueryElement
@@ -628,3 +633,70 @@ def test_gaps_register_is_not_merged_when_not_resuming(tmp_path: Path) -> None:
     _loaded_generator().generate(base, limit=5, sections=["chains"])
     text = (base / "99-gaps-and-risks.md").read_text(encoding="utf-8")
     assert "from a previous unrelated run" not in text
+
+
+# --- a provider page must say where its data surfaces -----------------------------------------
+
+
+def test_provider_page_names_the_composite_that_consumes_it_and_the_report_above_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DSO or ADSO usually reaches reporting *through* a CompositeProvider.
+
+    Found on a production page: an ADSO holding millions of records was a part provider of a
+    CompositeProvider that one BEx report reads. Its page said "Reports/queries on this provider: -"
+    and named neither the CompositeProvider nor the report, because the only query list it rendered
+    was the one assigned *directly* to the provider in `RSZCOMPIC`. The page therefore read as
+    though nothing consumed an object that feeds a live report.
+
+    The lineage read is stubbed here - its own module tests it - so what this pins is that the page
+    renders the part-provider hop and follows it to the reports on the consuming provider.
+    """
+    generator = _loaded_generator()
+    provenance = Provenance(source_table="RSOHCPR")
+    graph = LineageGraph(
+        root_id="ADSO_LOADED",
+        direction="downstream",
+        depth=1,
+        nodes=[
+            LineageNode(
+                id="ADSO_LOADED", object_type="adso", name="ADSO_LOADED", provenance=provenance
+            ),
+            LineageNode(
+                id="CP_TOP", object_type="compositeprovider", name="CP_TOP", provenance=provenance
+            ),
+        ],
+        edges=[
+            LineageEdge(
+                src="ADSO_LOADED",
+                dst="CP_TOP",
+                kind="composite_part",
+                confidence="exact",
+                provenance=provenance,
+            )
+        ],
+        node_count=2,
+        edge_count=1,
+    )
+    monkeypatch.setattr(
+        generator._lineage,
+        "impact_analysis",
+        lambda name, depth=1: ImpactAnalysis(
+            root_id=name, graph=graph, routine_lookup_consumers=["LOOKUP_CONSUMER"]
+        ),
+    )
+    # A report on the consuming CompositeProvider, not on the provider itself.
+    monkeypatch.setattr(
+        generator, "_query_by_provider", lambda cap: {"CP_TOP": ["QUERY_ON_THE_COMPOSITE"]}
+    )
+
+    result = generator.generate(tmp_path / "kb", limit=5, sections=["providers"])
+    page = (Path(result.output_dir) / "04-providers" / f"{_slug('ADSO_LOADED')}.md").read_text(
+        encoding="utf-8"
+    )
+    assert "CP_TOP" in page, "the CompositeProvider consuming this provider must be named"
+    assert "QUERY_ON_THE_COMPOSITE" in page, (
+        "a report reading this provider through a CompositeProvider must be named; listing only "
+        "directly-assigned queries reports 'no reports' for a provider that feeds a dashboard"
+    )
+    assert "LOOKUP_CONSUMER" in page, "the routine-embedded consumers must survive the change"

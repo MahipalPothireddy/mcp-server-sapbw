@@ -540,9 +540,7 @@ class TransformationsRepository(Repository):
                             object_name=name,
                             rule_id=_as_int(rule_id),
                             step_id=_as_int(step_id),
-                            provenance=self.provenance(
-                                logical, {"TRANID": owner, column: name}
-                            ),
+                            provenance=self.provenance(logical, {"TRANID": owner, column: name}),
                         )
                     )
         return {k: sorted(v, key=lambda i: (i.kind, i.object_name)) for k, v in out.items()}

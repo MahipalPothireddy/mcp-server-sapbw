@@ -71,8 +71,7 @@ def test_every_section_cites_a_real_capability_key() -> None:
     assert not offenders, (
         "these sections cite a logical name the capability map does not have, so"
         " `physical()` falls back to the logical name and the payload names a table that"
-        " does not exist (defect D60):\n  "
-        + "\n  ".join(offenders)
+        " does not exist (defect D60):\n  " + "\n  ".join(offenders)
     )
 
 

@@ -1463,8 +1463,11 @@ class AnalysisService:
         run.say(
             f"It runs {cadence.frequency} ({basis} from {cadence.run_count} run(s) over "
             f"{cadence.run_days} day(s))"
-            + (", and has not run within the window for that cadence." if cadence.active is False
-               else ".")
+            + (
+                ", and has not run within the window for that cadence."
+                if cadence.active is False
+                else "."
+            )
         )
         return cadence
 
@@ -1632,8 +1635,11 @@ class AnalysisService:
                 f"{len(stale)} of {len(parts)} part(s) are far behind the others"
                 + (f" and hold {frozen_rows:,} row(s) between them" if frozen_rows else "")
                 + f": {', '.join(f'{p} ({ages[p]}d)' for p in stale[:_NAMED_PARTS])}"
-                + (f", against {', '.join(current[:_NAMED_PARTS])} loaded within a day" if current
-                   else "")
+                + (
+                    f", against {', '.join(current[:_NAMED_PARTS])} loaded within a day"
+                    if current
+                    else ""
+                )
                 + ". Confirm this is intended - retained history behind a live union is a normal "
                 "design - and check which parts a report actually reads before comparing figures "
                 "across periods.",
@@ -2108,9 +2114,7 @@ class AnalysisService:
                 "Totals here will not reconcile against the provider, and nothing in the result "
                 "says a condition did it. Check these before treating a gap as a load fault.",
                 objects=[name, *labels[:_RISK_OBJECTS]],
-                evidence=[
-                    p for c in suppressing[:_RISK_OBJECTS] for p in _as_list(c.provenance)
-                ],
+                evidence=[p for c in suppressing[:_RISK_OBJECTS] for p in _as_list(c.provenance)],
                 detail="; ".join(
                     self._condition_risks_detail(c) for c in suppressing[:_RISK_OBJECTS]
                 ),

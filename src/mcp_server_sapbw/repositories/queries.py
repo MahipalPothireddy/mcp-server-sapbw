@@ -193,9 +193,7 @@ def _decode_contype(code: str | None) -> DecodedCode | None:
     if not text:
         return None
     label = _CONTYPE_LABELS.get(text)
-    return DecodedCode(
-        code=text, label=label, confidence="dictionary" if label else "advisory"
-    )
+    return DecodedCode(code=text, label=label, confidence="dictionary" if label else "advisory")
 
 
 def _decode_operator(code: str | None) -> DecodedCode | None:
@@ -224,9 +222,7 @@ def _decode_alert_level(code: str | None) -> DecodedCode:
     """``RSZRANGE.ALERTLEVEL`` against its declared domain ``RSRA_ALERT_LEVEL``."""
     text = (code or "").strip()
     label = _ALERT_LEVELS.get(text)
-    return DecodedCode(
-        code=text, label=label, confidence="dictionary" if label else "advisory"
-    )
+    return DecodedCode(code=text, label=label, confidence="dictionary" if label else "advisory")
 
 
 def _decode_evaluation_scope(code: str | None) -> DecodedCode | None:
@@ -235,9 +231,7 @@ def _decode_evaluation_scope(code: str | None) -> DecodedCode | None:
     if not text:
         return None
     label = _EXCABSREL_LABELS.get(text)
-    return DecodedCode(
-        code=text, label=label, confidence="dictionary" if label else "advisory"
-    )
+    return DecodedCode(code=text, label=label, confidence="dictionary" if label else "advisory")
 
 
 def _decode_threshold_source(code: str | None) -> ValueSource | None:
@@ -315,6 +309,8 @@ def _derive_axis(parent_deftp: str | None, laytp: str | None) -> tuple[QueryAxis
     if axis is None:
         return "unknown", f"{basis} (pair has no measured meaning)"
     return axis, basis
+
+
 # Every value of the LAYTP domain RSZLAYTP as DD07T documents it on 7.50, read from the live
 # dictionary rather than recalled. Nine of these were mapped and eight fell through to ``other``,
 # which on the reference system silently bucketed 24.4% of all element-tree edges (D24). The
@@ -516,7 +512,14 @@ class QueriesRepository(Repository):
         if unsupported is not None:
             return unsupported
 
-        where = ["OBJSTAT = 'ACT'"]
+        # OBJVERS first, and not optional. RSZCOMPDIR holds a row per *version* of a component, so
+        # without it one query is counted once per version it exists in - and OBJSTAT = 'ACT' does
+        # not substitute, because it is the activation state of the row, not the version of it.
+        # Measured on the reference system: 2,373 rows for 1,069 active queries (A 1,069, M 890,
+        # D 279, B 135), so the catalogue over-reported by 2.2x, the index listed every query up to
+        # four times with a different "last used" against each, and a documentation run rebuilt the
+        # same page for each duplicate. This is the exact failure mission rule 6 describes.
+        where = ["OBJVERS = 'A'", "OBJSTAT = 'ACT'"]
         params: list[Any] = []
         # RSZCOMPDIR lists all reusable components; restrict to actual queries (root DEFTP='REP').
         rep_filter = self._query_only_filter()
@@ -628,9 +631,7 @@ class QueriesRepository(Repository):
             )
             for uid in sorted(eltuids)
         ]
-        parent_deftp = {
-            uid: (_clean(row[0]) if row else None) for uid, row in directory.items()
-        }
+        parent_deftp = {uid: (_clean(row[0]) if row else None) for uid, row in directory.items()}
         edges = []
         for p, c, laytp, posn in edge_rows:
             axis, axis_basis = _derive_axis(parent_deftp.get(p), laytp)
@@ -701,9 +702,7 @@ class QueriesRepository(Repository):
         would otherwise list the same one twice.
         """
         filter_uids = {
-            uid
-            for uid, row in directory.items()
-            if row and str(row[0]).strip().upper() == "SOB"
+            uid for uid, row in directory.items() if row and str(row[0]).strip().upper() == "SOB"
         }
         if not filter_uids:
             return restrictions
@@ -739,9 +738,7 @@ class QueriesRepository(Repository):
         calc: _CalcAggregation | None = None,
         properties: ElementProperties | None = None,
     ) -> QueryElement:
-        deftp, mapname, reusable, subdeftp = (
-            directory if directory else (None, None, None, None)
-        )
+        deftp, mapname, reusable, subdeftp = directory if directory else (None, None, None, None)
         code = str(deftp).strip()
         element_type = _DEFTP_TO_TYPE.get(code, "unknown")
         if element_type == "selection":
@@ -749,19 +746,15 @@ class QueriesRepository(Repository):
             # condition or an exception, neither of which restricts 1KYFNM. Falling back to the D28
             # heuristic keeps the 1,581 blank-SUBDEFTP elements and the 12,357 structure elements on
             # exactly the behaviour they already had (D26).
-            element_type = _SUBDEFTP_TO_TYPE.get(
-                str(subdeftp).strip().upper()
-            ) or _selection_type(selected or [])
+            element_type = _SUBDEFTP_TO_TYPE.get(str(subdeftp).strip().upper()) or _selection_type(
+                selected or []
+            )
         # The InfoObject a characteristic placement places. It has no MAPNAME of its own, so without
         # this it is an anonymous row - which is why only 31 of the subject query's 107 elements
         # carried any identifier. 1KYFNM is the key-figure dimension, not a business characteristic,
         # so it is not reported as one.
         iobjnm = next(
-            (
-                name
-                for name in (selected or [])
-                if name.strip().upper() != _KEY_FIGURE_DIMENSION
-            ),
+            (name for name in (selected or []) if name.strip().upper() != _KEY_FIGURE_DIMENSION),
             None,
         )
         return QueryElement(
@@ -1490,9 +1483,7 @@ class QueriesRepository(Repository):
         """
         names: set[str] = {e.name for e in elements if e.element_type == "variable" and e.name}
         self._add_restriction_variables(restrictions, names)
-        uids: set[str] = {
-            e.eltuid for e in elements if e.element_type == "variable" and not e.name
-        }
+        uids: set[str] = {e.eltuid for e in elements if e.element_type == "variable" and not e.name}
         return self._fetch_variables(names, uids)
 
     @staticmethod

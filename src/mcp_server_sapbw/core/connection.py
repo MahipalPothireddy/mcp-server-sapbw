@@ -220,8 +220,25 @@ def assert_read_only(sql: str) -> None:
 # --- Secret scrubbing --------------------------------------------------------------------
 
 
+#: Any IPv4 address, with an optional port. Masked regardless of whether it matches the configured
+#: host, because the driver reports addresses this process never configured: a transport failure
+#: from hdbcli names the *resolved* server address, the client's own address, and both ports -
+#: "System call 'recv' failed ... {198.51.100.10:62939 -> 203.0.113.67:30215}". Literal
+#: replacement of the profile's host string cannot catch either of those, so a real connection drop
+#: returned both endpoints to the caller and wrote them to the log. Numeric error codes (`rc=10054`,
+#: `(-10807,`) do not match this shape and are left intact, because they are what makes the error
+#: diagnosable.
+_ENDPOINT = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
+
+
 class SecretScrubber:
-    """Replaces known sensitive strings (host, user, password) with ``<redacted>``."""
+    """Replaces known sensitive strings (host, user, password) and any endpoint with a placeholder.
+
+    Two mechanisms, because they fail in opposite directions. The known-secret list is exact but
+    only covers what this process was told; the endpoint pattern is approximate but covers what the
+    driver volunteers. Mission Rule 5 requires connection details never to reach an error message,
+    and that cannot be satisfied by a list alone.
+    """
 
     def __init__(self, secrets: Iterable[str]) -> None:
         # Longest first so overlapping secrets are fully masked.
@@ -230,7 +247,7 @@ class SecretScrubber:
     def scrub(self, text: str) -> str:
         for secret in self._secrets:
             text = text.replace(secret, "<redacted>")
-        return text
+        return _ENDPOINT.sub("<redacted-endpoint>", text)
 
     @classmethod
     def for_profile(cls, profile: Profile) -> SecretScrubber:

@@ -269,8 +269,7 @@ class FieldLineageService(Repository):
         if self.capability.is_available("nav_attribute"):
             table = self.physical("nav_attribute") or "RSDATRNAV"
             return (
-                f"{head}, and it is not a navigation attribute "
-                f"({table} has no row for it); {tail}"
+                f"{head}, and it is not a navigation attribute ({table} has no row for it); {tail}"
             )
         return (
             f"{head}. Whether it is a navigation attribute could not be checked: "
@@ -692,9 +691,7 @@ class FieldLineageService(Repository):
         return _datasource_name(raw) if source.kind in _BOUNDARY_KINDS else raw
 
     @staticmethod
-    def _transformation_note(
-        advisory: bool, siblings: list[str], chosen: str | None
-    ) -> str | None:
+    def _transformation_note(advisory: bool, siblings: list[str], chosen: str | None) -> str | None:
         """Say both things that can be true of this hop: it fans out, and it may be advisory."""
         parts: list[str] = []
         if len(siblings) > 1:

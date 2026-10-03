@@ -759,9 +759,7 @@ def test_package_texts_are_unescaped() -> None:
 def owners_for(mapping: dict[str, tuple[str, str]]) -> dict[str, TableOwner]:
     """``{table: (package, package description)}`` as the analyzer receives it."""
     return {
-        table.upper(): TableOwner(
-            table=table.upper(), package=package, package_description=text
-        )
+        table.upper(): TableOwner(table=table.upper(), package=package, package_description=text)
         for table, (package, text) in mapping.items()
     }
 
@@ -816,9 +814,7 @@ def test_unattributed_tables_make_the_owner_count_a_lower_bound() -> None:
     customer-metadata check, which is right to reject it: the check cannot tell an invented
     customer name from a real one, and that is the property that makes it worth having.
     """
-    ownership = _describe_ownership(
-        ["VBRP", "NOSUCHTAB"], owners_for({"VBRP": ("VF", "Invoice")})
-    )
+    ownership = _describe_ownership(["VBRP", "NOSUCHTAB"], owners_for({"VBRP": ("VF", "Invoice")}))
     assert ownership.unresolved == ["NOSUCHTAB"]
     assert "lower bound" in ownership.detail
     assert "NOSUCHTAB" not in str(ownership.by_package)

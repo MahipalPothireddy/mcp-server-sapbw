@@ -137,6 +137,7 @@ def _host_tokens(text: str) -> set[str]:
         hits.add(token)
     return hits
 
+
 # Working-tree directories never scanned (git-ignored artefacts, caches, and the fixtures dir where
 # synthetic sample names deliberately live).
 SKIP_DIRS = {

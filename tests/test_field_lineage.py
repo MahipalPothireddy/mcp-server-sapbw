@@ -121,12 +121,32 @@ _NAV_ATTRIBUTES: dict[str, tuple[str, str]] = {
 _HEADER.update(
     {
         "TR_CUST_A": (
-            "ACT", "RSDS", "", "DS_CUST_MAIN".ljust(30) + "SRC100",
-            "IOBJ", "", "CUSTOMER", "", "", "", "", "",
+            "ACT",
+            "RSDS",
+            "",
+            "DS_CUST_MAIN".ljust(30) + "SRC100",
+            "IOBJ",
+            "",
+            "CUSTOMER",
+            "",
+            "",
+            "",
+            "",
+            "",
         ),
         "TR_CUST_B": (
-            "ACT", "RSDS", "", "DS_CUST_EXTRA".ljust(30) + "SRC200",
-            "IOBJ", "", "CUSTOMER", "", "", "", "", "",
+            "ACT",
+            "RSDS",
+            "",
+            "DS_CUST_EXTRA".ljust(30) + "SRC200",
+            "IOBJ",
+            "",
+            "CUSTOMER",
+            "",
+            "",
+            "",
+            "",
+            "",
         ),
     }
 )
@@ -581,7 +601,18 @@ def test_a_self_transformation_is_not_the_branch_the_chain_follows() -> None:
     the branch worth following.
     """
     _HEADER["TR_SELF"] = (
-        "ACT", "IOBJ", "", "CUSTOMER", "IOBJ", "", "CUSTOMER", "", "", "", "", "",
+        "ACT",
+        "IOBJ",
+        "",
+        "CUSTOMER",
+        "IOBJ",
+        "",
+        "CUSTOMER",
+        "",
+        "",
+        "",
+        "",
+        "",
     )
     _RULES["TR_SELF"] = [(1, "DIRECT", "MOV", "S", "")]
     _FIELDS["TR_SELF"] = [(1, "1", "COUNTRY", ""), (1, "0", "COUNTRY", "")]
@@ -607,8 +638,18 @@ def test_a_constant_branch_is_not_preferred_over_one_carrying_a_source_field() -
     a terminal one for no reason.
     """
     _HEADER["TR_CUST_C"] = (
-        "ACT", "RSDS", "", "AAA_FIRST_ALPHABETICALLY".ljust(30) + "SRC300",
-        "IOBJ", "", "CUSTOMER", "", "", "", "", "",
+        "ACT",
+        "RSDS",
+        "",
+        "AAA_FIRST_ALPHABETICALLY".ljust(30) + "SRC300",
+        "IOBJ",
+        "",
+        "CUSTOMER",
+        "",
+        "",
+        "",
+        "",
+        "",
     )
     _RULES["TR_CUST_C"] = [(1, "CONSTANT", "", "S", "")]
     _FIELDS["TR_CUST_C"] = [(1, "1", "COUNTRY", "")]  # target only: no source field
@@ -695,7 +736,7 @@ def test_multiprovider_identification_rename_is_read_not_assumed() -> None:
 
 
 def test_multiprovider_field_with_no_identification_row_says_so_specifically() -> None:
-    """"No part supplies this" is a different answer from "no rule found", and only one of them is
+    """ "No part supplies this" is a different answer from "no rule found", and only one of them is
     true here. Saying the general thing would hide that BW was actually consulted."""
     path = _service().trace_field("SALES_MP", "NOT_UNIONED")
     assert path.resolution == "none"

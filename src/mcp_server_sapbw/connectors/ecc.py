@@ -117,6 +117,7 @@ def _best_object_reference(xml: str, name: str) -> tuple[str, str, str] | None:
     attributing
     it to whatever came back.
     """
+
     def attr(pattern: re.Pattern[str], attrs: str) -> str:
         match = pattern.search(attrs)
         return match.group(1) if match else ""

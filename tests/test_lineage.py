@@ -44,6 +44,12 @@ _TABLES = {
 _ISOLATED_CUBE = "RETIRED_CUBE"
 
 _BIC_LOOKUP = "/BIC/" + "ALOOKUP_DSO00"  # concatenated so the scan does not match this .py file
+# An *Advanced* DSO read by the same routine. '...2' is the ADSO active table, where the '...00'
+# above is a classic DSO's. Both are routine-resolved, and the node type each produces is the point:
+# the routine path used to emit "dso" for the first and "infoobject" for everything else, so an ADSO
+# found inside ABAP was typed - and coloured in every rendered diagram - as master data.
+_BIC_LOOKUP_ADSO = "/BIC/" + "ALOOKUP_ADSO2"
+_ROUTINE_ADSO = "LOOKUP_ADSO"
 
 # A query element sitting on top of the cube, reached by a transformation whose target TLOGO is
 # 'ELEM'. Present because a real BW 7.50 system has these and the walk reaching one used to discard
@@ -126,6 +132,7 @@ _RSAABAP = {
     "CODE_TR2": [
         "METHOD start.",
         "  SELECT * FROM " + _BIC_LOOKUP + " INTO TABLE lt.",
+        "  SELECT * FROM " + _BIC_LOOKUP_ADSO + " INTO TABLE lt_adso.",
         "ENDMETHOD.",
     ]
 }
@@ -142,9 +149,7 @@ _LOOKUP_ADSO = "RATE_ADSO"
 _LOOKUP_IOBJ = "COST_CENTRE"
 
 # RULEID, STEPID, ADSONM, BEHAVIOR, CONSTANT   ('C' = substitute a constant on a miss)
-_ADSO_STEP_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {
-    "TR2": [(2, 1, _LOOKUP_ADSO, "C", "0.00")]
-}
+_ADSO_STEP_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {"TR2": [(2, 1, _LOOKUP_ADSO, "C", "0.00")]}
 # RULEID, STEPID, IOBJNM, MPER, DATEIOBJNM, CONSTANT
 _MASTER_STEP_LOOKUPS: dict[str, list[tuple[Any, ...]]] = {
     "TR2": [(3, 1, _LOOKUP_IOBJ, "2", "POSTING_DATE", "")]
@@ -334,6 +339,28 @@ def test_upstream_lineage_includes_routine_lookup() -> None:
     routine_edges = [e for e in graph.edges if e.kind == "routine_lookup"]
     assert any(e.src == "LOOKUP_DSO" and e.dst == "SALES_CUBE" for e in routine_edges)
     assert all(e.confidence == "advisory" for e in routine_edges)
+
+
+def test_a_routine_resolved_adso_is_typed_adso_not_master_data() -> None:
+    """The routine path must decode the kind it resolved, not collapse it to two possibilities.
+
+    It used to read ``"dso" if kind == "dso" else "infoobject"``, so an ADSO or an InfoCube reached
+    through routine ABAP arrived typed as an InfoObject. Nothing downstream re-derived the type, so
+    the mislabel reached impact analysis, the generated documentation and every diagram - where it
+    also picked up the master-data colour, making a transactional store look like master data.
+    """
+    graph = _service().get_lineage("SALES_CUBE", direction="upstream", depth=3)
+    assert not isinstance(graph, UnsupportedResult)
+    by_name = {n.name: n for n in graph.nodes}
+
+    assert _ROUTINE_ADSO in by_name, "the ADSO the routine reads must reach the graph"
+    assert by_name[_ROUTINE_ADSO].object_type == "adso"
+    # The classic DSO beside it still decodes as before: this is a widening, not a re-mapping.
+    assert by_name["LOOKUP_DSO"].object_type == "dso"
+
+    # Both arrive as advisory routine edges - correcting the type must not promote the evidence.
+    kinds = {e.src: (e.kind, e.confidence) for e in graph.edges if e.dst == "SALES_CUBE"}
+    assert kinds[_ROUTINE_ADSO] == ("routine_lookup", "advisory")
 
 
 def test_trace_to_source_reaches_datasource() -> None:

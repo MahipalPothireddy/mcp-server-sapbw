@@ -115,6 +115,7 @@ def detect_sso(location: str) -> str | None:
         return "federated single sign-on"
     return None
 
+
 #: BIPRWS web-application roots, newest layout first. BI 4.3 SP03 merged the RESTful services into
 #: the BOE web application; before that they were a separate ``biprws`` webapp. Probed in order.
 BIPRWS_ROOT_CANDIDATES: tuple[str, ...] = ("/BOE/biprws", "/biprws")
@@ -272,9 +273,7 @@ class _BiprwsSession:
         findings with four different owners, and the caller reports which one it got.
         """
         client = self._ensure_client()
-        roots = (
-            (self._profile.base_path,) if self._profile.base_path else BIPRWS_ROOT_CANDIDATES
-        )
+        roots = (self._profile.base_path,) if self._profile.base_path else BIPRWS_ROOT_CANDIDATES
         last: BiprwsProbe | None = None
         for root in roots:
             if not root:
@@ -467,13 +466,13 @@ class BobjConnector:
         session: _BiprwsSession | None = None,
     ) -> None:
         if profile is not None and profile.kind != "bobj":
-            raise BiConnectorError(
-                f"profile '{profile.name}' is kind '{profile.kind}', not 'bobj'"
-            )
+            raise BiConnectorError(f"profile '{profile.name}' is kind '{profile.kind}', not 'bobj'")
         self._profile = profile
         # Injectable so the connector is fully testable offline with no HTTP stack involved.
-        self._session = session if session is not None else (
-            _BiprwsSession(profile) if profile is not None else None
+        self._session = (
+            session
+            if session is not None
+            else (_BiprwsSession(profile) if profile is not None else None)
         )
         self._probe: BiprwsProbe | None = None
 
@@ -889,8 +888,7 @@ class TableauConnector:
             present = {
                 str(row[0]).lower()
                 for row in self.query(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema = 'public'"
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
                 )
             }
         except BiConnectorError as exc:
@@ -1102,9 +1100,7 @@ class TableauConnector:
             kind: BiSourceKind = (
                 "calc_view"
                 if generated_view
-                else _classify_tableau_source(
-                    str(dbclass or ""), str(tablename or dbname or "")
-                )
+                else _classify_tableau_source(str(dbclass or ""), str(tablename or dbname or ""))
             )
             out.append(
                 BiDashboardSource(
@@ -1118,9 +1114,9 @@ class TableauConnector:
             )
         return out
 
-    def _content_names(self, workbooks: str | None, datasources: str | None) -> dict[
-        tuple[str, Any], str
-    ]:
+    def _content_names(
+        self, workbooks: str | None, datasources: str | None
+    ) -> dict[tuple[str, Any], str]:
         """``(owner_type, id) -> content name`` for every workbook and published datasource.
 
         One read per content type rather than a join per connection row: ``data_connections`` has a
@@ -1239,8 +1235,7 @@ class TableauConnector:
         if not probe.reachable or not connections:
             return 0
         rows = self.query(
-            f"SELECT count(*) FROM {connections} "
-            f"WHERE position(%s in coalesce(dbname,'')) > 0",
+            f"SELECT count(*) FROM {connections} WHERE position(%s in coalesce(dbname,'')) > 0",
             [_SYS_BIC_MARKER],
         )
         return int(rows[0][0]) if rows else 0
@@ -1256,9 +1251,9 @@ class TableauConnector:
                 self._conn = None
 
 
-def _classify_tableau_source(dbclass: str, target: str) -> Literal[
-    "calc_view", "bw_provider", "unknown"
-]:
+def _classify_tableau_source(
+    dbclass: str, target: str
+) -> Literal["calc_view", "bw_provider", "unknown"]:
     """Read a Tableau connection's class and target as "calc view" or "BW provider".
 
     Advisory by construction, and labelled ``unknown`` rather than guessed when neither signal is

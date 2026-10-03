@@ -316,9 +316,7 @@ class ScriptedConnection:
         if "RSZSELECT" in sql:
             ids = _in_params(sql, params)
             if "ACTIVE" in sql:
-                return [
-                    (k, *v[1:]) for k, v in _COND_SELECT.items() if k in ids and v[0] in ids
-                ]
+                return [(k, *v[1:]) for k, v in _COND_SELECT.items() if k in ids and v[0] in ids]
             rows = [(k, o) for k, objs in _SELECT.items() if k in ids for o in objs]
             # Two callers, two column lists: one wants the InfoObject names alone (to find which
             # elements are variables), the other needs them keyed by element to classify a
@@ -335,9 +333,7 @@ class ScriptedConnection:
             # for one known only by its element uid (D25). Either may match.
             ids = {str(p).strip() for p in params}
             return [
-                (k, v[0], v[1], v[2], v[3])
-                for k, v in _GLOBV.items()
-                if k in ids or v[4] in ids
+                (k, v[0], v[1], v[2], v[3]) for k, v in _GLOBV.items() if k in ids or v[4] in ids
             ]
         if "RSBKDTP" in sql:
             return []
@@ -458,12 +454,22 @@ def test_every_documented_laytp_code_decodes_to_something_other_than_other() -> 
     documents it, read from the live dictionary rather than recalled.
     """
     documented = {
-        "NIL": "No Layout", "ROW": "Row", "COL": "Column", "CEL": "Cell",
-        "NAV": "Navigation", "AGG": "Aggregated", "FIX": "Filter",
-        "MBR": "Structure element", "OPD": "Operand", "RNG": "Area",
-        "REP": "Internal Use", "VAR": "Variable Sequence",
-        "FLT": "Formatted Reporting - Order", "ATR": "Order of Attributes",
-        "SHT": "Query Sheet", "SOB": "Selection Object",
+        "NIL": "No Layout",
+        "ROW": "Row",
+        "COL": "Column",
+        "CEL": "Cell",
+        "NAV": "Navigation",
+        "AGG": "Aggregated",
+        "FIX": "Filter",
+        "MBR": "Structure element",
+        "OPD": "Operand",
+        "RNG": "Area",
+        "REP": "Internal Use",
+        "VAR": "Variable Sequence",
+        "FLT": "Formatted Reporting - Order",
+        "ATR": "Order of Attributes",
+        "SHT": "Query Sheet",
+        "SOB": "Selection Object",
         "QVR": "Variable Squence of Query Variables",
     }
     undecoded = sorted(code for code in documented if code not in _LAYTP_TO_ROLE)
@@ -1462,3 +1468,43 @@ def test_a_variable_found_by_both_routes_is_listed_once() -> None:
     names = [v.name for v in query.variables]
     assert names.count("USD_VAR") == 1
     assert len(names) == len(set(names))
+
+
+# --- the catalogue must read one version of each query ----------------------------------------
+
+
+def test_the_query_catalogue_reads_only_the_active_version() -> None:
+    """``RSZCOMPDIR`` holds a row per *version*, so an unfiltered catalogue counts each query once
+    per version it exists in.
+
+    Measured on the reference system before this was fixed: **2,373 rows for 1,069 active queries**
+    (A 1,069, M 890, D 279, B 135). Three consequences, all of them visible to a user: the total
+    over-reported by 2.2x, the generated index listed a query up to four times with a different
+    "last used" date against each, and a documentation run rebuilt the same page once per duplicate.
+
+    ``OBJSTAT = 'ACT'`` does not substitute for the version filter. It is the activation state of a
+    row, and the modified and delivered versions carry it too - which is exactly why the omission
+    survived: the catalogue looked filtered.
+    """
+
+    class VersionedConnection(ScriptedConnection):
+        """Four versions of one query, with the version filter applied as a database would."""
+
+        @staticmethod
+        def _compdir(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+            if "TSTPNM" in sql:  # the header read, unrelated to this
+                return ScriptedConnection._compdir(sql, params)
+            every_version = [
+                ("Q1UID", "SALES_QUERY", "OWNER1", _HEADER[4]),  # A - the live definition
+                ("Q1UID_M", "SALES_QUERY", "OWNER1", _HEADER[4]),  # M - being edited
+                ("Q1UID_D", "SALES_QUERY", "OWNER1", _HEADER[4]),  # D - shipped by SAP
+                ("Q1UID_B", "SALES_QUERY", "OWNER1", _HEADER[4]),  # B - backup
+            ]
+            return every_version[:1] if "OBJVERS = 'A'" in sql else every_version
+
+    result = QueriesRepository(VersionedConnection(), _capability()).list_queries(limit=50)
+    assert not isinstance(result, UnsupportedResult)
+    summaries, _total = result
+    assert [s.compuid for s in summaries] == ["Q1UID"], (
+        "the catalogue listed more than one version of the same query; it must read OBJVERS = 'A'"
+    )

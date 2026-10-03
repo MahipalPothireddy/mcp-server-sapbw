@@ -189,6 +189,19 @@ _LOOKUP_PROVENANCE: dict[str, tuple[str, str]] = {
     "adso": ("transformation_step_adso", "ADSONM"),
 }
 
+#: Node type per ``TableDependency.resolved_kind`` from the routine parser. Exhaustive over the
+#: kinds that model declares ('dso', 'adso', 'infocube', 'infoobject'), which is the point: this
+#: used to be ``"dso" if kind == "dso" else "infoobject"``, so an ADSO or a cube resolved out of
+#: routine ABAP was typed - and therefore coloured, in every rendered diagram - as master data.
+#: Only the routine path was affected; the declared path above always decoded its kind properly.
+#: An unresolved kind maps to ``unknown`` rather than to a type we did not read.
+_ROUTINE_KIND_TO_NODE: dict[str, LineageNodeType] = {
+    "dso": "dso",
+    "adso": "adso",
+    "infocube": "infocube",
+    "infoobject": "infoobject",
+}
+
 
 def _is_dtp_endpoint(type_code: str | None) -> bool:
     """Whether a transformation endpoint's TLOGO says the *name* is a DTP rather than an object.
@@ -423,6 +436,11 @@ class LineageService(Repository):
         #: calc view -> the BW objects under it. Per-instance rather than on disk: it is one
         #: statement plus a catalogue lookup, and a stale entry would outlive a re-activated view.
         self._calc_base_memo: dict[str, list[Any]] = {}
+        #: CompositeProvider -> its parsed stored model, or ``None`` when the model could not be
+        #: read. Consulted by the consumer direction to confirm a part relationship the calc view
+        #: suggested, so the same fact carries the same confidence whichever end the walk started
+        #: from. Memoised because one walk meets the same CompositeProvider from each of its parts.
+        self._part_model_memo: dict[str, Any] = {}
 
     # --- public API ----------------------------------------------------------------------
 
@@ -1709,6 +1727,72 @@ class LineageService(Repository):
                 return buckets  # a short page means the batch is exhausted
         return None
 
+    def _declared_part_input(self, provider: str, part: str) -> Any | None:
+        """The CompositeProvider's own stored input for ``part``, or ``None`` if it declares none.
+
+        The confirmation step that makes :meth:`_part_edge` direction-independent. Reading the model
+        here costs one extract per CompositeProvider met, memoised, and it is the *same* read the
+        upstream direction already performs in :meth:`_declared_part_hops` - so a relationship both
+        directions can see is now described identically by both, instead of being exact walking from
+        the CompositeProvider and advisory walking from the part.
+        """
+        key = provider.strip().upper()
+        if key not in self._part_model_memo:
+            model = self._providers.composite_model(provider)
+            self._part_model_memo[key] = (
+                model if (model is not None and model.parsed and model.inputs) else None
+            )
+        model = self._part_model_memo[key]
+        if model is None:
+            return None
+        target = part.strip().upper()
+        for candidate in model.part_inputs:
+            # Either spelling confirms it: the model names a BW object in ``part_name`` and, for a
+            # calc-view part, its _SYS_BIC runtime form - and which one a walk arrives under depends
+            # on where it came from.
+            names = {
+                (candidate.part_name or "").strip().upper(),
+                (candidate.runtime_view_name or "").strip().upper(),
+            } - {""}
+            if target in names:
+                return candidate
+        return None
+
+    def _part_edge(self, part: str, provider: str, provenance: Provenance) -> LineageEdge:
+        """A ``composite_part`` edge, confirmed against the stored model where that is possible.
+
+        The calc view establishes *that* a CompositeProvider reads this object; the stored model
+        establishes that BW declares it as a part, names the alias, and quotes its own entity
+        reference. When the model confirms, this edge is byte-identical to the one the upstream walk
+        emits. When the model cannot be read, the edge stays advisory - the evidence really is
+        weaker then, and saying so is the point of the field.
+        """
+        declared = self._declared_part_input(provider, part)
+        if declared is None:
+            return LineageEdge(
+                src=part,
+                dst=provider,
+                kind="composite_part",
+                derivation="declared",
+                confidence="advisory",
+                note="CompositeProvider resolved via its generated calc view",
+                evidence=evidence_for("calc_view_consumer", "provider"),
+                provenance=provenance,
+            )
+        return LineageEdge(
+            src=part,
+            dst=provider,
+            kind="composite_part",
+            derivation="declared",
+            confidence="exact",
+            note=(
+                f"declared as input {declared.alias!r} of the CompositeProvider's stored "
+                f"model ({declared.entity_ref})"
+            ),
+            evidence=evidence_for("composite_part", "declared_model"),
+            provenance=self.provenance("composite_header", {"HCPRNM": provider, "OBJVERS": "A"}),
+        )
+
     def _consumer_hop(self, name: str, view_name: str, *, root_key: str) -> _Hop | None:
         """One dependent calc view read as the object that owns it, or ``None`` if it owns nothing.
 
@@ -1726,20 +1810,7 @@ class LineageService(Repository):
             # tables, so that row is a resolver artefact rather than a lineage relationship.
             if provider.strip().upper() == root_key:
                 return None
-            return _Hop(
-                provider,
-                "compositeprovider",
-                LineageEdge(
-                    src=name,
-                    dst=provider,
-                    kind="composite_part",
-                    derivation="declared",
-                    confidence="advisory",
-                    note="CompositeProvider resolved via its generated calc view",
-                    evidence=evidence_for("calc_view_consumer", "provider"),
-                    provenance=provenance,
-                ),
-            )
+            return _Hop(provider, "compositeprovider", self._part_edge(name, provider, provenance))
 
         resolved = query_from_calc_view(view_name)
         if resolved is None:
@@ -2096,9 +2167,7 @@ class LineageService(Repository):
     ) -> LineageEdge:
         lookup_kind = of.kind if of is not None else kind
         readable = _LOOKUP_KIND_LABEL.get(lookup_kind or "", "declared")
-        logical, column = _LOOKUP_PROVENANCE.get(
-            lookup_kind or "", ("transformation", "TRANID")
-        )
+        logical, column = _LOOKUP_PROVENANCE.get(lookup_kind or "", ("transformation", "TRANID"))
         key = {"TRANID": tran_id}
         if of is not None:
             key[column] = of.object_name
@@ -2150,8 +2219,8 @@ class LineageService(Repository):
                     if not obj or obj in seen:
                         continue
                     seen.add(obj)
-                    node_type: LineageNodeType = (
-                        "dso" if dep.resolved_kind == "dso" else "infoobject"
+                    node_type: LineageNodeType = _ROUTINE_KIND_TO_NODE.get(
+                        (dep.resolved_kind or "").strip().lower(), "unknown"
                     )
                     hops.append(
                         _Hop(

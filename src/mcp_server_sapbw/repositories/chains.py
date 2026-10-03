@@ -144,6 +144,8 @@ class _StepAnalysis:
     steps_examined: int = 0
     self_overlaps: int = 0
     run_windows: list[tuple[datetime, datetime]] = field(default_factory=list)
+
+
 _TS_DIGITS = 14  # YYYYMMDDHHMMSS
 _DATE_DIGITS = 8  # YYYYMMDD
 

@@ -194,6 +194,22 @@ def _order_within_layers(
             positions[nid] = index
 
 
+#: Vertical slack added when the graph contains an edge spanning more than one column. Half lands
+#: above the columns and half below, each half wide enough to hold a corridor and its clearance.
+_ROUTE_BAND = 44
+
+
+def _needs_route_band(edges: list[LineageEdge], layer_of: dict[str, int]) -> bool:
+    """Whether any edge spans more than one column, and so has to be routed around boxes."""
+    return any(
+        edge.src != edge.dst
+        and edge.src in layer_of
+        and edge.dst in layer_of
+        and abs(layer_of[edge.dst] - layer_of[edge.src]) > 1
+        for edge in edges
+    )
+
+
 def build_layout(graph: LineageGraph, *, title: str = "", subtitle: str = "") -> DiagramLayout:
     """Position a lineage graph into deterministic left-to-right layers."""
     node_ids = [n.id for n in graph.nodes]
@@ -212,6 +228,13 @@ def build_layout(graph: LineageGraph, *, title: str = "", subtitle: str = "") ->
     rows = max((len(m) for m in layers.values()), default=1)
     width = _MARGIN * 2 + len(layers) * _NODE_W + max(len(layers) - 1, 0) * _H_GAP
     height = _MARGIN * 2 + _HEADER_H + _LEGEND_H + rows * _NODE_H + max(rows - 1, 0) * _V_GAP
+    if _needs_route_band(graph.edges, layer_of):
+        # Slack for edges that have to be routed around boxes. Columns are centred in the content
+        # area, so this appears as clearance above and below every column - which is where a
+        # corridor goes. Without it a graph one row deep has nowhere to route and the edge would be
+        # drawn through the boxes between its endpoints. Added only when such an edge exists, so
+        # diagrams that never needed routing keep the canvas they had.
+        height += _ROUTE_BAND
 
     nodes: list[LayoutNode] = []
     for layer_index, members in sorted(layers.items()):
@@ -239,6 +262,178 @@ def build_layout(graph: LineageGraph, *, title: str = "", subtitle: str = "") ->
         truncated=graph.truncated,
         layer_count=len(layers),
     )
+
+
+# --- edge routing -------------------------------------------------------------------------
+#
+# An edge between *adjacent* columns cannot cross a box: the only space between them is the gutter,
+# and the gutter holds no boxes. An edge spanning more than one column has boxes in its way, and a
+# single bezier drawn between the two endpoints runs flat through them - which is how a production
+# figure came to read as if an ADSO fed a DataSource it has no relationship with. Measured on that
+# graph: 4 of 11 edges passed through the rectangle of a node they were not connected to, one of
+# them through three.
+#
+# So a multi-column edge is routed through a horizontal corridor that is free of boxes across the
+# span it traverses, turning into and out of that corridor inside the gutters either side - where,
+# again, there are no boxes. Non-crossing is then a property of the construction rather than
+# something to verify afterwards. Adjacent-column edges keep their original single-curve shape, so
+# this changes only the diagrams that were wrong.
+
+_Point = tuple[float, float]
+_Segment = tuple[_Point, _Point, _Point, _Point]
+
+_DIRECT_POINTS = 2  # start and end: the shape an edge between adjacent columns keeps
+_ROUTED_POINTS = 4  # start, two turns, end: an edge taken through a corridor
+_BEND = _H_GAP * 0.5  # how far into the gutter an edge turns toward its corridor
+_CORRIDOR_PAD = 6.0  # clearance kept between a routed run and the boxes bounding its band
+_CORRIDOR_MIN = 14.0  # a band narrower than this cannot hold a line plus that clearance
+_LANE_STEP = 9.0  # separation between parallel edges of the same pair
+_LABEL_LANE_STEP = 11.0  # and between their labels, which otherwise print on top of each other
+
+
+def _free_bands(layout: DiagramLayout, x_lo: float, x_hi: float) -> list[_Point]:
+    """Horizontal bands spanning ``[x_lo, x_hi]`` that no node box occupies."""
+    occupied = sorted(
+        (node.y, node.y + _NODE_H)
+        for node in layout.nodes
+        if node.x < x_hi and node.x + _NODE_W > x_lo
+    )
+    merged: list[list[float]] = []
+    for top, bottom in occupied:
+        if merged and top <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], bottom)
+        else:
+            merged.append([top, bottom])
+    bands: list[_Point] = []
+    cursor = float(_MARGIN + _HEADER_H)
+    for top, bottom in merged:
+        if top - cursor >= _CORRIDOR_MIN:
+            bands.append((cursor, top))
+        cursor = max(cursor, bottom)
+    content_bottom = float(layout.height - _MARGIN - _LEGEND_H)
+    if content_bottom - cursor >= _CORRIDOR_MIN:
+        bands.append((cursor, content_bottom))
+    return bands
+
+
+def _corridor_y(layout: DiagramLayout, x_lo: float, x_hi: float, y_target: float) -> float | None:
+    """The free band closest to ``y_target``, or ``None`` when every band is too narrow."""
+    bands = _free_bands(layout, x_lo, x_hi)
+    if not bands:
+        return None
+
+    def within(band: _Point) -> float:
+        top, bottom = band
+        return min(max(y_target, top + _CORRIDOR_PAD), bottom - _CORRIDOR_PAD)
+
+    return within(min(bands, key=lambda band: abs(within(band) - y_target)))
+
+
+def route_edge(
+    layout: DiagramLayout, src: LayoutNode, dst: LayoutNode, *, lane: int = 0
+) -> list[_Point]:
+    """Waypoints for one edge: two for a direct hop, four when it is routed via a corridor.
+
+    ``lane`` separates parallel edges of the same pair - a transformation and the routine lookup
+    between the same two objects are two facts, and drawn on one line they read as one.
+    """
+    x1, y1 = src.x + _NODE_W, src.y + _NODE_H / 2
+    x2, y2 = dst.x, dst.y + _NODE_H / 2
+    if x2 < x1:  # backward edge (cycle): leave from the left, arrive on the right
+        x1, y1 = src.x, src.y + _NODE_H / 2
+        x2, y2 = dst.x + _NODE_W, dst.y + _NODE_H / 2
+    if abs(dst.layer - src.layer) <= 1:
+        return [(x1, y1), (x2, y2)]
+    step = _BEND if x2 >= x1 else -_BEND
+    bend_out, bend_in = x1 + step, x2 - step
+    corridor = _corridor_y(
+        layout,
+        min(bend_out, bend_in),
+        max(bend_out, bend_in),
+        (y1 + y2) / 2 + lane * _LANE_STEP,
+    )
+    if corridor is None:
+        # Every band across the span is occupied. Nothing to do but go direct; a dense graph is
+        # drawn as it was before rather than routed somewhere that would also cross a box.
+        return [(x1, y1), (x2, y2)]
+    return [(x1, y1), (bend_out, corridor), (bend_in, corridor), (x2, y2)]
+
+
+def _route_segments(points: list[_Point], *, bow: float = 0.0) -> list[_Segment]:
+    """The route as cubic segments, so SVG and PNG draw one shape from one source."""
+    if len(points) == _DIRECT_POINTS:
+        (x1, y1), (x2, y2) = points
+        mid = (x1 + x2) / 2
+        return [((x1, y1), (mid, y1 + bow), (mid, y2 + bow), (x2, y2))]
+    (x1, y1), (bend_out, corridor), (bend_in, corridor_end), (x2, y2) = points
+    first_mid = (x1 + bend_out) / 2
+    last_mid = (bend_in + x2) / 2
+    return [
+        # Turn into the corridor, entirely inside the gutter beside the source column.
+        ((x1, y1), (first_mid, y1), (first_mid, corridor), (bend_out, corridor)),
+        # The run itself: a straight line expressed as a cubic so there is one segment type.
+        (
+            (bend_out, corridor),
+            (bend_out, corridor),
+            (bend_in, corridor_end),
+            (bend_in, corridor_end),
+        ),
+        # And out again, inside the gutter beside the target column.
+        ((bend_in, corridor_end), (last_mid, corridor_end), (last_mid, y2), (x2, y2)),
+    ]
+
+
+def _num(value: float) -> str:
+    """Trim a coordinate for the path data: ``173.0`` carries no more meaning than ``173``."""
+    return f"{value:g}"
+
+
+def _svg_edge_path(points: list[_Point], *, bow: float = 0.0) -> str:
+    segments = _route_segments(points, bow=bow)
+    start = segments[0][0]
+    parts = [f"M{_num(start[0])},{_num(start[1])}"]
+    for _begin, control_a, control_b, end in segments:
+        parts.append(
+            f" C{_num(control_a[0])},{_num(control_a[1])} "
+            f"{_num(control_b[0])},{_num(control_b[1])} {_num(end[0])},{_num(end[1])}"
+        )
+    return "".join(parts)
+
+
+def _flatten_route(points: list[_Point], *, bow: float = 0.0, steps: int = 16) -> list[_Point]:
+    """Sample the route into a polyline, for the raster renderer and for overlap tests."""
+    flat: list[_Point] = []
+    for begin, control_a, control_b, end in _route_segments(points, bow=bow):
+        for index in range(steps + 1):
+            t = index / steps
+            inv = 1 - t
+            flat.append(
+                (
+                    inv**3 * begin[0]
+                    + 3 * inv**2 * t * control_a[0]
+                    + 3 * inv * t**2 * control_b[0]
+                    + t**3 * end[0],
+                    inv**3 * begin[1]
+                    + 3 * inv**2 * t * control_a[1]
+                    + 3 * inv * t**2 * control_b[1]
+                    + t**3 * end[1],
+                )
+            )
+    return flat
+
+
+def _route_label_spot(
+    layout: DiagramLayout, points: list[_Point], *, lane: int = 0
+) -> _Point | None:
+    """Where to write an edge's label: on the corridor run, or the old search for a direct hop."""
+    offset = lane * _LABEL_LANE_STEP
+    if len(points) == _ROUTED_POINTS:
+        # The corridor is free of boxes by construction, so its midpoint needs no collision test.
+        (_x1, _y1), (bend_out, corridor), (bend_in, _corridor_end), (_x2, _y2) = points
+        return (bend_out + bend_in) / 2, corridor + offset
+    (x1, y1), (x2, y2) = points
+    spot = _label_spot(layout, x1, y1 + lane * _LANE_STEP, x2, y2 + lane * _LANE_STEP)
+    return None if spot is None else (spot[0], spot[1] + offset)
 
 
 def _label_spot(
@@ -312,6 +507,7 @@ def render_svg(layout: DiagramLayout) -> str:
         )
 
     # Edges first so nodes paint over the line ends.
+    lanes: dict[tuple[str, str], int] = {}
     for edge in layout.edges:
         src, dst = by_id.get(edge.src), by_id.get(edge.dst)
         if src is None or dst is None:
@@ -340,20 +536,19 @@ def render_svg(layout: DiagramLayout) -> str:
                 f'<text x="{cx + 48}" y="{cy + 4}" font-size="10" fill="#b91c1c">self</text>'
             )
             continue
-        x1, y1 = src.x + _NODE_W, src.y + _NODE_H / 2
-        x2, y2 = dst.x, dst.y + _NODE_H / 2
-        if x2 < x1:  # backward edge (cycle): route below to stay readable
-            x1, y1 = src.x, src.y + _NODE_H / 2
-            x2, y2 = dst.x + _NODE_W, dst.y + _NODE_H / 2
-        mid = (x1 + x2) / 2
-        path = f"M{x1},{y1} C{mid},{y1} {mid},{y2} {x2},{y2}"
+        lane_key = (edge.src, edge.dst)
+        lane = lanes.get(lane_key, 0)
+        lanes[lane_key] = lane + 1
+        points = route_edge(layout, src, dst, lane=lane)
+        bow = lane * _LANE_STEP if len(points) == _DIRECT_POINTS else 0.0
+        path = _svg_edge_path(points, bow=bow)
         out.append(
             f"<path {identity} "
             f'd="{path}" fill="none" stroke="{stroke}" stroke-width="1.6"{dash} '
             f'marker-end="url(#{marker})"/>'
         )
         label = _edge_label(edge)
-        spot = _label_spot(layout, x1, y1, x2, y2) if label else None
+        spot = _route_label_spot(layout, points, lane=lane) if label else None
         if label and spot is not None:
             out.append(
                 f'<text x="{spot[0]}" y="{spot[1] - 4}" font-size="9.5" fill="#64748b" '
@@ -466,19 +661,23 @@ def render_png(layout: DiagramLayout, *, scale: int = 2) -> bytes | None:
     if layout.subtitle:
         draw.text((_MARGIN * s, 38 * s), layout.subtitle, fill="#64748b", font=fonts["small"])
 
+    lanes: dict[tuple[str, str], int] = {}
     for edge in layout.edges:
         src, dst = by_id.get(edge.src), by_id.get(edge.dst)
         if src is None or dst is None or src.id == dst.id:
             continue
         advisory = edge.confidence == "advisory"
         colour = "#94a3b8" if advisory else "#475569"
-        x1, y1 = (src.x + _NODE_W) * s, (src.y + _NODE_H / 2) * s
-        x2, y2 = dst.x * s, (dst.y + _NODE_H / 2) * s
-        _draw_connector(draw, (x1, y1), (x2, y2), colour, s, dashed=advisory)
+        lane_key = (edge.src, edge.dst)
+        lane = lanes.get(lane_key, 0)
+        lanes[lane_key] = lane + 1
+        # Routed in layout units - the same waypoints the SVG uses - and scaled only when drawn, so
+        # the raster and the vector cannot disagree about where an edge goes.
+        points = route_edge(layout, src, dst, lane=lane)
+        bow = lane * _LANE_STEP if len(points) == _DIRECT_POINTS else 0.0
+        _draw_connector(draw, points, colour, s, dashed=advisory, bow=bow)
         label = _edge_label(edge)
-        spot = (
-            _label_spot(layout, x1 / s, y1 / s, x2 / s, y2 / s) if label else None
-        )  # collision test in layout units
+        spot = _route_label_spot(layout, points, lane=lane) if label else None
         if label and spot is not None:
             draw.text(
                 (spot[0] * s, spot[1] * s - 5 * s),
@@ -566,34 +765,36 @@ def _png_legend(draw: Any, layout: DiagramLayout, fonts: dict[str, Any], scale: 
 
 def _draw_connector(
     draw: Any,
-    start: tuple[float, float],
-    end: tuple[float, float],
+    points: list[_Point],
     colour: str,
     scale: int,
     *,
     dashed: bool,
+    bow: float = 0.0,
 ) -> None:
-    """Draw a left-to-right connector as a flattened cubic curve, dashed when advisory."""
-    x1, y1 = start
-    x2, y2 = end
-    mid = (x1 + x2) / 2
-    steps = 24
-    points: list[tuple[float, float]] = []
-    for i in range(steps + 1):
-        t = i / steps
-        inv = 1 - t
-        # Cubic Bezier with horizontal control points (matches the SVG path shape).
-        x = inv**3 * x1 + 3 * inv**2 * t * mid + 3 * inv * t**2 * mid + t**3 * x2
-        y = inv**3 * y1 + 3 * inv**2 * t * y1 + 3 * inv * t**2 * y2 + t**3 * y2
-        points.append((x, y))
-    for index in range(steps):
+    """Draw a routed connector as a flattened polyline, dashed when advisory.
+
+    Takes the waypoints rather than two endpoints so a corridor-routed edge rasterises as the shape
+    the vector output draws. The arrow head follows the final segment's direction instead of
+    assuming a left-to-right arrival, which also fixes the head on a backward (cycle) edge.
+    """
+    flat = [(x * scale, y * scale) for x, y in _flatten_route(points, bow=bow)]
+    for index in range(len(flat) - 1):
         if dashed and index % 2:
             continue  # gap
-        draw.line([points[index], points[index + 1]], fill=colour, width=max(1, 2 * scale) - 1)
-    # Arrow head at the destination.
+        draw.line([flat[index], flat[index + 1]], fill=colour, width=max(1, 2 * scale) - 1)
+    tip, before = flat[-1], flat[-2]
+    dx, dy = tip[0] - before[0], tip[1] - before[1]
+    length = (dx * dx + dy * dy) ** 0.5 or 1.0
+    ux, uy = dx / length, dy / length
     head = 5 * scale
+    base = (tip[0] - ux * head * 1.6, tip[1] - uy * head * 1.6)
     draw.polygon(
-        [(x2, y2), (x2 - head * 1.6, y2 - head * 0.75), (x2 - head * 1.6, y2 + head * 0.75)],
+        [
+            tip,
+            (base[0] - uy * head * 0.75, base[1] + ux * head * 0.75),
+            (base[0] + uy * head * 0.75, base[1] - ux * head * 0.75),
+        ],
         fill=colour,
     )
 

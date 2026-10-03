@@ -433,3 +433,145 @@ def test_routine_edges_still_say_they_came_from_abap() -> None:
     assert evidence_for("lineage_edge", "advisory").method == "routine_select_parse"
     assert evidence_for("calc_view_consumer", "provider").method == "generated_view_naming"
     assert evidence_for("calc_view_consumer", "provider").basis == "derived"
+
+
+# --- H. one relationship, one confidence, whichever end the walk starts from -------------------
+#
+# A part provider and its CompositeProvider are a single declared fact. Walking upstream *from* the
+# CompositeProvider it was read out of the stored model and reported ``exact``; walking downstream
+# from the part, the same fact was resolved through the generated calc view and reported
+# ``advisory``. The strength of the evidence therefore depended on which end the walk started from,
+# and a figure centred on the part drew its last hop dashed beside an identical sibling edge drawn
+# solid. Found in a production diagram: one part-to-CompositeProvider edge advisory and a sibling
+# part's edge to the same CompositeProvider exact, both
+# declared inputs of the same model.
+#
+# The confirmation is not free - it reads the model - so it is only worth doing because the model is
+# the same extract the other direction already pays for, and it is memoised per CompositeProvider.
+
+MODELLED_CONSUMER = CONSUMERS[0]
+_PART_ALIAS = "U1.ADSO.1"
+_STORED_MODEL = (
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<Composite:compositeView xmlns:Composite="urn:composite" '
+    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" schemaVersion="1.12" '
+    f'name="{MODELLED_CONSUMER}" withHanaModel="true" defaultNode="#///U1">\n'
+    '  <viewNode xsi:type="View:Union" name="U1">\n'
+    '    <element xsi:type="BwCore:BwElement" name="KEYFIELD" infoObjectName="KEYFIELD"/>\n'
+    f'    <input xsi:type="Composite:CompositeInput" name="" alias="{_PART_ALIAS}" '
+    'selectAll="true">\n'
+    f"      <entity>{ROOT}.composite#//</entity>\n"
+    "    </input>\n"
+    "  </viewNode>\n"
+    "</Composite:compositeView>\n"
+)
+
+
+class ModelledConnection(ScriptedConnection):
+    """Also serves ``RSOHCPR``, so one consumer's stored model can actually be read.
+
+    Only one, deliberately. The other eleven have no model here, which is what keeps the advisory
+    branch under test in the same fixture: a relationship the model cannot confirm must stay
+    advisory rather than being promoted along with the ones it can.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: Every RSOHCPR read, by the provider asked about, so the memo can be asserted on.
+        self.model_reads: list[str] = []
+
+    def execute_select(
+        self, sql: str, parameters: Sequence[Any] | None = None
+    ) -> list[tuple[Any, ...]]:
+        if "RSOHCPR" in sql:
+            charge_query()
+            params = list(parameters or [])
+            self.model_reads.append(str(params[0]) if params else "")
+            return self._model(sql, params)
+        return super().execute_select(sql, parameters)
+
+    @staticmethod
+    def _model(sql: str, params: list[Any]) -> list[tuple[Any, ...]]:
+        if not params or str(params[0]) != MODELLED_CONSUMER:
+            return []
+        if "LENGTH(XML_UI)" in sql:
+            return [(len(_STORED_MODEL),)]
+        if "LENGTH(XML_DEF)" in sql:
+            return [(0,)]
+        if "XML_UI" in sql:
+            return [(_STORED_MODEL,)]
+        return []
+
+
+def _part_edge(graph: Any, part: str, provider: str) -> Any:
+    def is_wanted(edge: Any) -> bool:
+        return bool(edge.kind == "composite_part" and edge.src == part and edge.dst == provider)
+
+    found = [edge for edge in graph.edges if is_wanted(edge)]
+    assert len(found) == 1, f"expected one {part}->{provider} part edge, got {len(found)}"
+    return found[0]
+
+
+def test_a_part_edge_the_model_confirms_reads_the_same_from_either_end() -> None:
+    connection = ModelledConnection()
+    service = _service(connection)
+
+    downstream = service.get_lineage(ROOT, direction="downstream", depth=1)
+    upstream = service.get_lineage(MODELLED_CONSUMER, direction="upstream", depth=1)
+    assert not isinstance(downstream, UnsupportedResult)
+    assert not isinstance(upstream, UnsupportedResult)
+
+    from_part = _part_edge(downstream, ROOT, MODELLED_CONSUMER)
+    from_provider = _part_edge(upstream, ROOT, MODELLED_CONSUMER)
+
+    assert from_part.confidence == "exact", (
+        "the stored model declares this part, so reaching it from the part end does not make the "
+        "fact weaker"
+    )
+    assert _PART_ALIAS in (from_part.note or ""), "a confirmed edge should name the model's alias"
+    assert (from_part.confidence, from_part.note) == (
+        from_provider.confidence,
+        from_provider.note,
+    ), "the same relationship described differently depending on the direction of travel"
+    assert from_part.evidence is not None and from_provider.evidence is not None
+    assert from_part.evidence.method == from_provider.evidence.method
+    assert from_part.evidence.method == evidence_for("composite_part", "declared_model").method
+
+
+def test_a_part_edge_the_model_cannot_confirm_stays_advisory() -> None:
+    """Promotion is earned per relationship, not applied to the kind.
+
+    Eleven of these twelve CompositeProviders have no readable model in this fixture. Their edges
+    rest on the generated view's name alone, which is genuinely weaker evidence, and saying so is
+    the entire purpose of the field.
+    """
+    graph = _service(ModelledConnection()).get_lineage(ROOT, direction="downstream", depth=1)
+    assert not isinstance(graph, UnsupportedResult)
+    unconfirmed = [
+        e for e in graph.edges if e.kind == "composite_part" and e.dst != MODELLED_CONSUMER
+    ]
+    assert len(unconfirmed) == len(CONSUMERS) - 1
+    for edge in unconfirmed:
+        assert edge.confidence == "advisory"
+        assert edge.evidence is not None
+        assert edge.evidence.method == "generated_view_naming"
+
+
+def test_the_model_is_read_once_per_composite_provider() -> None:
+    """Twelve consumers must not become twelve model reads per consumer.
+
+    The confirmation runs inside consumer resolution, which a walk reaches once per part - so
+    without the memo a wide CompositeProvider would pay for the same LOB repeatedly.
+    """
+    connection = ModelledConnection()
+    service = _service(connection)
+    service.get_lineage(ROOT, direction="downstream", depth=1)
+    before = len(connection.model_reads)
+    service.get_lineage(ROOT, direction="downstream", depth=1)
+    assert len(connection.model_reads) == before, "the second walk re-read the stored model"
+    assert connection.model_reads.count(MODELLED_CONSUMER) <= 3, (
+        "one model is a size probe per column plus one body fetch, not more"
+    )
+    # And a provider whose model is absent is remembered as absent: 12 consumers, each probed once,
+    # rather than once per edge that reaches them.
+    assert len(connection.model_reads) == 3 + 2 * (len(CONSUMERS) - 1)

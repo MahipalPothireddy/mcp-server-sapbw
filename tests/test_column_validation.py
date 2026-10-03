@@ -298,6 +298,7 @@ def test_an_unmeasured_column_set_falls_back_to_the_name_prefix() -> None:
     cube = versioned.table("cube_header")
     assert cube is not None
     cube.columns = frozenset()
-    assert "OBJVERS = 'A'" in SqlDialect(versioned).build_select(
-        columns=["INFOCUBE"], from_logical="cube_header"
-    ).sql, "RSDCUBE matches a prefix, so the fallback still filters it"
+    assert (
+        "OBJVERS = 'A'"
+        in SqlDialect(versioned).build_select(columns=["INFOCUBE"], from_logical="cube_header").sql
+    ), "RSDCUBE matches a prefix, so the fallback still filters it"

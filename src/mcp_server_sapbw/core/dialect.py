@@ -275,9 +275,7 @@ class SqlDialect:
             return status.has_column(_OBJVERS)
         return needs_active_version(physical)
 
-    def _check_columns(
-        self, logical: str, physical: str, columns: Sequence[str] | None
-    ) -> None:
+    def _check_columns(self, logical: str, physical: str, columns: Sequence[str] | None) -> None:
         """Refuse a SELECT naming a column this release does not have (D45).
 
         Only **bare upper-case identifiers** are checked. A ``columns`` list legitimately contains
@@ -303,8 +301,7 @@ class SqlDialect:
         missing = [
             column
             for column in columns
-            if column.isidentifier() and column == column.upper()
-            and not status.has_column(column)
+            if column.isidentifier() and column == column.upper() and not status.has_column(column)
         ]
         if missing:
             raise DialectError(

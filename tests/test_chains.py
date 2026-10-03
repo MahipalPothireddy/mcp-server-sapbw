@@ -215,9 +215,7 @@ class ScriptedConnection:
                     summary.append((cid, len(runs), min(dats), max(dats)))
                 return summary
             if "GROUP BY" in sql:  # cadence: distinct run days (CHAIN_ID, DATUM)
-                return sorted(
-                    {(cid, r[1]) for cid, runs in _RUNS.items() for r in runs}
-                )
+                return sorted({(cid, r[1]) for cid, runs in _RUNS.items() for r in runs})
             if "MAX(DATUM)" in sql:  # cadence: reference date, one unkeyed aggregate
                 every = [r[1] for runs in _RUNS.values() for r in runs]
                 return [(max(every),)] if every else [(None,)]
@@ -558,8 +556,7 @@ def test_a_p95_over_too_few_runs_is_labelled_rather_than_presented_as_planning_d
     if result.duration_seconds.p95_s is not None:
         labelled = [c for c in result.caveats if "p95 is computed over only" in c]
         assert labelled, (
-            "a p95 below the meaningful-run threshold must say so; caveats were: "
-            f"{result.caveats}"
+            f"a p95 below the meaningful-run threshold must say so; caveats were: {result.caveats}"
         )
         assert "not meaningfully distinct" in labelled[0]
 

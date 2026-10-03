@@ -11,10 +11,14 @@ from xml.etree import ElementTree
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph, LineageNode
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.services.diagram import (
+    _NODE_H,
+    _NODE_W,
+    _flatten_route,
     build_layout,
     png_available,
     render_png,
     render_svg,
+    route_edge,
 )
 
 P = Provenance(source_table="RSTRAN")
@@ -60,6 +64,33 @@ def _chain_graph(truncated: bool = False) -> LineageGraph:
         node_count=6,
         edge_count=5,
         truncated=truncated,
+    )
+
+
+def _skip_level_graph() -> LineageGraph:
+    """A -> B -> C -> D, plus A -> D skipping two columns.
+
+    Every column holds one node, so the layout centres them all at the same height and the long edge
+    runs along the row B and C occupy. That is the production geometry reduced to four boxes.
+    """
+    return LineageGraph(
+        root_id="D",
+        direction="both",
+        depth=3,
+        nodes=[
+            _node("A", "adso"),
+            _node("B", "datasource"),
+            _node("C", "adso"),
+            _node("D", "compositeprovider"),
+        ],
+        edges=[
+            _edge("A", "B"),
+            _edge("B", "C"),
+            _edge("C", "D"),
+            _edge("A", "D", "composite_part"),
+        ],
+        node_count=4,
+        edge_count=4,
     )
 
 
@@ -125,6 +156,100 @@ def test_self_loop_is_rendered() -> None:
 
 
 # --- SVG ----------------------------------------------------------------------------------
+
+
+def test_svg_routes_a_long_edge_clear_of_every_box_it_passes() -> None:
+    """A skip-level edge must not be drawn through the boxes between its endpoints.
+
+    The defect this pins was found in a production figure, where an ADSO fed a CompositeProvider
+    directly as well as through two intermediate layers. That skip-level edge spanned four
+    columns and was drawn as one bezier with horizontal control points, so it ran flat through the
+    row it started in - straight across two unrelated boxes and into a third. A reader reasonably
+    concluded the ADSO fed a DataSource it has no relationship with. Measured on that 11-node
+    graph: 4 of 11 edges crossed a box they were not connected to.
+
+    Asserted on the sampled path rather than on the shape of the ``d`` attribute, because what
+    matters is where the line goes, not how it is expressed.
+    """
+    layout = build_layout(_skip_level_graph())
+    by_id = layout.by_id
+    crossings: list[str] = []
+    for edge in layout.edges:
+        src, dst = by_id[edge.src], by_id[edge.dst]
+        for point in _flatten_route(route_edge(layout, src, dst)):
+            for node in layout.nodes:
+                if node.id in (edge.src, edge.dst):
+                    continue
+                if (
+                    node.x <= point[0] <= node.x + _NODE_W
+                    and node.y <= point[1] <= node.y + _NODE_H
+                ):
+                    crossings.append(f"{edge.src}->{edge.dst} crosses {node.id}")
+    assert not crossings, "; ".join(sorted(set(crossings)))
+
+
+def test_an_adjacent_edge_keeps_its_single_curve() -> None:
+    """Only the edges that were wrong change shape.
+
+    Between adjacent columns the whole span is gutter, which holds no boxes, so a direct curve
+    cannot cross anything and there is nothing to route around. Two waypoints means the original
+    shape; four means a corridor was used.
+    """
+    layout = build_layout(_skip_level_graph())
+    by_id = layout.by_id
+    adjacent = route_edge(layout, by_id["A"], by_id["B"])
+    skipping = route_edge(layout, by_id["A"], by_id["D"])
+    assert len(adjacent) == 2
+    assert len(skipping) == 4
+
+
+def test_a_routed_edge_turns_inside_the_gutters_either_side() -> None:
+    """Why the construction cannot cross a box, stated as a test rather than as a comment.
+
+    The vertical movement happens between two columns, where there are no boxes at any height; the
+    horizontal run happens in a band chosen to be free. So each waypoint's x must sit in a gutter,
+    not inside any column's x-range.
+    """
+    layout = build_layout(_skip_level_graph())
+    by_id = layout.by_id
+    _start, bend_out, bend_in, _end = route_edge(layout, by_id["A"], by_id["D"])
+    columns = {node.x for node in layout.nodes}
+    for x in (bend_out[0], bend_in[0]):
+        assert all(not (left <= x <= left + _NODE_W) for left in columns), (
+            "a turn at this x would be inside a column, where boxes live"
+        )
+    assert bend_out[1] == bend_in[1], "the run between the turns is horizontal"
+
+
+def test_parallel_edges_between_one_pair_are_drawn_apart() -> None:
+    """A transformation and the routine lookup between the same two objects are two facts.
+
+    Drawn on identical paths with identically placed labels they read as one, and the two labels
+    overprint into something illegible.
+    """
+    graph = LineageGraph(
+        root_id="B",
+        direction="both",
+        depth=1,
+        nodes=[_node("A", "adso"), _node("B", "adso")],
+        edges=[
+            _edge("A", "B", "transformation"),
+            _edge("A", "B", "routine_lookup", "advisory"),
+        ],
+        node_count=2,
+        edge_count=2,
+    )
+    layout = build_layout(graph)
+    root = ElementTree.fromstring(render_svg(layout))
+    paths = [p.get("d") for p in root.iter() if p.get("class") == "bw-edge"]
+    assert len(paths) == 2
+    assert paths[0] != paths[1], "parallel edges must not share one path"
+    labels = [
+        (t.get("x"), t.get("y"))
+        for t in root.iter()
+        if t.tag.endswith("text") and (t.text or "") in ("routine", "delta")
+    ]
+    assert len(set(labels)) == len(labels), "parallel edge labels must not overprint each other"
 
 
 def test_svg_is_self_contained_and_styled() -> None:

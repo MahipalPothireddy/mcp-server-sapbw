@@ -214,9 +214,7 @@ def _repo(
         discovered_at=datetime.now(UTC),
         tables=tables,
     )
-    connection = ScriptedConnection(
-        unreadable=unreadable, layout=layout, assignments=assignments
-    )
+    connection = ScriptedConnection(unreadable=unreadable, layout=layout, assignments=assignments)
     return SecurityRepository(connection, capability), connection
 
 

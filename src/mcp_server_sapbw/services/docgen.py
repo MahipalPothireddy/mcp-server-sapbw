@@ -656,28 +656,63 @@ class DocGenerator(Repository):
             ("dso_header", "Classic DSOs"),
             ("adso_header", "Advanced DSOs"),
             ("cube_header", "InfoCubes/MultiProviders"),
+            ("composite_header", "CompositeProviders"),
             ("infoobject", "InfoObjects"),
         ):
-            status = self.capability.table(logical)
-            if status is not None and status.present and status.row_estimate is not None:
-                rows.append(
-                    f"| {label} (row estimate) | {status.row_estimate:,} | {status.resolved_name} |"
-                )
+            count, source = self._provider_count(logical)
+            if count is not None:
+                rows.append(f"| {label} | {count:,} | {source} |")
         page = [
             "# Inventory",
             "",
             self._backlinks(1),
             "",
-            "Object counts across the connected system. Provider counts are row estimates from "
-            "`SYS.M_TABLES` (cheap, approximate).",
+            "Object counts across the connected system. Provider counts are **active-version** "
+            "counts (`OBJVERS = 'A'`), so they are the number of objects that exist rather "
+            "than the number of rows in the header table.",
             "",
             *rows,
             "",
             "See **[load coverage](load-coverage.md)** for every object a chain loads, its update "
             "mode, and which enumerated providers no chain loads.",
-            self._citation("RSPCCHAINATTR, RSTRAN, RSZCOMPDIR, SYS.VIEWS, SYS.M_TABLES"),
+            self._citation(
+                "RSPCCHAINATTR, RSTRAN, RSZCOMPDIR, SYS.VIEWS, RSPCCHAIN + RSBKDTP, and the "
+                "provider header tables counted at OBJVERS = 'A'"
+            ),
         ]
         self._write(base, "01-inventory/index.md", "\n".join(page))
+
+    def _provider_count(self, logical: str) -> tuple[int | None, str]:
+        """Active-version count for one provider header table, with how it was obtained.
+
+        Counted, not estimated. A ``SYS.M_TABLES`` row estimate counts every version a row exists
+        in - active, modified and delivered - so it answers a different question from "how many of
+        these objects are there". Measured on the reference system it overstated classic DSOs by a
+        factor of twenty: 1,998 rows against 92 active objects. A reader takes an inventory number
+        as the object count, so the extra statement is worth it; the estimate stays as a *labelled*
+        fallback for a release whose header table has no ``OBJVERS`` column.
+        """
+        status = self.capability.table(logical)
+        if status is None or not status.present:
+            return None, ""
+        try:
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=["COUNT(*)"], from_logical=logical, where=["OBJVERS = 'A'"]
+                )
+            )
+            # Converted inside the guard on purpose: an inventory figure is not worth failing a
+            # whole documentation run over, so anything unreadable degrades to the estimate.
+            return int(rows[0][0]), f"{status.resolved_name} (OBJVERS = 'A')"
+        except Exception:
+            if status.row_estimate is None:
+                return None, ""
+            self._gaps.add(
+                "inventory",
+                f"{status.resolved_name} could not be counted by active version, so its figure "
+                "is a row estimate over all versions and overstates the object count",
+            )
+            return status.row_estimate, f"{status.resolved_name} (row estimate, all versions)"
 
     def _chain_total(self) -> int:
         result = self._unwrap("inventory", self._chains.list_chains(limit=1))
@@ -1100,21 +1135,50 @@ class DocGenerator(Repository):
             f"- Outbound transformations (source from this): "
             f"{', '.join(trans_out.get(name, [])) or '-'}",
             "",
+        ]
+        routine_consumers, part_consumers = self._consumers(name)
+        # Reports that read this provider *through* a CompositeProvider or MultiProvider. Resolved
+        # from the catalogue already in hand, so the second hop costs nothing to add and the page
+        # stops claiming "no reports" for a provider whose data is on a dashboard.
+        indirect = sorted(
+            {query for consumer in part_consumers for query in query_by_provider.get(consumer, [])}
+        )
+        lines += [
             "## HANA & consumers",
             f"- Calc views reading this: {', '.join(calcviews_by_object.get(name, [])) or '-'}",
-            f"- Reports/queries on this provider: "
+            f"- Consumed as a part provider by: {', '.join(part_consumers) or '-'}",
+            f"- Reports/queries directly on this provider: "
             f"{', '.join(query_by_provider.get(name, [])) or '-'}",
-            f"- Routine-embedded consumers (advisory): "
-            f"{', '.join(self._routine_lookup_consumers(name)) or '-'}",
-            self._citation("RSDODSO, RSOADSO, RSDCUBE, RSDIOBJ, RSTRAN, RSAABAP"),
+            f"- Reports reaching it through those providers: {', '.join(indirect) or '-'}",
+            f"- Routine-embedded consumers (advisory): {', '.join(routine_consumers) or '-'}",
+            self._citation("RSDODSO, RSOADSO, RSDCUBE, RSDIOBJ, RSTRAN, RSAABAP, RSZCOMPIC"),
         ]
         return "\n".join(lines)
 
-    def _routine_lookup_consumers(self, name: str) -> list[str]:
+    def _consumers(self, name: str) -> tuple[list[str], list[str]]:
+        """Routine-embedded consumers and part-provider consumers, from a single impact read.
+
+        The part-provider direction was missing from these pages, and it is the one a reader needs
+        most. A classic or Advanced DSO usually reaches reporting *through* a CompositeProvider, so
+        a page listing only the queries assigned directly to the provider shows "no reports" for an
+        object whose data is on a dashboard. Observed on a production tree: an ADSO holding millions
+        of records, a part provider of a CompositeProvider that one BEx report reads, had a page
+        that mentioned neither the CompositeProvider nor the report. Both answers come out of the
+        same depth-1 blast radius, so adding the second costs no extra statement.
+        """
         impact = self._lineage.impact_analysis(name, depth=1)
         if isinstance(impact, UnsupportedResult):
-            return []
-        return impact.routine_lookup_consumers[:20]
+            return [], []
+        key = name.strip().upper()
+        parts = sorted(
+            {
+                edge.dst
+                for edge in impact.graph.edges
+                if edge.kind in ("composite_part", "multiprovider_part")
+                and edge.src.strip().upper() == key
+            }
+        )
+        return impact.routine_lookup_consumers[:20], parts[:20]
 
     def _provider_names_and_edges(
         self, cap: int

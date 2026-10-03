@@ -205,9 +205,7 @@ class RoutineParser:
             unresolved = [
                 ref
                 for ref in unresolved
-                if not (
-                    ref.call_kind == "form" and ref.object_name.strip().lower() in followed
-                )
+                if not (ref.call_kind == "form" and ref.object_name.strip().lower() in followed)
             ]
         complexity.line_count = len(lines)
         complexity.call_count = len(unresolved)
