@@ -28,12 +28,23 @@ _TABLES = {**_SYS_TABLES, **_ABAP_TABLES}
 _BIC_DSO = "/BIC/" + "ASALES00"  # -> resolves to DSO SALES
 _BI0_IOBJ = "/BI0/" + "PMATERIAL"  # -> resolves to InfoObject MATERIAL
 
+# BW's *other* generated view scheme: one calculation view per InfoProvider, in _SYS_BIC. This is
+# what a modeller picks when building on top of a provider, and the only route by which a
+# CompositeProvider can be read - it has no generated /BIC/ table for the table route to find.
+_GEN = "system-local.bw.bw2hana/"
+_GEN_CP = _GEN + "SALES_CP"  # a CompositeProvider: no /BIC/ table exists
+_GEN_ADSO = _GEN + "SALES_ADSO"
+_GEN_GHOST = _GEN + "GONE_PROV"  # parses, but matches no provider header row
+
 _CALC_VIEWS = [("CV_SALES", "CALC"), ("CV_FIN", "CALC"), ("CV_LEGACY", "JOIN")]
 _CONSUMING = {"CV_SALES", "CV_FIN"}
 # hana_reads_bw: (dependent calc view, base object, base type)
 _HANA_READS = [
     ("CV_SALES", _BIC_DSO, "TABLE"),
     ("CV_SALES", _BI0_IOBJ, "TABLE"),
+    ("CV_SALES", _GEN_CP, "VIEW"),
+    ("CV_SALES", _GEN_ADSO, "VIEW"),
+    ("CV_SALES", _GEN_GHOST, "VIEW"),
     ("CV_FIN", _BIC_DSO, "TABLE"),
 ]
 # BW-generated per-provider views (0BW:BIA:<PROVIDER>[:node][.node]) reading a calc view. The two
@@ -61,9 +72,13 @@ _CUBETYPE = {"SALES_MP": "M"}
 
 
 class ScriptedConnection:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
     def execute_select(
         self, sql: str, parameters: Sequence[Any] | None = None
     ) -> list[tuple[Any, ...]]:
+        self.statements.append(sql)
         params = list(parameters or [])
         if '"VIEWS"' in sql:  # list query FROM "SYS"."VIEWS" (OBJECT_DEPENDENCIES only in subquery)
             return self._views(sql)
@@ -103,7 +118,12 @@ class ScriptedConnection:
             return [(len(names),)] if count else [(n,) for n in names]
         if "DEPENDENT_OBJECT_NAME = ?" in sql:  # calc-view lineage (base tables of a view)
             view = str(params[1])
-            return [("SAPABAP1", b, t) for d, b, t in _HANA_READS if d == view]
+            # A generated per-provider view lives in _SYS_BIC; a /BIC/ table in the ABAP schema.
+            return [
+                ("_SYS_BIC" if b.startswith(_GEN) else ABAP, b, t)
+                for d, b, t in _HANA_READS
+                if d == view
+            ]
         return [(0,)] if count else []
 
 
@@ -130,6 +150,13 @@ def _capability(present: set[str] | None = None) -> CapabilityRecord:
 
 def _repo(present: set[str] | None = None) -> HanaRepository:
     return HanaRepository(ScriptedConnection(), _capability(present))
+
+
+def _repo_with_connection(
+    present: set[str] | None = None,
+) -> tuple[HanaRepository, ScriptedConnection]:
+    conn = ScriptedConnection()
+    return HanaRepository(conn, _capability(present)), conn
 
 
 def test_list_calc_views_marks_bw_consuming() -> None:
@@ -169,7 +196,7 @@ def test_get_calc_view_lineage_resolves_bw_objects() -> None:
 def test_get_hana_crossings_both_directions() -> None:
     report = _repo().get_hana_crossings()
     assert not isinstance(report, UnsupportedResult)
-    assert report.hana_reads_bw_count == 3
+    assert report.hana_reads_bw_count == len(_HANA_READS)
     assert report.bw_reads_hana_count == len(_BW_READS)
     directions = {c.direction for c in report.crossings}
     assert directions == {"hana_reads_bw", "bw_reads_hana"}
@@ -258,3 +285,105 @@ def test_calc_view_lineage_without_consumers_stays_quiet() -> None:
 def test_unsupported_without_object_dependencies() -> None:
     result = _repo(present={"hana_views"}).get_calc_view_lineage("CV_SALES")
     assert isinstance(result, UnsupportedResult)
+
+
+# --- generated per-provider views (system-local.bw.bw2hana/) -----------------------------
+#
+# D47. These are BW's second generated view scheme and the only route by which a calc view can
+# read a CompositeProvider, which has no /BIC/ table. Resolution handled the table scheme alone,
+# so on a landscape where modellers build on the generated views every base of every modelled view
+# came back unresolved - and a CompositeProvider base vanished from a trace entirely, because
+# SYS.OBJECT_DEPENDENCIES is transitive and only the Advanced DSOs two hops down have tables.
+
+
+def test_calc_view_base_resolves_a_composite_provider_with_no_bic_table() -> None:
+    """The regression that matters: a CompositeProvider base, which the table route cannot see."""
+    lineage = _repo().get_calc_view_lineage("CV_SALES")
+    assert not isinstance(lineage, UnsupportedResult)
+    cp = next(b for b in lineage.base_tables if b.table == _GEN_CP)
+    assert cp.resolved_object == "SALES_CP"
+    assert cp.resolved_kind == "compositeprovider"  # confirmed against RSOHCPR, not guessed
+    assert cp.resolution == "generated_provider_view"
+    assert cp.is_bw_generated is True  # BW generated it; it is not a foreign object
+    assert "SALES_CP" in lineage.resolved_bw_objects
+
+
+def test_calc_view_base_resolves_a_generated_adso_view() -> None:
+    lineage = _repo().get_calc_view_lineage("CV_SALES")
+    assert not isinstance(lineage, UnsupportedResult)
+    adso = next(b for b in lineage.base_tables if b.table == _GEN_ADSO)
+    assert (adso.resolved_object, adso.resolved_kind) == ("SALES_ADSO", "adso")
+    assert adso.resolution == "generated_provider_view"
+
+
+def test_an_unconfirmed_generated_view_stays_unresolved() -> None:
+    """A name that parses but matches no header row is not promoted to a provider."""
+    lineage = _repo().get_calc_view_lineage("CV_SALES")
+    assert not isinstance(lineage, UnsupportedResult)
+    ghost = next(b for b in lineage.base_tables if b.table == _GEN_GHOST)
+    assert ghost.resolved_object is None
+    assert ghost.resolution == "unresolved"
+    assert "GONE_PROV" not in lineage.resolved_bw_objects
+
+
+def test_base_resolution_carries_its_evidence() -> None:
+    lineage = _repo().get_calc_view_lineage("CV_SALES")
+    assert not isinstance(lineage, UnsupportedResult)
+    by_table = {b.table: b for b in lineage.base_tables}
+    gen = by_table[_GEN_CP].evidence
+    bic = by_table[_BIC_DSO].evidence
+    assert gen is not None and bic is not None
+    # The two routes are not equally strong and must not read as though they were: one is
+    # type-confirmed against the catalogue, the other rests on a naming convention.
+    assert (gen.basis, gen.method) == ("derived", "generated_provider_view")
+    assert (bic.basis, bic.method) == ("inferred", "bic_table_naming")
+    ghost = by_table[_GEN_GHOST].evidence
+    assert ghost is not None
+    assert ghost.basis == "unknown"
+
+
+def test_caveats_name_the_routes_actually_used() -> None:
+    """A caveat about /BIC/ resolution on a view with no /BIC/ base told the reader nothing."""
+    lineage = _repo().get_calc_view_lineage("CV_SALES")
+    assert not isinstance(lineage, UnsupportedResult)
+    assert any("bw2hana" in c for c in lineage.caveats)
+    assert any("/BIC/" in c for c in lineage.caveats)
+    # The one base that did not resolve is counted rather than passed over in silence.
+    assert any("did not resolve" in c for c in lineage.caveats)
+
+
+def test_crossings_include_the_generated_provider_view_route() -> None:
+    report = _repo().get_hana_crossings()
+    assert not isinstance(report, UnsupportedResult)
+    cp = next(c for c in report.crossings if c.bw_object == _GEN_CP)
+    assert cp.direction == "hana_reads_bw"
+    assert cp.hana_object == "CV_SALES"
+    assert (cp.bw_object_resolved, cp.bw_object_kind) == ("SALES_CP", "compositeprovider")
+    assert cp.resolution == "generated_provider_view"
+    assert cp.evidence is not None
+    assert cp.evidence.basis == "derived"
+
+
+def test_the_crossing_query_reads_both_schemes_and_skips_bw_plumbing() -> None:
+    """Asserted against the SQL, because the fixture cannot prove a WHERE clause.
+
+    Filtering the BW side to the ABAP schema excluded every generated-provider-view crossing, so
+    on a landscape built that way the report said there were none.
+    """
+    repo, conn = _repo_with_connection()
+    repo.get_hana_crossings()
+    sql = next(
+        s for s in conn.statements if "BASE_OBJECT_TYPE" in s and "/BIC/%" in s and "LIKE" in s
+    )
+    assert "bw2hana/%" in sql, "the generated per-provider view scheme must be matched too"
+    # A generated view reading another generated view is BW's own plumbing, not a crossing.
+    assert "DEPENDENT_OBJECT_NAME NOT LIKE 'system-local.bw%'" in sql
+
+
+def test_provider_confirmation_is_batched_per_lineage_call() -> None:
+    """One statement per header table, not one per base: cost must not scale with width."""
+    repo, conn = _repo_with_connection()
+    repo.get_calc_view_lineage("CV_SALES")
+    header_reads = [s for s in conn.statements if "RSOHCPR" in s]
+    # Two: one confirming the three parsed base names, one for the consuming 0BW:BIA: views.
+    assert len(header_reads) <= 2

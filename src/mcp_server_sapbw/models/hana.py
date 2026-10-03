@@ -1,16 +1,26 @@
 """Domain models for the HANA layer (B8).
 
 Calc views live in the ``_SYS_BIC`` schema; their dependencies come from
-``SYS.OBJECT_DEPENDENCIES`` (DEPENDENCY_TYPE=1 = direct). A calc view is "BW-consuming" when it
-reads BW-generated ``/BIC/`` or ``/BI0/`` tables, which resolve back to BW objects by naming
-convention (advisory). The BW<->HANA crossing table captures both directions: a calc view reading a
-BW table (``hana_reads_bw``) and a BW-layer object reading a calc view (``bw_reads_hana``). Every
-fact cites ``SYS.OBJECT_DEPENDENCIES``.
+``SYS.OBJECT_DEPENDENCIES`` (DEPENDENCY_TYPE=1 = direct). The BW<->HANA crossing table captures
+both directions: a calc view reading BW data (``hana_reads_bw``) and a BW-layer object reading a
+calc view (``bw_reads_hana``). Every fact cites ``SYS.OBJECT_DEPENDENCIES``.
 
-On the BW side of a ``bw_reads_hana`` crossing sits a BW-generated per-InfoProvider view named
-``0BW:BIA:<PROVIDER>``; :class:`BwProviderView` carries the provider parsed from that name with its
-type confirmed by lookup, which is what turns a raw dependency row into the calc-view ->
-CompositeProvider hop.
+**BW exposes its data to HANA under three generated naming schemes, and they are not
+interchangeable.** Reading only the first is how a CompositeProvider went missing from a view's
+bases while the providers beneath it were promoted into its place:
+
+* ``/BIC/`` and ``/BI0/`` **tables** - a provider's physical storage. Resolves to a BW object by
+  naming convention only, so the reading is advisory. A CompositeProvider has no such table.
+* ``system-local.bw.bw2hana/<OBJECT>`` - one generated calculation view per InfoProvider, for
+  *both* Advanced DSOs and CompositeProviders. What a modeller builds on, and the only route by
+  which a CompositeProvider can be read. Parsed, then type-confirmed against the header tables.
+* ``0BW:BIA:<PROVIDER>`` - the view BW generates to *consume* a calc view, with internal nodes
+  suffixed ``:<node>`` / ``.<node>``. :class:`BwProviderView` carries the provider parsed from it
+  with the type confirmed by lookup, which is what turns a raw dependency row into the calc-view
+  -> CompositeProvider hop.
+
+:attr:`BaseTableRef.resolution` and :attr:`HanaCrossing.resolution` name which scheme answered, so
+a type-confirmed provider and a table-name convention never read as the same strength of fact.
 """
 
 from __future__ import annotations
@@ -40,8 +50,25 @@ class CalcView(BaseModel):
     provenance: Provenance | list[Provenance]
 
 
+#: How the BW object behind a calc-view base was identified. The three routes are not equally
+#: strong, which is why the base carries which one was used rather than just the result.
+BaseResolution = Literal["bic_table", "generated_provider_view", "unresolved"]
+
+
 class BaseTableRef(BaseModel):
-    """A base object a calc view reads, with a best-effort resolution to a BW object."""
+    """A base object a calc view reads, with a best-effort resolution to a BW object.
+
+    ``resolution`` says *how* the BW object was identified, because the routes differ in strength
+    and a caller acting on the answer needs to know which one it got:
+
+    * ``bic_table`` - decomposed from a ``/BIC/`` or ``/BI0/`` generated table name. Advisory:
+      nothing records which BW object owns a generated table.
+    * ``generated_provider_view`` - BW's generated per-provider view
+      (``system-local.bw.bw2hana/<OBJECT>``), parsed and then **type-confirmed** against the
+      provider header tables. This is how a view reading a CompositeProvider resolves; a
+      CompositeProvider has no ``/BIC/`` table, so the table route cannot see it at all.
+    * ``unresolved`` - a base this server could not map back to a BW object.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -49,9 +76,23 @@ class BaseTableRef(BaseModel):
     schema_name: str | None = None
     object_type: str | None = None  # HANA BASE_OBJECT_TYPE (TABLE / VIEW / ...)
     is_bw_generated: bool = False
-    resolved_object: str | None = None  # heuristic BW object (advisory)
+    resolved_object: str | None = None
     resolved_kind: str | None = None
+    resolution: BaseResolution = "unresolved"
+    evidence: Evidence | None = None
     provenance: Provenance
+
+    @model_validator(mode="after")
+    def _derive_evidence(self) -> BaseTableRef:
+        if self.evidence is None:
+            detail = None
+            if self.resolution == "generated_provider_view" and self.resolved_kind:
+                detail = (
+                    f"{self.table} is BW's generated view for {self.resolved_object}, "
+                    f"type-confirmed as {self.resolved_kind} against the provider header tables."
+                )
+            self.evidence = evidence_for("calc_view_base", self.resolution, detail=detail)
+        return self
 
 
 class BwProviderView(BaseModel):
@@ -100,7 +141,9 @@ class HanaCrossing(BaseModel):
     # '0BW:BIA:<PROVIDER>' view name (parsed, then type-confirmed against the header tables).
     bw_object_resolved: str | None = None
     bw_object_kind: str | None = None
-    resolution: Literal["bic_table", "bw_provider_view", "unresolved"] = "unresolved"
+    resolution: Literal[
+        "bic_table", "bw_provider_view", "generated_provider_view", "unresolved"
+    ] = "unresolved"
     object_type: str | None = None  # the HANA object type on the BW side (TABLE/VIEW/SYNONYM)
     evidence: Evidence | None = None
     provenance: Provenance
@@ -109,10 +152,11 @@ class HanaCrossing(BaseModel):
     def _derive_evidence(self) -> HanaCrossing:
         if self.evidence is None:
             detail = None
+            type_confirmed = {"bw_provider_view", "generated_provider_view"}
             if self.bw_object_resolved:
                 detail = f"{self.bw_object} was read as BW object {self.bw_object_resolved}" + (
                     f", type-confirmed as {self.bw_object_kind}."
-                    if self.resolution == "bw_provider_view" and self.bw_object_kind
+                    if self.resolution in type_confirmed and self.bw_object_kind
                     else " by the generated-table naming convention, which nothing records."
                 )
             self.evidence = evidence_for("hana_crossing", self.resolution, detail=detail)

@@ -289,10 +289,39 @@ _MAPPING: dict[tuple[str, str], tuple[EvidenceBasis, str, str]] = {
         "Read from a /BIC/ table name by convention. The BW object behind a generated table is not "
         "recorded anywhere, so this cannot be confirmed.",
     ),
+    ("hana_crossing", "generated_provider_view"): (
+        "derived",
+        "generated_provider_view",
+        "Parsed from BW's generated per-provider view name (system-local.bw.bw2hana/<object>) and "
+        "confirmed against the provider catalogue, so both the name and the object type are "
+        "established.",
+    ),
     ("hana_crossing", "unresolved"): (
         "unknown",
         "unresolved",
         "The dependency names an object this server could not map back to a BW object at all.",
+    ),
+    # BaseTableRef.resolution - how the BW object behind a calc view's base was identified.
+    # A CompositeProvider has no generated /BIC/ table, so the table route cannot see one: only
+    # the generated per-provider view resolves it, which is why the two are reported apart.
+    ("calc_view_base", "generated_provider_view"): (
+        "derived",
+        "generated_provider_view",
+        "The base is BW's generated view for an InfoProvider "
+        "(system-local.bw.bw2hana/<object>); the object name was parsed from it and its type "
+        "confirmed against the provider header tables.",
+    ),
+    ("calc_view_base", "bic_table"): (
+        "inferred",
+        "bic_table_naming",
+        "Read from a /BIC/ or /BI0/ table name by convention. The BW object behind a generated "
+        "table is not recorded anywhere, so this cannot be confirmed.",
+    ),
+    ("calc_view_base", "unresolved"): (
+        "unknown",
+        "unresolved",
+        "The base names an object this server could not map back to a BW object. It may be a "
+        "non-BW table, another modelled view, or a generated object whose pattern is not covered.",
     ),
     # FieldLineagePath.resolution - how far a field's own derivation was followed.
     ("field_lineage", "field"): (

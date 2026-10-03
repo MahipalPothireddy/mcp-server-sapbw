@@ -1,10 +1,17 @@
 """HANA-layer repository (B8).
 
 Reads calc views from the HANA catalog (``SYS.VIEWS`` in the ``_SYS_BIC`` schema) and their
-dependencies from ``SYS.OBJECT_DEPENDENCIES`` (DEPENDENCY_TYPE=1 = direct, validated live in B8),
-resolving BW-generated ``/BIC/`` / ``/BI0/`` base tables back to BW objects (advisory, reusing the
-routine parser's resolver). Builds the bidirectional BW<->HANA crossing table. The SYS catalog
-views are OBJVERS-free and schema-qualified as ``SYS`` via the capability record.
+dependencies from ``SYS.OBJECT_DEPENDENCIES`` (DEPENDENCY_TYPE=1 = direct, validated live in B8).
+Builds the bidirectional BW<->HANA crossing table. The SYS catalog views are OBJVERS-free and
+schema-qualified as ``SYS`` via the capability record.
+
+A base resolves to a BW object by one of two routes, reported apart because they establish
+different things. A BW-generated ``/BIC/`` / ``/BI0/`` **table** name decomposes by convention
+(advisory, reusing the routine parser's resolver). BW's generated per-provider **view**,
+``system-local.bw.bw2hana/<OBJECT>``, is parsed and then type-confirmed against the provider
+header tables. Only the second can resolve a CompositeProvider, which has no generated table at
+all - so handling the table form alone did not merely weaken the answer, it dropped a whole class
+of object while the transitive dependency graph quietly supplied the providers beneath it instead.
 
 BW also generates a HANA view per InfoProvider in the ABAP schema, named
 ``0BW:BIA:<PROVIDER>`` with internal nodes suffixed ``:<node>`` / ``.<node>`` (e.g.
@@ -24,6 +31,7 @@ from ..core.dialect import quote_ident
 from ..models.completeness import BoundHit, Completeness, bounded
 from ..models.evidence import evidence_for
 from ..models.hana import (
+    BaseResolution,
     BaseTableRef,
     BwProviderView,
     CalcView,
@@ -44,6 +52,7 @@ from ..models.provenance import Provenance, UnsupportedResult
 from ..models.providers import classify_cube_type
 from ..services.calcview_parser import CalcViewParseError, parse_calc_view
 from ..services.routine_parser import _resolve_bw_table
+from ..services.table_resolver import CALC_VIEW_PACKAGE, provider_from_calc_view
 from .base import Repository
 
 # _SYS_BIC view types we treat as calc views (HIERARCHY views are BW hierarchy runtime, excluded).
@@ -66,6 +75,11 @@ _BW_VIEW_PREFIX = "0BW:BIA:"
 # Repository packages BW generates into. A view under one of these was produced by BW's own
 # generation rather than modelled by a person.
 _BW_REPO_PACKAGE_PREFIX = "system-local.bw"
+# The package segment of BW's generated per-InfoProvider view, used to match the name in SQL.
+# Matched as a segment rather than against the full package because a namespaced provider gets a
+# lowercase namespace suffix ('...bw2hana.abc/V_STOCK'); provider_from_calc_view does the exact
+# parse once a row is in hand.
+_BW2HANA_SEGMENT = CALC_VIEW_PACKAGE.rsplit(".", maxsplit=1)[-1]
 
 # Largest activated definition this server will fetch and parse, in characters.
 #
@@ -93,9 +107,21 @@ def _clean(value: Any) -> str | None:
     return text or None
 
 
-def _is_bw_generated(name: str) -> bool:
+def _is_bic_table(name: str) -> bool:
+    """A BW-generated *table* name, which decomposes to a BW object by convention."""
     upper = name.upper()
     return upper.startswith(("/BIC/", "/BI0/"))
+
+
+def _is_bw_generated(name: str) -> bool:
+    """Whether BW generated this object, by either of the two naming schemes it uses.
+
+    Both a ``/BIC/`` table and a ``system-local.bw.bw2hana/<OBJECT>`` view are BW's own output. The
+    second was reported as *not* BW-generated because only the table form was recognised, which is
+    the defect behind D47: on a landscape where modellers build on the generated provider views
+    rather than on the raw tables, every base of every modelled view read as a foreign object.
+    """
+    return _is_bic_table(name) or provider_from_calc_view(name) is not None
 
 
 def _split_repo_name(view_name: str) -> tuple[str | None, str | None]:
@@ -217,7 +243,27 @@ class HanaRepository(Repository):
                     limit=_MAX_PROVIDER_CONSUMERS,
                 )
             )
-        caveats = ["/BIC/ and /BI0/ base-table resolution to BW objects is advisory (naming-based)"]
+        # Caveat what was actually used. A flat "/BIC/ resolution is advisory" was reported even
+        # when no base went down that route, which told a reader the resolution was weak rather
+        # than that it had not happened (D47).
+        routes = {entry.resolution for entry in base_tables}
+        caveats: list[str] = []
+        if "bic_table" in routes:
+            caveats.append(
+                "/BIC/ and /BI0/ base-table resolution to BW objects is advisory (naming-based)"
+            )
+        if "generated_provider_view" in routes:
+            caveats.append(
+                f"bases named '{CALC_VIEW_PACKAGE}/<object>' are BW's generated per-provider "
+                "views; the object name is parsed from the view name and its type confirmed "
+                "against the provider header tables"
+            )
+        unresolved = [entry.table for entry in base_tables if entry.resolution == "unresolved"]
+        if unresolved:
+            caveats.append(
+                f"{len(unresolved)} of {len(base_tables)} bases did not resolve to a BW object "
+                "and are reported unresolved rather than omitted"
+            )
         if consumers:
             caveats.append(
                 "consuming BW providers are read from the '0BW:BIA:<PROVIDER>' generated views; "
@@ -262,23 +308,51 @@ class HanaRepository(Repository):
             )
         )
         truncated = len(rows) > _MAX_BASE_TABLES
-        base_tables: list[BaseTableRef] = []
+        kept: list[tuple[str, str | None, str | None]] = []
         seen: set[str] = set()
         for base_schema, base_object, base_type in rows[:_MAX_BASE_TABLES]:
             table = _clean(base_object)
             if table is None or table in seen:
                 continue
             seen.add(table)
-            is_bw = _is_bw_generated(table)
-            obj, kind, _confidence = _resolve_bw_table(table) if is_bw else (None, None, None)
+            kept.append((table, _clean(base_schema), _clean(base_type)))
+
+        # Names of BW's generated per-provider views, confirmed against the header tables in one
+        # batch. Doing it here rather than per row keeps this a single extra statement regardless
+        # of how many bases the view has.
+        parsed_providers = {
+            table: provider
+            for table, _schema, _type in kept
+            if (provider := provider_from_calc_view(table)) is not None
+        }
+        kinds = (
+            self._provider_kinds(sorted(set(parsed_providers.values()))) if parsed_providers else {}
+        )
+
+        base_tables: list[BaseTableRef] = []
+        for table, schema, obj_type in kept:
+            resolution: BaseResolution = "unresolved"
+            obj: str | None = None
+            kind: str | None = None
+            if (provider := parsed_providers.get(table)) is not None:
+                # A CompositeProvider has no generated /BIC/ table, so this is the *only* route
+                # that can resolve one. Reported even when the header lookup finds nothing, so a
+                # provider the release does not carry reads as unresolved rather than as absent.
+                if (confirmed := kinds.get(provider)) is not None:
+                    obj, kind, resolution = provider, confirmed, "generated_provider_view"
+            elif _is_bic_table(table):
+                obj, kind, _confidence = _resolve_bw_table(table)
+                if obj is not None:
+                    resolution = "bic_table"
             base_tables.append(
                 BaseTableRef(
                     table=table,
-                    schema_name=_clean(base_schema),
-                    object_type=_clean(base_type),
-                    is_bw_generated=is_bw,
+                    schema_name=schema,
+                    object_type=obj_type,
+                    is_bw_generated=_is_bw_generated(table),
                     resolved_object=obj,
                     resolved_kind=kind,
+                    resolution=resolution,
                     provenance=self.provenance(
                         "object_dependencies",
                         {"DEPENDENT_OBJECT_NAME": view_name, "BASE_OBJECT_NAME": table},
@@ -567,13 +641,30 @@ class HanaRepository(Repository):
     def _hana_reads_bw(
         self, abap: str, calc_view: str | None, limit: int, offset: int
     ) -> tuple[list[HanaCrossing], int, bool]:
+        """Modelled calc views reading BW, by either route BW exposes its data through.
+
+        Two shapes, and the second was missing entirely (D47). A view can read a generated
+        ``/BIC/`` table in the ABAP schema, or BW's generated per-provider view in ``_SYS_BIC``
+        (``system-local.bw.bw2hana/<OBJECT>``) - which is what a modeller picks in the HANA
+        modeller, and the only route by which a CompositeProvider can be read at all. Filtering on
+        the ABAP schema alone excluded every crossing of the second kind, so on a landscape built
+        that way the report said there were no crossings.
+
+        The dependent side is restricted to views BW did *not* generate, because a generated view
+        reading another generated view is BW's own plumbing rather than a boundary crossing.
+        """
+        generated_base = f"BASE_OBJECT_NAME LIKE '%{_BW2HANA_SEGMENT}/%'"
         where = [
             "DEPENDENT_SCHEMA_NAME = ?",
-            "BASE_SCHEMA_NAME = ?",
             "DEPENDENCY_TYPE = ?",
-            "(BASE_OBJECT_NAME LIKE '/BIC/%' OR BASE_OBJECT_NAME LIKE '/BI0/%')",
+            "("
+            "(BASE_SCHEMA_NAME = ? AND "
+            "(BASE_OBJECT_NAME LIKE '/BIC/%' OR BASE_OBJECT_NAME LIKE '/BI0/%'))"
+            f" OR (BASE_SCHEMA_NAME = ? AND {generated_base})"
+            ")",
+            f"DEPENDENT_OBJECT_NAME NOT LIKE '{_BW_REPO_PACKAGE_PREFIX}%'",
         ]
-        params: list[Any] = [_CALC_SCHEMA, abap, _DIRECT]
+        params: list[Any] = [_CALC_SCHEMA, _DIRECT, abap, _CALC_SCHEMA]
         if calc_view:
             where.append("DEPENDENT_OBJECT_NAME = ?")
             params.append(calc_view)
@@ -586,12 +677,44 @@ class HanaRepository(Repository):
         )
         total = self._count(base)
         rows = self.select(self.dialect.paginate(base, limit=limit, offset=offset))
-        # This direction is filtered to /BIC/ and /BI0/ base tables in SQL, so no BW provider views.
+        # Generated per-provider views on the BW side are type-confirmed in one batch, the same
+        # way the 0BW:BIA: views are on the other direction.
+        provider_views = self._resolve_generated_provider_views(
+            [str(base_obj) for _dep, base_obj, _t in rows]
+        )
         crossings = [
-            self._crossing("hana_reads_bw", str(dep), str(base_obj), str(base_type), {})
+            self._crossing("hana_reads_bw", str(dep), str(base_obj), str(base_type), provider_views)
             for dep, base_obj, base_type in rows
         ]
         return crossings, total, total > offset + limit
+
+    def _resolve_generated_provider_views(self, view_names: list[str]) -> dict[str, BwProviderView]:
+        """Resolve ``system-local.bw.bw2hana/<OBJECT>`` names to their InfoProviders.
+
+        The sibling of :meth:`resolve_bw_view_providers`, for BW's *other* generated view scheme.
+        Same contract: the name is parsed, the type is confirmed by lookup, and a name matching no
+        header row comes back ``verified=False`` rather than being dropped.
+        """
+        parsed = {
+            view: provider
+            for view in view_names
+            if (provider := provider_from_calc_view(view)) is not None
+        }
+        if not parsed:
+            return {}
+        kinds = self._provider_kinds(sorted(set(parsed.values())))
+        return {
+            view: BwProviderView(
+                view_name=view,
+                provider=provider,
+                resolved_kind=kinds.get(provider),
+                verified=provider in kinds,
+                provenance=self.provenance(
+                    "object_dependencies", {"BW_VIEW": view, "PROVIDER": provider}
+                ),
+            )
+            for view, provider in parsed.items()
+        }
 
     def _bw_reads_hana(
         self, abap: str, calc_view: str | None, limit: int, offset: int
@@ -627,16 +750,24 @@ class HanaRepository(Repository):
         object_type: str,
         provider_views: dict[str, BwProviderView],
     ) -> HanaCrossing:
-        resolution: Literal["bic_table", "bw_provider_view", "unresolved"] = "unresolved"
+        resolution: Literal[
+            "bic_table", "bw_provider_view", "generated_provider_view", "unresolved"
+        ] = "unresolved"
         resolved: str | None = None
         kind: str | None = None
-        if _is_bw_generated(bw_object):
+        if _is_bic_table(bw_object):
             resolved, kind, _confidence = _resolve_bw_table(bw_object)
             if resolved is not None:
                 resolution = "bic_table"
         elif (view := provider_views.get(bw_object)) is not None:
             resolved, kind = view.provider, view.resolved_kind
-            resolution = "bw_provider_view"
+            # Which generated scheme the name came from. Both are parsed-then-confirmed, but they
+            # are different objects and a caller tracing the hop needs to know which.
+            resolution = (
+                "generated_provider_view"
+                if provider_from_calc_view(bw_object) is not None
+                else "bw_provider_view"
+            )
         return HanaCrossing(
             direction=direction,
             hana_object=hana_object,

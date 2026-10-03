@@ -6,6 +6,54 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — a CompositeProvider a calculation view reads was dropped, and its parts promoted
+
+Reported by a customer checking a generated lineage document against their own system. A view
+documented as reading four Advanced DSOs in fact reads three DSOs and a **CompositeProvider**; the
+fourth DSO sits underneath that CompositeProvider. The set of DSOs eventually involved was right.
+The shape was wrong by a whole layer, and nothing in the output said so.
+
+The cause is one assumption in two places: that a calc view's BW bases are found by resolving
+`/BIC/` **table** names. An Advanced DSO has such a table. A CompositeProvider does not — it is
+consumed through a generated *view* — so it could not be seen at all. Worse, because
+`SYS.OBJECT_DEPENDENCIES` is transitive, the ADSOs two hops beneath the CompositeProvider still
+surfaced, and were reported as the view's own bases. A missing object would have been noticed; a
+plausible wrong shape was not.
+
+The pattern never resolved was `system-local.bw.bw2hana/<OBJECT>`, BW's generated view per
+InfoProvider, and it is what a modeller picks when building on BW data. On the reporting system
+**every** direct base of **every** modelled calculation view examined carried that name, so
+`resolved_bw_objects` came back empty each time and `is_bw_generated` read `false` for objects BW
+itself had generated. The reverse parser for the pattern already existed in
+`services/table_resolver.py` — written for the provider-to-its-view direction — and was simply
+never wired into the HANA path. Two code paths that did not meet.
+
+Three sites, each fixed for the question it answers:
+
+- **`bw_get_calc_view_lineage`** resolves the pattern and type-confirms the object against the
+  provider header tables. Every base now carries `resolution`, so a type-confirmed provider and a
+  `/BIC/` naming guess no longer read alike, and an unresolved base is reported rather than
+  omitted. Caveats name the routes actually used instead of asserting `/BIC/` resolution on views
+  that have no `/BIC/` base.
+- **`bw_get_lineage` / `bw_trace_to_source` / `bw_impact_analysis`** read a view's **direct**
+  bases first and prefer them, keeping the transitive table walk as the fallback it should always
+  have been. Preferring the direct read is what stops a two-hop reach being reported as a direct
+  one; the transitive route still answers for BW-generated views, where intermediate views make a
+  provider table reachable no other way.
+- **`bw_get_hana_crossings`** matched only `/BIC/` tables in the ABAP schema, and the generated
+  provider views live in `_SYS_BIC` — so on a landscape built that way the report said there were
+  no crossings. Both shapes are now read, and generated-view-to-generated-view dependencies are
+  excluded as BW's own plumbing rather than counted as boundaries.
+
+`ProvidersRepository.confirm_provider_kinds` is new because `provider_catalog` could not do this:
+it indexes names for table-name resolution and therefore omits CompositeProviders, which have no
+table to resolve.
+
+Both fixes were confirmed to fail without the change — the pre-fix behaviour reproduces exactly,
+with the CompositeProvider absent and its part presented as a direct base. The tool descriptions
+were part of the defect and are corrected too: they told a reader that resolution was `/BIC/`-only,
+which is what sent this analysis to `bw_trace_to_source` for a question about a view.
+
 ### Fixed — one unmodelled endpoint type discarded the entire lineage graph
 
 `bw_get_lineage` returned **no graph at all** the moment a walk reached a query element used as a

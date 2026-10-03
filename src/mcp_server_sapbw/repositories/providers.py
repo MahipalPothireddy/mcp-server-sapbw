@@ -60,6 +60,7 @@ from ..services.table_resolver import (
     calc_view_patterns,
     candidate_tables,
     is_hierarchy_view,
+    provider_from_calc_view,
     resolve_table,
 )
 from .base import Repository
@@ -148,6 +149,17 @@ def _first_text(texts: dict[str, str], *keys: str | None) -> str | None:
 # part providers' active tables appear one or more hops down as transitive dependencies. Scoping
 # the scan to a single named view keeps this cheap (tens of rows), unlike a system-wide type-2 scan.
 _TRANSITIVE_DEPENDENCY = 2
+_DIRECT_DEPENDENCY = 1  # what the view itself names, as against what it can reach
+
+# Header tables probed to confirm a provider name, most specific first. Unlike the table-name
+# catalogue this includes CompositeProviders, which have no generated table of their own.
+# (logical table, id column, provider type) - 'cube_header' is refined by CUBETYPE.
+_PROVIDER_HEADER_SOURCES: tuple[tuple[str, str, ProviderType], ...] = (
+    ("composite_header", "HCPRNM", "compositeprovider"),
+    ("adso_header", "ADSONM", "adso"),
+    ("dso_header", "ODSOBJECT", "dso"),
+    ("cube_header", "INFOCUBE", "infocube"),
+)
 _MAX_PART_TABLES = 400  # transitive closure of one view; bounded, and reported when hit
 _MAX_CATALOG = 20000  # provider-name catalogue used to confirm table -> object readings
 # How many object names a caveat lists before eliding. A caveat points at the list; it is not a
@@ -1419,24 +1431,166 @@ class ProvidersRepository(Repository):
         return self.providers_under_calc_view(view), []
 
     def providers_under_calc_view(self, view: str) -> list[PartProviderRef]:
-        """The BW objects a calculation view sits on, from its generated base tables.
+        """The BW objects a calculation view sits on.
 
-        **Transitive** dependencies, not direct ones, which is the whole reason this exists as its
-        own reader. BW layers intermediate views between a calc view and a provider's active table,
-        so the table is never a *direct* dependency of the view - a direct-dependency read of a
-        modelled view over BW data returns its intermediate views and no provider at all. Verified
-        live: the direct route found nothing for a CompositeProvider's declared calc-view part,
-        where the transitive route found the four ADSOs beneath it.
+        Two routes, tried in order of what they establish rather than blended:
+
+        1. **Direct dependencies.** What the view itself reads: BW's generated per-provider view
+           (``system-local.bw.bw2hana/<OBJECT>``, parsed and type-confirmed) or a ``/BIC/`` table
+           read outright. If anything is found here it *is* the answer, because these are the
+           objects the view names.
+        2. **Transitive ``/BIC/`` tables**, used only when the first route finds nothing. BW layers
+           intermediate views between a generated view and a provider's active table, so for a
+           BW-generated view the provider table is reachable only transitively.
+
+        Route 1 did not exist, and that is defect D47. Route 2 alone resolves a
+        CompositeProvider base to *its parts' tables* - the CP itself has no table - so a
+        CompositeProvider a view reads disappeared from the graph and the ADSOs two hops beneath
+        it were reported as the view's own bases. On the measured system that turned a four-layer
+        path into a three-layer one and attributed a provider's content to the wrong object.
+        Preferring the direct route also stops the transitive one reporting a two-hop reach as a
+        direct read.
 
         Public because the lineage walk needs it for a calc view it reached through a declared
-        CompositeProvider input, not only for the view BW generated for a provider. Resolution is
-        by table name, so a part is advisory unless the provider catalogue confirmed it.
+        CompositeProvider input, not only for the view BW generated for a provider.
         """
         if not (
             self.capability.is_available("hana_views")
             and self.capability.is_available("object_dependencies")
         ):
             return []
+        direct = self._calc_view_direct_providers(view)
+        if direct:
+            return direct
+        return self._calc_view_transitive_providers(view)
+
+    def _calc_view_direct_providers(self, view: str) -> list[PartProviderRef]:
+        """Objects the view reads outright: generated per-provider views, or ``/BIC/`` tables.
+
+        Neither schema nor object type is constrained in SQL, because the two shapes differ in
+        both: a generated provider view is a VIEW in ``_SYS_BIC``, a ``/BIC/`` table is a TABLE in
+        the ABAP schema. Filtering to either one is what hid the other.
+        """
+        rows = self.select(
+            self.dialect.paginate(
+                self.dialect.build_select(
+                    columns=["DISTINCT BASE_OBJECT_NAME"],
+                    from_logical="object_dependencies",
+                    where=[
+                        "DEPENDENT_SCHEMA_NAME = ?",
+                        "DEPENDENT_OBJECT_NAME = ?",
+                        "DEPENDENCY_TYPE = ?",
+                    ],
+                    params=[_CALC_SCHEMA, view, _DIRECT_DEPENDENCY],
+                    order_by=["BASE_OBJECT_NAME"],
+                ),
+                limit=_MAX_PART_TABLES,
+            )
+        )
+        names = [str(name).strip() for (name,) in rows if str(name).strip()]
+        if not names:
+            return []
+
+        # Generated per-provider views, type-confirmed against the header tables in one batch.
+        parsed = {
+            name: provider
+            for name in names
+            if name != view and (provider := provider_from_calc_view(name)) is not None
+        }
+        kinds = self.confirm_provider_kinds(sorted(set(parsed.values()))) if parsed else {}
+        catalog = self.provider_catalog()
+        parts: list[PartProviderRef] = []
+        seen: set[str] = set()
+        for name, provider in parsed.items():
+            kind = kinds.get(provider)
+            if kind is None:
+                continue  # parses, but no header row carries it: not asserted as a provider
+            if provider in seen:
+                continue
+            seen.add(provider)
+            parts.append(
+                PartProviderRef(
+                    name=provider,
+                    part_type=kind,
+                    via_table=name,
+                    confidence="confirmed",
+                    # Explicit, because PartProviderRef's default sentence describes the
+                    # generated-*table* route and would misdescribe this one.
+                    evidence=evidence_for(
+                        "calc_view_base",
+                        "generated_provider_view",
+                        detail=(
+                            f"The view reads {name}, BW's generated view for {provider}, whose "
+                            f"type was confirmed as {kind} against the provider catalogue."
+                        ),
+                    ),
+                    provenance=self.provenance(
+                        "object_dependencies",
+                        {"DEPENDENT_OBJECT_NAME": view, "BASE_OBJECT_NAME": name},
+                    ),
+                )
+            )
+
+        # Tables the view reads outright, resolved the same way as the transitive route.
+        for name in names:
+            if name in parsed:
+                continue
+            resolved = resolve_table(name, catalog)
+            if not resolved.is_part_provider_candidate or resolved.object_name is None:
+                continue
+            if resolved.object_name in seen:
+                continue
+            seen.add(resolved.object_name)
+            parts.append(
+                PartProviderRef(
+                    name=resolved.object_name,
+                    part_type=_KIND_TO_PROVIDER_TYPE.get(resolved.kind),
+                    via_table=name,
+                    confidence=resolved.confidence,
+                    provenance=self.provenance(
+                        "object_dependencies",
+                        {"DEPENDENT_OBJECT_NAME": view, "BASE_OBJECT_NAME": name},
+                    ),
+                )
+            )
+        parts.sort(key=lambda p: p.name)
+        return parts
+
+    def confirm_provider_kinds(self, names: list[str]) -> dict[str, ProviderType]:
+        """Confirm provider names against the header tables, returning name -> provider type.
+
+        Batched, most specific header first, and it covers ``composite_header`` - which
+        :meth:`provider_catalog` does not, because that one serves table-name resolution and a
+        CompositeProvider has no generated table to resolve. A name no header row carries is
+        absent from the result rather than defaulted, so a caller cannot mistake "not confirmed"
+        for a kind.
+        """
+        remaining = [n for n in dict.fromkeys(names) if n]
+        kinds: dict[str, ProviderType] = {}
+        for logical, id_column, kind in _PROVIDER_HEADER_SOURCES:
+            if not remaining or not self.capability.is_available(logical):
+                continue
+            is_cube = logical == "cube_header"
+            placeholders = ", ".join("?" for _ in remaining)
+            rows = self.select(
+                self.dialect.build_select(
+                    columns=[id_column, "CUBETYPE"] if is_cube else [id_column],
+                    from_logical=logical,
+                    where=[f"{id_column} IN ({placeholders})"],
+                    params=list(remaining),
+                    order_by=[id_column],
+                )
+            )
+            for row in rows:
+                name = str(row[0]).strip()
+                if not name or name in kinds:
+                    continue
+                kinds[name] = classify_cube_type(row[1]) if is_cube else kind
+            remaining = [n for n in remaining if n not in kinds]
+        return kinds
+
+    def _calc_view_transitive_providers(self, view: str) -> list[PartProviderRef]:
+        """Provider tables reachable transitively, for views whose bases are BW-generated chains."""
         rows = self.select(
             self.dialect.paginate(
                 self.dialect.build_select(

@@ -1955,11 +1955,26 @@ def bw_list_calc_views(
 
 @_readonly_tool
 def bw_get_calc_view_lineage(system: str, view_name: str) -> CalcViewLineage | UnsupportedResult:
-    """A calc view's base tables and the InfoProviders consuming it, resolved to BW objects.
+    """A calc view's **direct** bases and the InfoProviders consuming it, resolved to BW objects.
 
-    Base tables come from SYS.OBJECT_DEPENDENCIES with ``/BIC/`` names resolved (advisory).
-    ``consuming_bw_providers`` reads BW's generated ``0BW:BIA:<PROVIDER>`` views, giving the
-    calc-view -> CompositeProvider hop that BW's own where-used lists omit.
+    This is the tool for "what does this view read". Use it rather than ``bw_trace_to_source``
+    when the question is about a view, because the dependency catalogue is transitive and a trace
+    answers "what does this ultimately come from" - a different question, with a different shape.
+
+    Bases come from SYS.OBJECT_DEPENDENCIES, and each one carries ``resolution`` saying how its BW
+    object was identified, because the two routes are not equally strong:
+
+    * ``generated_provider_view`` - BW's generated view for an InfoProvider
+      (``system-local.bw.bw2hana/<OBJECT>``), parsed and then **type-confirmed** against the
+      provider header tables. A CompositeProvider can only be read this way: it has no generated
+      ``/BIC/`` table, so a view reading one resolves here or not at all.
+    * ``bic_table`` - decomposed from a ``/BIC/`` or ``/BI0/`` table name. Advisory; nothing
+      records which BW object owns a generated table.
+    * ``unresolved`` - reported rather than omitted, so a base this server cannot map is visible.
+
+    ``consuming_bw_providers`` is the other direction, read from BW's generated
+    ``0BW:BIA:<PROVIDER>`` views: the calc-view -> CompositeProvider hop BW's own where-used lists
+    omit.
     """
     return runtime().hana(system).get_calc_view_lineage(view_name)
 
@@ -1995,9 +2010,16 @@ def bw_get_hana_crossings(
 ) -> HanaCrossingReport | UnsupportedResult:
     """Every BW<->HANA boundary crossing, both directions (calc-view<->BW-object).
 
-    Each crossing says how its BW side was resolved: ``bic_table`` (from a ``/BIC/`` name,
-    advisory), ``bw_provider_view`` (a ``0BW:BIA:`` view parsed to its InfoProvider and
-    type-confirmed), or ``unresolved``.
+    Both routes a modelled view can reach BW data by are covered: a ``/BIC/`` table in the ABAP
+    schema, and BW's generated per-provider view in ``_SYS_BIC``. The second is what a modeller
+    actually picks, so filtering to the first reported no crossings at all on a landscape built
+    that way.
+
+    Each crossing says how its BW side was resolved: ``generated_provider_view``
+    (``system-local.bw.bw2hana/<object>``, parsed then type-confirmed), ``bw_provider_view`` (a
+    ``0BW:BIA:`` view, likewise), ``bic_table`` (from a ``/BIC/`` name, advisory - nothing records
+    the owning object), or ``unresolved``. Crossings between two BW-generated views are excluded:
+    that is BW's own plumbing, not a boundary.
     """
     limit, offset = _clamp_page(limit, offset)
     return (

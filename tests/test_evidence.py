@@ -25,7 +25,7 @@ from mcp_server_sapbw.models.evidence import (
     evidence_for,
     summarise,
 )
-from mcp_server_sapbw.models.hana import HanaCrossing
+from mcp_server_sapbw.models.hana import BaseTableRef, HanaCrossing
 from mcp_server_sapbw.models.lineage import LineageEdge, LineageGraph
 from mcp_server_sapbw.models.provenance import Provenance
 from mcp_server_sapbw.models.providers import PartProviderRef
@@ -121,6 +121,7 @@ _COVERED: list[tuple[type[BaseModel], str, str]] = [
     (SourceSystem, "kind_confidence", "source_system_kind"),
     (TableDependency, "resolution_confidence", "table_resolution"),
     (HanaCrossing, "resolution", "hana_crossing"),
+    (BaseTableRef, "resolution", "calc_view_base"),
     (FieldLineagePath, "resolution", "field_lineage"),
     (ChainCadence, "confidence", "cadence"),
     (RoutineAnalysis, "completeness", "routine_analysis"),
