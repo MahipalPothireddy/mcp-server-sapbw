@@ -57,6 +57,15 @@ onboarding exercise, not a development one.
 > connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
 > `PROGRESS.md` for the build log and `.kiro/specs/mcp-server-sapbw/` for the spec.
 
+## See the output first
+
+[`examples/interactive-lineage/`](examples/interactive-lineage/) holds a rendered example of what
+this produces for one BEx query — an interactive dependency diagram with object descriptions,
+per-routine analysis and calculation-view logic, in a single self-contained HTML file. The
+landscape in it is synthetic; the shape is not.
+
+[![Example lineage diagram](examples/interactive-lineage/preview.png)](examples/interactive-lineage/)
+
 ## What it does
 
 - **Process chains & scheduling** — structure, recursive meta-chains, observed cadence (from run

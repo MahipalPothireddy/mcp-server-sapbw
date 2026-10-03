@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Q_SALES_MARGIN — interactive lineage example</title>
+<meta name="generator" content="mcp-server-sapbw">
+<style>
+:root {
+  --ink:#0f172a; --muted:#475569; --rule:#cbd5e1; --band:#f1f5f9;
+  --paper:#ffffff; --accent:#1d4ed8; --ok:#15803d; --warn:#b45309;
+  --bad:#be123c; --method:#7e22ce; --shadow:0 1px 2px rgba(15,23,42,.06);
+  --k-query:#e9d5ff; --k-query-e:#7e22ce;
+  --k-cp:#bbf7d0;    --k-cp-e:#15803d;
+  --k-adso:#c7d2fe;  --k-adso-e:#4338ca;
+  --k-ds:#fde68a;    --k-ds-e:#b45309;
+  --k-calc:#fbcfe8;  --k-calc-e:#9d174d;
+  --k-src:#fef3c7;   --k-src-e:#92400e;
+  --k-iobj:#e2e8f0;  --k-iobj-e:#475569;
+}
+* { box-sizing:border-box; }
+html { scroll-behavior:smooth; }
+body {
+  margin:0; background:#f8fafc; color:var(--ink);
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,
+       Arial,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+code, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:.86em; }
+a { color:var(--accent); }
+h1,h2,h3,h4 { line-height:1.25; margin:0; }
+
+/* ---------------------------------------------------------------- chrome */
+header.top {
+  background:var(--ink); color:#e2e8f0; padding:26px 32px 20px;
+  border-bottom:3px solid var(--accent);
+}
+header.top h1 { font-size:30px; letter-spacing:-.4px; color:#fff; }
+header.top .sub { color:#94a3b8; font-size:15px; margin-top:4px; }
+.chips { display:flex; flex-wrap:wrap; gap:7px; margin-top:16px; }
+.chip {
+  background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.16);
+  border-radius:999px; padding:3px 11px; font-size:12px; color:#cbd5e1;
+}
+.chip b { color:#fff; font-weight:600; }
+
+nav.toc {
+  position:sticky; top:0; z-index:40; background:rgba(255,255,255,.94);
+  backdrop-filter:blur(8px); border-bottom:1px solid var(--rule);
+  padding:0 22px; overflow-x:auto; white-space:nowrap; box-shadow:var(--shadow);
+}
+nav.toc a {
+  display:inline-block; padding:11px 11px; font-size:13px; color:var(--muted);
+  text-decoration:none; border-bottom:2px solid transparent;
+}
+nav.toc a:hover { color:var(--ink); background:var(--band); }
+nav.toc a.on { color:var(--accent); border-bottom-color:var(--accent);
+  font-weight:600; }
+
+main { max-width:1280px; margin:0 auto; padding:0 22px 90px; }
+section { scroll-margin-top:52px; padding:34px 0 8px; }
+section + section { border-top:1px solid var(--rule); }
+.secno { color:var(--accent); font-weight:700; font-size:13px;
+  letter-spacing:.9px; text-transform:uppercase; }
+section > h2 { font-size:25px; margin:5px 0 12px; letter-spacing:-.3px; }
+h3 { font-size:17px; margin:26px 0 9px; }
+h4 { font-size:14px; margin:18px 0 7px; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.6px; }
+p { margin:0 0 12px; max-width:95ch; }
+p.lead { font-size:17px; line-height:1.55; }
+.small { font-size:13px; color:var(--muted); }
+
+/* ---------------------------------------------------------------- blocks */
+.card {
+  background:var(--paper); border:1px solid var(--rule); border-radius:10px;
+  padding:18px 20px; margin:0 0 16px; box-shadow:var(--shadow);
+}
+.correction { border-left:5px solid var(--method); }
+.correction h3 { margin-top:0; color:var(--method); }
+.note { border-left:5px solid var(--accent); }
+.caution { border-left:5px solid var(--warn); background:#fffbeb;
+  border-color:#fde68a; }
+.grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr));
+  gap:16px; }
+
+dl.kv { margin:0; display:grid; grid-template-columns:max-content 1fr;
+  gap:3px 16px; }
+dl.kv dt { font-weight:600; font-size:13px; color:var(--muted); }
+dl.kv dd { margin:0; font-size:14px; }
+
+table { border-collapse:collapse; width:100%; font-size:13.5px;
+  background:var(--paper); }
+.tw { overflow-x:auto; border:1px solid var(--rule); border-radius:10px;
+  margin:0 0 16px; box-shadow:var(--shadow); }
+thead th {
+  background:var(--ink); color:#fff; text-align:left; font-weight:600;
+  padding:9px 11px; font-size:12.5px; position:sticky; top:0;
+}
+tbody td { padding:8px 11px; border-top:1px solid #e8edf3; vertical-align:top; }
+tbody tr:nth-child(even) { background:var(--band); }
+tbody tr:hover { background:#eef2ff; }
+td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+
+.sev { display:inline-block; padding:1px 8px; border-radius:5px;
+  font-size:11.5px; font-weight:700; letter-spacing:.3px; white-space:nowrap; }
+.sev.High   { background:#ffe4e6; color:var(--bad);    border:1px solid #fecdd3; }
+.sev.Medium { background:#fef3c7; color:var(--warn);   border:1px solid #fde68a; }
+.sev.Low    { background:var(--band); color:var(--muted); border:1px solid var(--rule); }
+.sev.Method { background:#f3e8ff; color:var(--method); border:1px solid #e9d5ff; }
+.tagok   { color:var(--ok);   font-weight:600; }
+.tagwarn { color:var(--warn); font-weight:600; }
+.tagbad  { color:var(--bad);  font-weight:600; }
+.tagmut  { color:var(--muted); }
+
+details { background:var(--paper); border:1px solid var(--rule);
+  border-radius:10px; margin:0 0 10px; box-shadow:var(--shadow); }
+details[open] { box-shadow:0 2px 10px rgba(15,23,42,.08); }
+summary { cursor:pointer; padding:12px 16px; font-weight:600; font-size:14.5px;
+  display:flex; align-items:center; gap:10px; }
+summary::-webkit-details-marker { display:none; }
+summary:before { content:"\25B8"; color:var(--accent); font-size:12px;
+  transition:transform .14s; }
+details[open] > summary:before { transform:rotate(90deg); }
+summary:hover { background:var(--band); border-radius:9px; }
+summary .meta { margin-left:auto; font-weight:400; font-size:12.5px;
+  color:var(--muted); }
+.dbody { padding:0 16px 14px; border-top:1px solid #e8edf3; }
+
+ul.tight { margin:0 0 12px; padding-left:20px; }
+ul.tight li { margin:3px 0; }
+
+/* ---------------------------------------------------------------- diagram */
+/* break the diagram out of the text column: nine layers need the width */
+.bleed { margin-left:calc(50% - 50vw); margin-right:calc(50% - 50vw);
+  padding:0 22px; }
+.viz { background:var(--paper); border:1px solid var(--rule);
+  border-radius:12px; box-shadow:var(--shadow); overflow:hidden; }
+.vizbar { display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center;
+  padding:11px 14px; border-bottom:1px solid var(--rule);
+  background:linear-gradient(#fff,#f8fafc); }
+.vizbar .grp { display:flex; gap:6px; align-items:center; }
+.vizbar label { font-size:12.5px; color:var(--muted); display:flex; gap:5px;
+  align-items:center; cursor:pointer; user-select:none; }
+.vizbar input[type=checkbox] { accent-color:var(--accent); }
+.btn { font:inherit; font-size:12.5px; padding:4px 10px; cursor:pointer;
+  background:#fff; border:1px solid var(--rule); border-radius:7px;
+  color:var(--ink); }
+.btn:hover { background:var(--band); border-color:#94a3b8; }
+.btn:active { transform:translateY(1px); }
+#q { font:inherit; font-size:13px; padding:5px 10px; border-radius:7px;
+  border:1px solid var(--rule); width:190px; }
+#q:focus { outline:2px solid var(--accent); outline-offset:1px; }
+.hint { font-size:12px; color:var(--muted); margin-left:auto; }
+
+.vizmain { display:grid; grid-template-columns:1fr 320px; min-height:580px; }
+@media (max-width:960px){ .vizmain { grid-template-columns:1fr; } }
+#stage { position:relative; background:#fff; cursor:grab; overflow:hidden; }
+#stage.drag { cursor:grabbing; }
+#svg { display:block; width:100%; height:100%; min-height:580px;
+  touch-action:none; }
+.lanelab { font:600 10.5px/1 -apple-system,"Segoe UI",sans-serif;
+  fill:#94a3b8; letter-spacing:.7px; text-transform:uppercase; }
+.lanebg { fill:#f8fafc; }
+g.node { cursor:pointer; }
+g.node rect { stroke-width:1.2; rx:6; }
+g.node text { font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,
+  monospace; fill:var(--ink); pointer-events:none; }
+g.node text.sub { font:400 8.4px/1 -apple-system,"Segoe UI",Roboto,sans-serif;
+  fill:#334155; letter-spacing:.1px; }
+g.node:focus { outline:none; }
+g.node:focus rect { stroke:var(--accent); stroke-width:3; }
+g.node.sel rect { stroke-width:3; filter:drop-shadow(0 2px 5px rgba(0,0,0,.22)); }
+g.node.dim { opacity:.14; }
+path.edge { fill:none; }
+path.edge.dim { opacity:.05; }
+path.edge.hot { stroke-width:2.6; }
+.k-query rect { fill:var(--k-query); stroke:var(--k-query-e); }
+.k-cp    rect { fill:var(--k-cp);    stroke:var(--k-cp-e); }
+.k-adso  rect { fill:var(--k-adso);  stroke:var(--k-adso-e); }
+.k-ds    rect { fill:var(--k-ds);    stroke:var(--k-ds-e); }
+.k-calc  rect { fill:var(--k-calc);  stroke:var(--k-calc-e); }
+.k-src   rect { fill:var(--k-src);   stroke:var(--k-src-e); }
+.k-iobj  rect { fill:var(--k-iobj);  stroke:var(--k-iobj-e); }
+
+#panel { border-left:1px solid var(--rule); background:#fcfdfe; padding:14px 16px;
+  overflow-y:auto; max-height:760px; }
+#panel h4 { margin:0 0 2px; font-size:11px; }
+#panel .pname { font:700 16px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,
+  monospace; word-break:break-all; margin:0 0 2px; }
+#panel .pdesc { font-size:14px; font-weight:600; line-height:1.35; margin:2px 0 5px; }
+#panel .pkind { font-size:12px; color:var(--muted); margin-bottom:12px; }
+.genmark { display:inline-block; font-size:9.5px; font-weight:600; padding:1px 5px;
+  border-radius:4px; background:#f3e8ff; color:var(--method);
+  border:1px solid #e9d5ff; vertical-align:2px; white-space:nowrap;
+  letter-spacing:.2px; cursor:help; }
+#panel dl.kv { grid-template-columns:1fr; gap:0; }
+#panel dl.kv dt { margin-top:10px; font-size:10.5px; text-transform:uppercase;
+  letter-spacing:.6px; }
+#panel dl.kv dd { font-size:13px; line-height:1.45; }
+#panel .empty { color:var(--muted); font-size:13px; }
+.nb { margin:12px 0 0; border-top:1px solid var(--rule); padding-top:10px; }
+.nb li { font-size:12.5px; margin:2px 0; list-style:none; }
+.nb li b { font-weight:600; }
+.nb .arrow { color:var(--muted); }
+.swatch { display:inline-block; width:10px; height:10px; border-radius:3px;
+  border:1px solid; vertical-align:-1px; margin-right:5px; }
+.legend { display:flex; flex-wrap:wrap; gap:6px 16px; padding:11px 14px;
+  border-top:1px solid var(--rule); font-size:12.5px; color:var(--muted);
+  background:#fcfdfe; }
+.legend .ln { display:inline-block; width:26px; height:0;
+  border-top-width:2px; vertical-align:3px; margin-right:5px; }
+.tip { position:absolute; pointer-events:none; z-index:9; max-width:300px;
+  background:var(--ink); color:#fff; font-size:12px; line-height:1.45;
+  padding:7px 10px; border-radius:7px; opacity:0; transition:opacity .1s;
+  box-shadow:0 4px 14px rgba(0,0,0,.3); }
+.tip.on { opacity:1; }
+.tip b { color:#fff; }
+.tip .t2 { color:#94a3b8; }
+
+footer { max-width:1280px; margin:0 auto; padding:24px 22px 60px;
+  color:var(--muted); font-size:12.5px; border-top:1px solid var(--rule); }
+
+@media print {
+  nav.toc, .vizbar, #panel, .hint { display:none !important; }
+  body { background:#fff; }
+  .viz, .card, .tw, details { break-inside:avoid; box-shadow:none; }
+  details { border:1px solid var(--rule); }
+  details:not([open]) > .dbody { display:block; }
+  section { break-before:page; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div style="max-width:1280px;margin:0 auto">
+    <div style="color:#94a3b8;font-size:13px;letter-spacing:.8px;
+      text-transform:uppercase">Example output &middot; synthetic data</div>
+    <h1>Q_SALES_MARGIN</h1>
+    <div class="sub">Sales Margin by Customer and Material</div>
+    <div class="chips"><span class="chip">Provider <b>SALES_OVERVIEW_CP (CompositeProvider)</b></span><span class="chip">Parts <b>5 Advanced DSOs</b></span><span class="chip">Objects drawn <b>33</b></span><span class="chip">Data <b>synthetic</b></span><span class="chip">Rendered <b>2026-10-03</b></span></div>
+  </div>
+</header>
+<nav class="toc"><div style="max-width:1280px;margin:0 auto"><a href="#intro">About</a><a href="#s1">1 Findings</a><a href="#s2">2 Diagram</a><a href="#s3">3 Transformations</a><a href="#s4">4 HANA views</a></div></nav><main><section id="intro"><div class="card note"><h3>What this is</h3>
+<p>An example of what <code>mcp-server-sapbw</code> produces for one BEx query: the objects behind
+it, how they connect, what the transformations do, and what the HANA calculation views compute.
+It is a static file &mdash; CSS, JavaScript and data inlined, no network access, nothing to
+install.</p>
+<p><b>Every name in it is invented.</b> The repository contains no customer metadata and this
+example is not an exception: the landscape below is synthetic, and the repository's CI fails the
+build if a real BW object name appears anywhere in the tree or its history. What is realistic is
+the <i>shape</i> &mdash; a report on a CompositeProvider that unions five stores, two of them
+full-loaded out of HANA calculation views that read other BW objects and hand the result back.
+That shape is what makes the output worth reading, and a tidy three-box example would not
+demonstrate it.</p>
+<h3>What to try</h3>
+<ul class="tight">
+  <li><b>Click a box.</b> The panel shows what the object is, where that description came from,
+      and every dependency with the mechanism that produced it. The rest of the graph dims.</li>
+  <li><b>Switch on master-data lookups.</b> The diagram re-lays itself out over what is left, so
+      hiding a column does not leave a gap.</li>
+  <li><b>Hover an edge.</b> It says whether the relationship is declared in metadata or was
+      parsed out of ABAP &mdash; the distinction the rest of this page keeps making.</li>
+  <li><b>Search</b>, drag to pan, scroll to zoom, <kbd>Esc</kbd> to reset.</li>
+</ul>
+<h3>The one thing to take from it</h3>
+<p>Every fact carries how it was established. <span class="tagok">Declared</span> means a metadata
+row states it. <span class="tagwarn">Advisory</span> means it was parsed out of ABAP or resolved
+from a generated name, so the set is a <b>lower bound</b> &mdash; dynamic SQL, function-module
+calls and class methods are not followed. An advisory edge is real; the absence of one proves
+nothing. Descriptions work the same way: anything not stored verbatim in BW is marked, because a
+synthesized description must never be indistinguishable from one BW holds.</p></div></section><section id="s1"><div class="secno">Section 1</div><h2>Findings</h2><p>Ordered by severity. Each one names the metadata it rests on, so a disputed finding can be traced back to the rows behind it rather than argued about.</p><div class="tw"><table><thead><tr><th>#</th><th>Severity</th><th>Finding</th></tr></thead><tbody><tr><td><b>F1</b></td><td><span class="sev High">High</span></td><td><b>Two closed BW &rarr; HANA &rarr; BW loops feed this report, and one reads a CompositeProvider.</b><p style='margin:5px 0 0'>ORDER_ITEM is full-loaded from OPEN_ORDER_CP, backed by <code>ACME.SALES/CV_OPEN_ORDERS</code>; BILLING_ITEM from FOC_ORDER_CP, backed by <code>ACME.SALES/CV_FREE_OF_CHARGE</code>. The second view's direct bases include the CompositeProvider <b>ORDER_COND_CP</b>, which adds a layer and pulls in ORDER_COND. BW raises no where-used warning when either view changes, and both loads are full - so there is no delta to inspect afterwards.</p><p class='small' style='margin:6px 0 0'>Evidence: <code>SYS.OBJECT_DEPENDENCIES · _SYS_REPO.ACTIVE_OBJECT · RSOHCPR · RSBKDTP</code></p></td></tr><tr><td><b>F2</b></td><td><span class="sev High">High</span></td><td><b>ORDER_ITEM is both upstream and downstream of the same calculation view.</b><p style='margin:5px 0 0'><code>CV_OPEN_ORDERS</code> reads ORDER_ITEM and feeds OPEN_ORDER_CP, which full-loads ORDER_ITEM. Load order therefore determines the result and the object cannot be reloaded independently of the view. A failed request cannot simply be re-run.</p><p class='small' style='margin:6px 0 0'>Evidence: <code>SYS.OBJECT_DEPENDENCIES · RSBKDTP · RSTRAN</code></p></td></tr><tr><td><b>F3</b></td><td><span class="sev Medium">Medium</span></td><td><b>The logic is in the self-referencing transformations, not in the loads from the source system.</b><p style='margin:5px 0 0'>None of the seven DataSource-fed transformations carries an end routine. 1,146 lines of end-routine ABAP sit in the three transformations that read a store and write back to it. A change review that reads the inbound transformations sees almost nothing.</p><p class='small' style='margin:6px 0 0'>Evidence: <code>RSTRAN · RSTRANRULE · RSAABAP</code></p></td></tr><tr><td><b>F4</b></td><td><span class="sev Medium">Medium</span></td><td><b>BILLING_ITEM's end routine reads PARTNER_FN through a SELECT, which BW's where-used list does not show.</b><p style='margin:5px 0 0'>Routine-derived dependencies are invisible to BW's own impact analysis, so a change to PARTNER_FN reaches this report with nothing in BW to flag it. Four such edges were found on this path, and that count is a <b>lower bound</b>: dynamic SQL, function-module calls and class methods are not followed.</p><p class='small' style='margin:6px 0 0'>Evidence: <code>RSAABAP · RSTRAN</code></p></td></tr><tr><td><b>F5</b></td><td><span class="sev Low">Low</span></td><td><b>BUDGET_PLAN is fed only by a flat file.</b><p style='margin:5px 0 0'>No system of record this server can reach, so its content cannot be reconciled upstream. It is also the only part loaded full from its source.</p><p class='small' style='margin:6px 0 0'>Evidence: <code>RSDS · RSBKDTP</code></p></td></tr></tbody></table></div></section><section id="s2"><div class="secno">Section 2</div><h2>The shape of the flow</h2><p>Laid out left to right by dependency depth. Every box is an object, every
+line a dependency with the mechanism that produced it, and every box's second line is the object's
+description.</p>
+<p class="small">33 objects and 48 dependencies in total,
+5 of the dependencies running backwards &mdash; those are the loops. A box with a dashed
+self-loop has a transformation whose source and target are the same object. The counter on the
+right says how many the current filters leave visible.</p><div class="bleed"><div class="viz">
+  <div class="vizbar">
+    <div class="grp">
+      <button class="btn" id="b-fit" type="button">Fit</button>
+      <button class="btn" id="b-in" type="button" aria-label="Zoom in">+</button>
+      <button class="btn" id="b-out" type="button" aria-label="Zoom out">&minus;</button>
+      <button class="btn" id="b-loop" type="button">Show the HANA loop</button>
+      <button class="btn" id="b-clear" type="button">Clear</button>
+    </div>
+    <div class="grp">
+      <label><input type="checkbox" id="t-look"> master-data &amp; lookup targets</label>
+      <label><input type="checkbox" id="t-look-e" checked> declared lookups</label>
+      <label><input type="checkbox" id="t-adv" checked> advisory edges</label>
+      <label><input type="checkbox" id="t-self" checked> self re-processing</label>
+    </div>
+    <input id="q" type="search" placeholder="Search object name&hellip;"
+      aria-label="Search object name">
+    <span class="hint" id="vcount"></span>
+  </div>
+  <noscript><div class="card caution" style="margin:14px">The diagram is drawn by script in the
+  page, so it needs JavaScript enabled. Nothing is fetched from the network. The same
+  relationships are written out as text in sections 3 and 4.</div></noscript>
+  <div class="vizmain">
+    <div id="stage">
+      <svg id="svg" role="img" aria-label="Dependency graph of the example query."></svg>
+      <div class="tip" id="tip" role="status"></div>
+    </div>
+    <aside id="panel" aria-live="polite"></aside>
+  </div>
+  <div class="legend"><span><span class="swatch" style="background:var(--k-src);border-color:var(--k-src-e)"></span>Source system</span><span><span class="swatch" style="background:var(--k-ds);border-color:var(--k-ds-e)"></span>DataSource</span><span><span class="swatch" style="background:var(--k-adso);border-color:var(--k-adso-e)"></span>Advanced DSO</span><span><span class="swatch" style="background:var(--k-iobj);border-color:var(--k-iobj-e)"></span>InfoObject</span><span><span class="swatch" style="background:var(--k-cp);border-color:var(--k-cp-e)"></span>CompositeProvider</span><span><span class="swatch" style="background:var(--k-calc);border-color:var(--k-calc-e)"></span>HANA calc view</span><span><span class="swatch" style="background:var(--k-query);border-color:var(--k-query-e)"></span>BEx query</span></div>
+  <div class="legend"><span><span class="ln" style="border-top:2px solid #be123c"></span>declared FULL load</span><span><span class="ln" style="border-top:2px solid #64748b"></span>declared delta load</span><span><span class="ln" style="border-top:2px solid #15803d"></span>CompositeProvider part</span><span><span class="ln" style="border-top:2px solid #0e7490"></span>read by a HANA calc view</span><span><span class="ln" style="border-top:2px dashed #0e7490"></span>exposed back to BW</span><span><span class="ln" style="border-top:2px solid #7e22ce"></span>read by the query</span><span><span class="ln" style="border-top:2px dashed #2563eb"></span>declared lookup</span><span><span class="ln" style="border-top:2px dashed #b45309"></span>routine-derived (advisory)</span></div>
+</div></div><p class="small" style="margin-top:14px">Master-data and lookup targets are hidden
+by default. On a real landscape far more is hidden: the full upstream graph for one query routinely
+runs to a couple of hundred objects, most of them the master-data supply chains behind customer,
+material and plant.</p></section><section id="s3"><div class="secno">Section 3</div><h2>What the transformations do</h2><p>One row per transformation into the five parts. Read the <b>Fields</b> and <b>ABAP lines</b> columns together: the rows with the most fields are rarely the rows with the code. Here the three self-referencing transformations hold every line of it, and the DataSource feeds hold none &mdash; which is the opposite of where a change review usually looks.</p><div class="tw"><table><thead><tr><th>Target</th><th>Loaded from</th><th class=num>Fields</th><th>How the fields are derived</th><th>Routines</th><th class=num>ABAP lines</th><th>BW objects read</th><th>Anti-patterns</th><th>Calls not followed</th></tr></thead><tbody><tr><td><b>ORDER_ITEM</b></td><td><code>ORDER_ITEM</code> <span class="tagbad">self</span></td><td class=num>164</td><td>71&nbsp;direct, 62&nbsp;constant, 19&nbsp;master-data read, 12&nbsp;DSO lookup</td><td>end x1, global x2</td><td class=num><span class="tagbad">612</span></td><td>0CUSTOMER, 0PLANT, PARTNER_FN</td><td><span class="tagwarn">recordset delete x1, nested loop x2</span></td><td><span class="tagmut">CONVERT_TO_FOREIGN_CURRENCY (function module)</span></td></tr><tr><td><b>BILLING_ITEM</b></td><td><code>BILLING_ITEM</code> <span class="tagbad">self</span></td><td class=num>98</td><td>44&nbsp;direct, 33&nbsp;constant, 21&nbsp;master-data read</td><td>end x1, global x2</td><td class=num>387</td><td>0PAYER, PARTNER_FN</td><td><span class="tagwarn">missing FOR ALL ENTRIES x1</span></td><td><span class="tagmut">CONVERT_TO_FOREIGN_CURRENCY (function module)</span></td></tr><tr><td><b>REBATE_ITEM</b></td><td><code>REBATE_ITEM</code> <span class="tagbad">self</span></td><td class=num>76</td><td>38&nbsp;direct, 25&nbsp;constant, 13&nbsp;master-data read</td><td>start x1, end x1</td><td class=num>147</td><td>COST_CENTRE, ORDER_ITEM</td><td><span class="tagok">none detected</span></td><td>&mdash;</td></tr><tr><td><b>ORDER_ITEM</b></td><td><code>OPEN_ORDER_CP</code></td><td class=num>42</td><td>40&nbsp;direct, 2&nbsp;constant</td><td>none</td><td class=num>&mdash;</td><td><span class="tagmut">none resolved</span></td><td><span class="tagok">none detected</span></td><td>&mdash;</td></tr><tr><td><b>ORDER_ITEM</b></td><td><code>DS_ORDER_ITEM</code></td><td class=num>118</td><td>101&nbsp;direct, 16&nbsp;formula, 1&nbsp;time conv.</td><td>none</td><td class=num>&mdash;</td><td><span class="tagmut">none resolved</span></td><td><span class="tagok">none detected</span></td><td>&mdash;</td></tr><tr><td><b>LEGACY_SALES</b></td><td><code>DS_LEGACY_SALES</code></td><td class=num>64</td><td>32&nbsp;constant, 30&nbsp;direct, 2&nbsp;formula</td><td>end x1</td><td class=num>203</td><td>0MATERIAL, PARTNER_FN</td><td><span class="tagwarn">hardcoded value x2</span></td><td><span class="tagmut">CONVERSION_EXIT_MATN1_INPUT (function module)</span></td></tr></tbody></table></div><p class="small">Field counts and rule types are read from the transformation and rule tables, active version only. Table dependencies and anti-patterns come from a <b>static parse</b> of the ABAP and are a lower bound: dynamic SQL, function-module calls and class methods are not followed, which is why the last column exists rather than being omitted. A routine reported with no anti-patterns has none <i>of the kinds the parser detects</i>.</p></section><section id="s4"><div class="secno">Section 4</div><h2>What the HANA calculation views compute</h2><p>Two of the five parts are not loaded from a DataSource at all. They are full-loaded from CompositeProviders whose only content is a HANA calculation view, and those views read other BW objects directly. The data leaves BW, is reshaped in HANA, and comes back as a load &mdash; a closed loop that BW raises no where-used warning about.</p><div class="card note"><h4 style="margin-top:0">ACME.SALES/CV_OPEN_ORDERS</h4><p class="lead" style="margin-bottom:8px"><b>Open order quantity and open order value, in document and group currency</b></p><dl class="kv"><dt>How BW names it</dt><dd>OPEN_ORDER_CP, the CompositeProvider that exposes it, is called &quot;Open Order Item&quot; in BW</dd><dt>How it is built</dt><dd>Order items are filtered to live business - no rejection reason, document category C or I. Two branches then run in parallel. One aggregates delivered quantity from DELIVERY_ITEM (goods issue posted only) and computes <code>open = ordered + target - delivered</code>. The other aggregates invoiced quantity from BILLING_ITEM and computes the same measure against invoiced instead. The branches are unioned with the opposing measure nulled out, and open value is pro-rated from net value.</dd><dt>What that means</dt><dd>This is the order backlog, measured two ways because &quot;not yet delivered&quot; and &quot;not yet invoiced&quot; are different questions and the view declines to choose. The result full-loads into ORDER_ITEM.</dd><dt>Worth knowing</dt><dd>Three measures exist only here - no BW transformation computes them and no BW where-used list mentions them. The union means a line can appear on both branches, so an aggregate over the result double-counts unless the branch is constrained.</dd></dl></div><div class="tw"><table><thead><tr><th>Node</th><th>Type</th><th>Reads</th><th>Filter</th></tr></thead><tbody><tr><td><b>Order</b></td><td>projection</td><td><code>ORDER_ITEM</code></td><td><code>rejection reason empty, category C or I</code></td></tr><tr><td><b>Delivered</b></td><td>aggregation</td><td><code>DELIVERY_ITEM</code></td><td><code>goods-issue date set</code></td></tr><tr><td><b>Invoiced</b></td><td>aggregation</td><td><code>BILLING_ITEM</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Join_1</b></td><td>join leftOuter</td><td><code>Order + Delivered</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Join_2</b></td><td>join leftOuter</td><td><code>Order + Invoiced</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Union_1</b></td><td>union</td><td><code>Join_1 + Join_2</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Final</b></td><td>projection (final)</td><td><code>Union_1</code></td><td><span class="tagmut">none</span></td></tr></tbody></table></div><h4>Calculated columns &mdash; logic that lives in HANA, not in BW</h4><div class="tw"><table><thead><tr><th>Column</th><th>Node</th><th>Formula</th></tr></thead><tbody><tr><td><b>open_quantity</b></td><td><code>Join_1</code></td><td><code>ordered + target - delivered</code></td></tr><tr><td><b>open_quantity</b></td><td><code>Join_2</code></td><td><code>ordered + target - invoiced</code></td></tr><tr><td><b>open_value</b></td><td><code>Final</code></td><td><code>abs(open_quantity / (ordered + target)) * net_value</code></td></tr></tbody></table></div><div class="card note"><h4 style="margin-top:0">ACME.SALES/CV_FREE_OF_CHARGE</h4><p class="lead" style="margin-bottom:8px"><b>Free-of-charge order lines, with their delivery and their pricing conditions</b></p><dl class="kv"><dt>How BW names it</dt><dd>FOC_ORDER_CP, the CompositeProvider that exposes it, is called &quot;Free of Charge View&quot; in BW</dd><dt>How it is built</dt><dd>Order items and order headers are both filtered to the free-of-charge document type. Delivery items are re-keyed onto the order and joined with an <b>inner</b> join, so an order line with no delivery row is dropped. The order header is then left-joined, and finally the conditions from ORDER_COND_CP - condition type, value and activation flag - are left-joined on order item.</dd><dt>What that means</dt><dd>A free-of-charge line is revenue-neutral but not cost-neutral: it consumes product and carries condition values. This view assembles the full picture of one, and the result full-loads into BILLING_ITEM.</dd><dt>Worth knowing</dt><dd>The inner join is the thing to know. The view answers &quot;free-of-charge lines that were delivered&quot;, not &quot;free-of-charge lines&quot;. An undelivered line is absent by construction, and nothing downstream says so.</dd></dl></div><div class="tw"><table><thead><tr><th>Node</th><th>Type</th><th>Reads</th><th>Filter</th></tr></thead><tbody><tr><td><b>Order</b></td><td>projection</td><td><code>ORDER_ITEM</code></td><td><code>document type = free of charge</code></td></tr><tr><td><b>Delivery</b></td><td>projection</td><td><code>DELIVERY_ITEM</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Item</b></td><td>join inner</td><td><code>Order + Delivery</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Header</b></td><td>projection</td><td><code>ORDER_HEADER</code></td><td><code>document type = free of charge</code></td></tr><tr><td><b>Join_2</b></td><td>join leftOuter</td><td><code>Item + Header</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Conditions</b></td><td>projection</td><td><code>ORDER_COND_CP</code></td><td><span class="tagmut">none</span></td></tr><tr><td><b>Join_3</b></td><td>join leftOuter (final)</td><td><code>Join_2 + Conditions</code></td><td><span class="tagmut">none</span></td></tr></tbody></table></div><p class="small">Read from each view's activated definition: filters, join types, union mappings and calculated-column formulas are stated there rather than inferred. The business reading is the analysis's own, anchored to the BW description of the CompositeProvider that exposes the view. An inactive change in the modeller is not visible, and the runtime view is what queries execute.</p></section></main><footer>
+<p>Rendered 2026-10-03 by <code>examples/interactive-lineage/build.py</code> from
+<code>sample_landscape.py</code>. Regenerate with
+<code>python examples/interactive-lineage/build.py</code>.</p>
+<p><b>Synthetic data throughout.</b> Against a real system the same renderer is driven by
+<code>bw_get_lineage</code>, <code>bw_describe_object</code>, <code>bw_get_transformation</code>,
+<code>bw_analyze_routine</code> and <code>bw_get_calc_view_logic</code>, and the output belongs
+outside the repository &mdash; it is customer intellectual property.</p>
+</footer>
+<script>window.__LINEAGE_GRAPH__ = {"layers":[{"name":"Source system","note":""},{"name":"DataSource","note":""},{"name":"Staging / calc-view base","note":""},{"name":"Nested CompositeProvider","note":""},{"name":"HANA calculation view","note":""},{"name":"Lookups / exposing CP","note":""},{"name":"Parts of SALES_OVERVIEW_CP","note":""},{"name":"Reporting CompositeProvider","note":""},{"name":"BEx query","note":""}],"nodes":[{"id":"ERP_PROD","label":"ERP_PROD","kind":"src","layer":0,"order":0,"group":"spine","sub":"ERP production","meta":{"description":"ERP production","description_origin":"generated - no usable text is stored in BW"},"degree":{"in":0,"out":5},"x":28,"y":202.0},{"id":"LEGACY_DW","label":"LEGACY_DW","kind":"src","layer":0,"order":1,"group":"spine","sub":"legacy data warehouse","meta":{"description":"legacy data warehouse","description_origin":"generated - no usable text is stored in BW"},"degree":{"in":0,"out":1},"x":28,"y":258.0},{"id":"FLAT FILE","label":"FLAT FILE","kind":"src","layer":0,"order":2,"group":"spine","sub":"file interface, no system of record","meta":{"description":"file interface, no system of record","description_origin":"generated - no usable text is stored in BW"},"degree":{"in":0,"out":1},"x":28,"y":314.0},{"id":"DS_ORDER_ITEM","label":"DS_ORDER_ITEM","kind":"ds","layer":1,"order":0,"group":"spine","sub":"Sales order item","meta":{"description":"Sales order item","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":90.0},{"id":"DS_ORDER_HEADER","label":"DS_ORDER_HEADER","kind":"ds","layer":1,"order":1,"group":"spine","sub":"Sales order header","meta":{"description":"Sales order header","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":146.0},{"id":"DS_BILLING_ITEM","label":"DS_BILLING_ITEM","kind":"ds","layer":1,"order":2,"group":"spine","sub":"Billing document item","meta":{"description":"Billing document item","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":202.0},{"id":"DS_DELIVERY_ITEM","label":"DS_DELIVERY_ITEM","kind":"ds","layer":1,"order":3,"group":"spine","sub":"Delivery item","meta":{"description":"Delivery item","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":258.0},{"id":"DS_REBATE_ITEM","label":"DS_REBATE_ITEM","kind":"ds","layer":1,"order":4,"group":"spine","sub":"Rebate settlement item","meta":{"description":"Rebate settlement item","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":314.0},{"id":"DS_LEGACY_SALES","label":"DS_LEGACY_SALES","kind":"ds","layer":1,"order":5,"group":"spine","sub":"Legacy sales history","meta":{"description":"Legacy sales history","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":370.0},{"id":"DS_BUDGET_FILE","label":"DS_BUDGET_FILE","kind":"ds","layer":1,"order":6,"group":"spine","sub":"Budget upload","meta":{"description":"Budget upload","description_origin":"BW's own text - stored verbatim in the object's text table","role":"the extraction boundary"},"degree":{"in":1,"out":1},"x":276,"y":426.0},{"id":"STG_ORDER","label":"STG_ORDER","kind":"adso","layer":2,"order":0,"group":"spine","sub":"Order staging","meta":{"description":"Order staging","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":1,"out":1},"x":524,"y":174.0},{"id":"ORDER_HEADER","label":"ORDER_HEADER","kind":"adso","layer":2,"order":1,"group":"spine","sub":"Order Header","meta":{"description":"Order Header","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":1,"out":2},"x":524,"y":230.0},{"id":"DELIVERY_ITEM","label":"DELIVERY_ITEM","kind":"adso","layer":2,"order":2,"group":"spine","sub":"Delivery Item","meta":{"description":"Delivery Item","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":1,"out":2},"x":524,"y":286.0},{"id":"ORDER_COND","label":"ORDER_COND","kind":"adso","layer":2,"order":3,"group":"spine","sub":"Order Conditions","meta":{"description":"Order Conditions","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":1},"x":524,"y":342.0},{"id":"ORDER_COND_CP","label":"ORDER_COND_CP","kind":"cp","layer":3,"order":0,"group":"spine","sub":"Order Conditions","meta":{"description":"Order Conditions","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":3,"out":1},"x":772,"y":258.0},{"id":"ACME.SALES/CV_OPEN_ORDERS","label":"CV_OPEN_ORDERS","kind":"calc","layer":4,"order":0,"group":"spine","sub":"Open order quantity and open order value","meta":{"description":"Open order quantity and open order value","description_origin":"generated - no usable text is stored in BW"},"degree":{"in":3,"out":1},"x":1020,"y":230.0},{"id":"ACME.SALES/CV_FREE_OF_CHARGE","label":"CV_FREE_OF_CHARGE","kind":"calc","layer":4,"order":1,"group":"spine","sub":"Free-of-charge order lines with conditions","meta":{"description":"Free-of-charge order lines with conditions","description_origin":"generated - no usable text is stored in BW"},"degree":{"in":4,"out":1},"x":1020,"y":286.0},{"id":"OPEN_ORDER_CP","label":"OPEN_ORDER_CP","kind":"cp","layer":5,"order":0,"group":"spine","sub":"Open Order Item","meta":{"description":"Open Order Item","description_origin":"BW's own text - stored verbatim in the object's text table"},"degree":{"in":1,"out":1},"x":1268,"y":34.0},{"id":"FOC_ORDER_CP","label":"FOC_ORDER_CP","kind":"cp","layer":5,"order":1,"group":"spine","sub":"Free of Charge View","meta":{"description":"Free of Charge View","description_origin":"BW's own text - stored verbatim in the object's text table"},"degree":{"in":1,"out":1},"x":1268,"y":90.0},{"id":"ORDER_ITEM","label":"ORDER_ITEM","kind":"adso","layer":6,"order":0,"group":"spine","sub":"Order Item","meta":{"description":"Order Item","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":6,"out":5},"x":1516,"y":146.0},{"id":"BILLING_ITEM","label":"BILLING_ITEM","kind":"adso","layer":6,"order":1,"group":"spine","sub":"Billing Item","meta":{"description":"Billing Item","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":6,"out":3},"x":1516,"y":202.0},{"id":"REBATE_ITEM","label":"REBATE_ITEM","kind":"adso","layer":6,"order":2,"group":"spine","sub":"Rebate Item","meta":{"description":"Rebate Item","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":4,"out":2},"x":1516,"y":258.0},{"id":"LEGACY_SALES","label":"LEGACY_SALES","kind":"adso","layer":6,"order":3,"group":"spine","sub":"Legacy Sales History","meta":{"description":"Legacy Sales History","description_origin":"BW's own text - stored verbatim in the object's text table"},"degree":{"in":3,"out":1},"x":1516,"y":314.0},{"id":"BUDGET_PLAN","label":"BUDGET_PLAN","kind":"adso","layer":6,"order":4,"group":"spine","sub":"Budget Plan","meta":{"description":"Budget Plan","description_origin":"BW's own text - stored verbatim in the object's text table"},"degree":{"in":1,"out":1},"x":1516,"y":370.0},{"id":"SALES_OVERVIEW_CP","label":"SALES_OVERVIEW_CP","kind":"cp","layer":7,"order":0,"group":"spine","sub":"Sales Overview","meta":{"description":"Sales Overview","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":5,"out":1},"x":1764,"y":258.0},{"id":"Q_SALES_MARGIN","label":"Q_SALES_MARGIN","kind":"query","layer":8,"order":0,"group":"spine","sub":"Sales Margin by Customer and Material","meta":{"description":"Sales Margin by Customer and Material","description_origin":"BW's own text - stored verbatim in the object's text table"},"degree":{"in":1,"out":0},"x":2012,"y":258.0},{"id":"0CUSTOMER","label":"0CUSTOMER","kind":"iobj","layer":5,"order":2,"group":"lookup","sub":"Customer","meta":{"description":"Customer","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":1},"x":1268,"y":146.0},{"id":"0MATERIAL","label":"0MATERIAL","kind":"iobj","layer":5,"order":3,"group":"lookup","sub":"Material","meta":{"description":"Material","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":2},"x":1268,"y":202.0},{"id":"0PAYER","label":"0PAYER","kind":"iobj","layer":5,"order":4,"group":"lookup","sub":"Payer","meta":{"description":"Payer","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":2},"x":1268,"y":258.0},{"id":"0PLANT","label":"0PLANT","kind":"iobj","layer":5,"order":5,"group":"lookup","sub":"Plant","meta":{"description":"Plant","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":1},"x":1268,"y":314.0},{"id":"0COMP_CODE","label":"0COMP_CODE","kind":"iobj","layer":5,"order":6,"group":"lookup","sub":"Company code","meta":{"description":"Company code","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":1},"x":1268,"y":370.0},{"id":"PARTNER_FN","label":"PARTNER_FN","kind":"adso","layer":5,"order":7,"group":"lookup","sub":"Partner Functions","meta":{"description":"Partner Functions","description_origin":"BW's text, extended - the short text is BW's; the long text was generated because the stored one added nothing"},"degree":{"in":0,"out":2},"x":1268,"y":426.0},{"id":"COST_CENTRE","label":"COST_CENTRE","kind":"adso","layer":5,"order":8,"group":"lookup","sub":"Cost Centre Assignment","meta":{"description":"Cost Centre Assignment","description_origin":"BW's own text - stored verbatim in the object's text table"},"degree":{"in":0,"out":1},"x":1268,"y":482.0}],"edges":[{"src":"ERP_PROD","dst":"DS_ORDER_ITEM","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"ERP_PROD","dst":"DS_ORDER_HEADER","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"ERP_PROD","dst":"DS_BILLING_ITEM","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"ERP_PROD","dst":"DS_DELIVERY_ITEM","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"ERP_PROD","dst":"DS_REBATE_ITEM","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"LEGACY_DW","dst":"DS_LEGACY_SALES","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"FLAT FILE","dst":"DS_BUDGET_FILE","kind":"declared","label":"extracts from","basis":"declared","note":"logical system read from the DataSource header","back":false},{"src":"DS_ORDER_ITEM","dst":"STG_ORDER","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"DS_ORDER_HEADER","dst":"ORDER_HEADER","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"DS_DELIVERY_ITEM","dst":"DELIVERY_ITEM","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"DS_BILLING_ITEM","dst":"BILLING_ITEM","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"DS_REBATE_ITEM","dst":"REBATE_ITEM","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"DS_LEGACY_SALES","dst":"LEGACY_SALES","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"DS_BUDGET_FILE","dst":"BUDGET_PLAN","kind":"declared","label":"loads (full)","basis":"declared","note":"","back":false},{"src":"STG_ORDER","dst":"ORDER_ITEM","kind":"declared","label":"loads (delta)","basis":"declared","note":"","back":false},{"src":"ORDER_COND","dst":"ORDER_COND_CP","kind":"part","label":"part [J1]","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"ORDER_HEADER","dst":"ORDER_COND_CP","kind":"part","label":"part [J2]","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"0PAYER","dst":"ORDER_COND_CP","kind":"part","label":"part [J3]","basis":"declared","note":"an InfoObject used as a join partner inside the CompositeProvider","back":true},{"src":"ORDER_ITEM","dst":"ACME.SALES/CV_OPEN_ORDERS","kind":"calcbase","label":"read by the view","basis":"declared","note":"direct base, confirmed against the activated view definition","back":true},{"src":"BILLING_ITEM","dst":"ACME.SALES/CV_OPEN_ORDERS","kind":"calcbase","label":"read by the view","basis":"declared","note":"direct base, confirmed against the activated view definition","back":true},{"src":"DELIVERY_ITEM","dst":"ACME.SALES/CV_OPEN_ORDERS","kind":"calcbase","label":"read by the view","basis":"declared","note":"direct base, confirmed against the activated view definition","back":false},{"src":"ORDER_ITEM","dst":"ACME.SALES/CV_FREE_OF_CHARGE","kind":"calcbase","label":"read by the view","basis":"declared","note":"","back":true},{"src":"ORDER_HEADER","dst":"ACME.SALES/CV_FREE_OF_CHARGE","kind":"calcbase","label":"read by the view","basis":"declared","note":"","back":false},{"src":"DELIVERY_ITEM","dst":"ACME.SALES/CV_FREE_OF_CHARGE","kind":"calcbase","label":"read by the view","basis":"declared","note":"","back":false},{"src":"ORDER_COND_CP","dst":"ACME.SALES/CV_FREE_OF_CHARGE","kind":"calcbase","label":"read by the view (CompositeProvider)","basis":"declared","note":"a CompositeProvider has no generated table, so only the generated per-provider view resolves it","back":false},{"src":"ACME.SALES/CV_OPEN_ORDERS","dst":"OPEN_ORDER_CP","kind":"expose","label":"exposed to BW","basis":"declared","note":"","back":false},{"src":"ACME.SALES/CV_FREE_OF_CHARGE","dst":"FOC_ORDER_CP","kind":"expose","label":"exposed to BW","basis":"declared","note":"","back":false},{"src":"OPEN_ORDER_CP","dst":"ORDER_ITEM","kind":"full","label":"loads (full)","basis":"declared","note":"a full load out of a HANA view: content is replaced by whatever the view returns","back":false},{"src":"FOC_ORDER_CP","dst":"BILLING_ITEM","kind":"full","label":"loads (full)","basis":"declared","note":"a full load out of a HANA view: content is replaced by whatever the view returns","back":false},{"src":"ORDER_ITEM","dst":"ORDER_ITEM","kind":"self","label":"re-processing (full)","basis":"declared","note":"source and target are the same object, so the result depends on load order","back":false},{"src":"BILLING_ITEM","dst":"BILLING_ITEM","kind":"self","label":"re-processing (full)","basis":"declared","note":"source and target are the same object, so the result depends on load order","back":false},{"src":"REBATE_ITEM","dst":"REBATE_ITEM","kind":"self","label":"re-processing (full)","basis":"declared","note":"source and target are the same object, so the result depends on load order","back":false},{"src":"0CUSTOMER","dst":"ORDER_ITEM","kind":"lookup","label":"declared lookup","basis":"declared","note":"recorded in BW's typed rule-step tables, so it appears in BW's own where-used list","back":false},{"src":"0MATERIAL","dst":"ORDER_ITEM","kind":"lookup","label":"declared lookup","basis":"declared","note":"","back":false},{"src":"0PAYER","dst":"BILLING_ITEM","kind":"lookup","label":"declared lookup","basis":"declared","note":"","back":false},{"src":"0COMP_CODE","dst":"BILLING_ITEM","kind":"lookup","label":"declared lookup","basis":"declared","note":"","back":false},{"src":"0PLANT","dst":"ORDER_ITEM","kind":"lookup","label":"declared lookup","basis":"declared","note":"","back":false},{"src":"0MATERIAL","dst":"LEGACY_SALES","kind":"lookup","label":"declared lookup","basis":"declared","note":"","back":false},{"src":"PARTNER_FN","dst":"BILLING_ITEM","kind":"routine","label":"read inside an end routine","basis":"advisory","note":"parsed from a SELECT in ABAP - real, but the set of such edges is a lower bound","back":false},{"src":"COST_CENTRE","dst":"REBATE_ITEM","kind":"routine","label":"read inside an end routine","basis":"advisory","note":"parsed from a SELECT in ABAP - real, but the set of such edges is a lower bound","back":false},{"src":"PARTNER_FN","dst":"LEGACY_SALES","kind":"routine","label":"read inside an end routine","basis":"advisory","note":"","back":false},{"src":"ORDER_ITEM","dst":"REBATE_ITEM","kind":"routine","label":"read inside an end routine","basis":"advisory","note":"","back":true},{"src":"ORDER_ITEM","dst":"SALES_OVERVIEW_CP","kind":"part","label":"part","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"BILLING_ITEM","dst":"SALES_OVERVIEW_CP","kind":"part","label":"part","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"REBATE_ITEM","dst":"SALES_OVERVIEW_CP","kind":"part","label":"part","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"LEGACY_SALES","dst":"SALES_OVERVIEW_CP","kind":"part","label":"part","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"BUDGET_PLAN","dst":"SALES_OVERVIEW_CP","kind":"part","label":"part","basis":"declared","note":"declared in the CompositeProvider's stored model","back":false},{"src":"SALES_OVERVIEW_CP","dst":"Q_SALES_MARGIN","kind":"read","label":"read by the query","basis":"declared","note":"","back":false}],"width":2210,"height":572,"node_w":170,"node_h":44,"pad_x":28,"pad_y":34,"col_w":248,"row_pitch":56};</script>
+<script>
+(function () {
+  "use strict";
+  var G = window.__LINEAGE_GRAPH__;
+  var NW = G.node_w, NH = G.node_h;
+  var PADX = G.pad_x, PADY = G.pad_y, COLW = G.col_w, PITCH = G.row_pitch;
+  var curW = G.width, curH = G.height;
+  var svg = document.getElementById("svg");
+  var stage = document.getElementById("stage");
+  var panel = document.getElementById("panel");
+  var tip = document.getElementById("tip");
+  var qbox = document.getElementById("q");
+
+  var byId = {};
+  G.nodes.forEach(function (n) { byId[n.id] = n; });
+
+  var EDGE = {
+    declared: { c: "#64748b", w: 1.3, d: "" },
+    full:     { c: "#be123c", w: 2.0, d: "" },
+    part:     { c: "#15803d", w: 1.5, d: "" },
+    calcbase: { c: "#0e7490", w: 1.7, d: "" },
+    expose:   { c: "#0e7490", w: 1.7, d: "6 3" },
+    read:     { c: "#7e22ce", w: 2.2, d: "" },
+    lookup:   { c: "#2563eb", w: 1.1, d: "5 4" },
+    routine:  { c: "#b45309", w: 1.1, d: "2 3" },
+    self:     { c: "#475569", w: 1.1, d: "3 2" }
+  };
+  var KINDNAME = {
+    query: "BEx query", cp: "CompositeProvider", adso: "Advanced DSO",
+    ds: "DataSource", calc: "HANA calculation view",
+    src: "Source / logical system", iobj: "InfoObject"
+  };
+  var EDGENAME = {
+    declared: "declared load", full: "declared FULL load",
+    part: "CompositeProvider part", calcbase: "calc-view base",
+    expose: "exposed to BW", read: "read by the query",
+    lookup: "declared lookup", routine: "routine-derived read (advisory)",
+    self: "self re-processing"
+  };
+
+  /* ------------------------------------------------------------ build svg */
+  var NS = "http://www.w3.org/2000/svg";
+  function el(t, a) {
+    var e = document.createElementNS(NS, t);
+    for (var k in a) { if (a[k] !== null) e.setAttribute(k, a[k]); }
+    return e;
+  }
+  var defs = el("defs", {});
+  Object.keys(EDGE).forEach(function (k) {
+    var m = el("marker", { id: "ar-" + k, viewBox: "0 0 10 10", refX: 9,
+      refY: 5, markerWidth: 6, markerHeight: 6, orient: "auto-start-reverse" });
+    m.appendChild(el("path", { d: "M0,1 L10,5 L0,9 z", fill: EDGE[k].c }));
+    defs.appendChild(m);
+  });
+  svg.appendChild(defs);
+
+  var root = el("g", { id: "root" });
+  var gLane = el("g", {}), gEdge = el("g", {}), gNode = el("g", {});
+  root.appendChild(gLane); root.appendChild(gEdge); root.appendChild(gNode);
+  svg.appendChild(root);
+
+  var laneBg = [], laneLab = [];
+  G.layers.forEach(function (L, i) {
+    var x = PADX + i * COLW;
+    if (i % 2 === 1) {
+      var r = el("rect", { class: "lanebg", x: x - 14, y: 0,
+        width: NW + 28, height: curH + 26 });
+      laneBg.push(r);
+      gLane.appendChild(r);
+    }
+    var t = el("text", { class: "lanelab", x: x, y: curH + 18 });
+    t.textContent = L.name;
+    laneLab.push(t);
+    gLane.appendChild(t);
+  });
+
+  function split(s, max) {
+    if (s.length <= max) return [s];
+    var cut = -1, i;
+    for (i = s.length - 1; i > 3; i--) {
+      if ((s[i] === "_" || s[i] === "/") && i <= max) { cut = i + 1; break; }
+    }
+    if (cut < 0) cut = max;
+    return [s.slice(0, cut), s.slice(cut)];
+  }
+
+  /* The description line. Wrapped to two lines at most and ellipsised beyond that - the
+     full text is in the panel, so truncating here costs nothing. */
+  function wrapSub(s) {
+    if (!s) return [];
+    var words = s.split(/\s+/), lines = [""], max = 26;
+    words.forEach(function (w) {
+      var line = lines[lines.length - 1];
+      if (!line) { lines[lines.length - 1] = w; return; }
+      if ((line + " " + w).length <= max) lines[lines.length - 1] = line + " " + w;
+      else lines.push(w);
+    });
+    if (lines.length > 2) {
+      lines = lines.slice(0, 2);
+      lines[1] = lines[1].slice(0, max - 1) + "\u2026";
+    }
+    return lines.filter(Boolean);
+  }
+
+  var nodeEls = {};
+  G.nodes.forEach(function (n) {
+    var aria = n.id + ", " + KINDNAME[n.kind] + (n.sub ? ", " + n.sub : "");
+    var g = el("g", { class: "node k-" + n.kind, tabindex: 0,
+      role: "button", transform: "translate(" + n.x + "," + n.y + ")",
+      "aria-label": aria });
+    g.appendChild(el("rect", { x: 0, y: 0, width: NW, height: NH }));
+    var name = split(n.label, 22);
+    var sub = wrapSub(n.sub);
+    // Lay the block out from the middle so a one-line name with a two-line description and a
+    // two-line name with none both sit centred.
+    var nameH = name.length * 11.5, subH = sub.length * 9.5;
+    var top = (NH - (nameH + (sub.length ? subH + 2 : 0))) / 2 + 9;
+    name.forEach(function (ln, k) {
+      var t = el("text", { x: NW / 2, y: top + k * 11.5, "text-anchor": "middle" });
+      if (name.length > 1) t.setAttribute("style", "font-size:9.5px");
+      t.textContent = ln;
+      g.appendChild(t);
+    });
+    sub.forEach(function (ln, k) {
+      var t = el("text", { class: "sub", x: NW / 2,
+        y: top + nameH + 1 + k * 9.5, "text-anchor": "middle" });
+      t.textContent = ln;
+      g.appendChild(t);
+    });
+    g.__n = n;
+    nodeEls[n.id] = g;
+    gNode.appendChild(g);
+  });
+
+  /* Re-run the layered layout over whatever is currently visible, so hiding
+     the lookup column shrinks the canvas instead of leaving dead space. */
+  function layout() {
+    var cols = {};
+    G.nodes.forEach(function (n) {
+      if (!shown(n)) return;
+      (cols[n.layer] = cols[n.layer] || []).push(n);
+    });
+    var tallest = 1;
+    Object.keys(cols).forEach(function (k) {
+      cols[k].sort(function (a, b) { return a.order - b.order; });
+      if (cols[k].length > tallest) tallest = cols[k].length;
+    });
+    curH = PADY * 2 + tallest * PITCH;
+    curW = PADX * 2 + (G.layers.length - 1) * COLW + NW;
+    Object.keys(cols).forEach(function (k) {
+      var col = cols[k];
+      var top = PADY + (tallest - col.length) * PITCH / 2;
+      col.forEach(function (n, i) {
+        n.cx = PADX + n.layer * COLW;
+        n.cy = top + i * PITCH;
+      });
+    });
+    laneBg.forEach(function (r) { r.setAttribute("height", curH + 26); });
+    laneLab.forEach(function (t) { t.setAttribute("y", curH + 18); });
+  }
+
+  function geom(e) {
+    var a = byId[e.src], b = byId[e.dst];
+    if (a.cx === undefined || b.cx === undefined) return "M0,0";
+    if (e.src === e.dst) {
+      var x = a.cx, y = a.cy;
+      return "M" + (x + NW * .3) + "," + y + " C" + (x + NW * .1) + "," +
+        (y - 30) + " " + (x + NW * .9) + "," + (y - 30) + " " +
+        (x + NW * .7) + "," + y;
+    }
+    if (a.layer === b.layer) {
+      var sx = a.cx + NW, sy = a.cy + NH / 2,
+          ex = b.cx + NW, ey = b.cy + NH / 2;
+      return "M" + sx + "," + sy + " C" + (sx + 78) + "," + sy + " " +
+        (ex + 78) + "," + ey + " " + ex + "," + ey;
+    }
+    if (e.back) {
+      var bx = a.cx, by = a.cy + NH / 2, cx = b.cx + NW, cy = b.cy + NH / 2;
+      var dip = 54 + Math.abs(a.layer - b.layer) * 12;
+      return "M" + bx + "," + by + " C" + (bx - 60) + "," + (by + dip) + " " +
+        (cx + 60) + "," + (cy + dip) + " " + cx + "," + cy;
+    }
+    var fx = a.cx + NW, fy = a.cy + NH / 2, tx = b.cx, ty = b.cy + NH / 2;
+    var m = (fx + tx) / 2;
+    return "M" + fx + "," + fy + " C" + m + "," + fy + " " + m + "," + ty +
+      " " + tx + "," + ty;
+  }
+
+  var edgeEls = [];
+  G.edges.forEach(function (e) {
+    var s = EDGE[e.kind];
+    var p = el("path", { class: "edge e-" + e.kind, d: geom(e), stroke: s.c,
+      "stroke-width": s.w, "stroke-dasharray": s.d || null,
+      "marker-end": "url(#ar-" + e.kind + ")",
+      opacity: (e.kind === "lookup" ? .4 : e.kind === "routine" ? .5 : .78) });
+    p.__e = e;
+    edgeEls.push(p);
+    gEdge.appendChild(p);
+  });
+
+  /* ------------------------------------------------------- adjacency index */
+  var adj = {};
+  G.nodes.forEach(function (n) { adj[n.id] = []; });
+  G.edges.forEach(function (e) {
+    adj[e.src].push({ o: e.dst, dir: "out", e: e });
+    if (e.src !== e.dst) adj[e.dst].push({ o: e.src, dir: "in", e: e });
+  });
+
+  /* ----------------------------------------------------------- view state */
+  var view = { x: 0, y: 0, k: 1 };
+  function apply() {
+    root.setAttribute("transform", "translate(" + view.x + "," + view.y +
+      ") scale(" + view.k + ")");
+  }
+  /* Fit the visible extent, but never below a scale where the labels stop
+     being readable - below that, anchor the source end and let the reader
+     pan. An unreadable overview is not an overview. */
+  var MIN_FIT = 0.5;
+  function fit() {
+    var r = stage.getBoundingClientRect();
+    var k = Math.min((r.width - 20) / curW, (r.height - 40) / (curH + 34));
+    var clamped = k < MIN_FIT;
+    view.k = Math.min(Math.max(k, MIN_FIT), 1.1);
+    view.x = clamped ? 8 : (r.width - curW * view.k) / 2;
+    view.y = Math.max(8, (r.height - (curH + 34) * view.k) / 2);
+    apply();
+  }
+  var panning = false, px = 0, py = 0;
+  stage.addEventListener("pointerdown", function (ev) {
+    if (ev.target.closest("g.node")) return;
+    panning = true; px = ev.clientX; py = ev.clientY;
+    stage.classList.add("drag"); stage.setPointerCapture(ev.pointerId);
+  });
+  stage.addEventListener("pointermove", function (ev) {
+    if (!panning) return;
+    view.x += ev.clientX - px; view.y += ev.clientY - py;
+    px = ev.clientX; py = ev.clientY; apply();
+  });
+  function endPan() { panning = false; stage.classList.remove("drag"); }
+  stage.addEventListener("pointerup", endPan);
+  stage.addEventListener("pointercancel", endPan);
+  stage.addEventListener("wheel", function (ev) {
+    ev.preventDefault();
+    var r = stage.getBoundingClientRect();
+    var mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    var f = Math.exp(-ev.deltaY * 0.0016);
+    var nk = Math.max(.15, Math.min(2.6, view.k * f));
+    view.x = mx - (mx - view.x) * (nk / view.k);
+    view.y = my - (my - view.y) * (nk / view.k);
+    view.k = nk; apply();
+  }, { passive: false });
+  function zoom(f) {
+    var r = stage.getBoundingClientRect(), mx = r.width / 2, my = r.height / 2;
+    var nk = Math.max(.15, Math.min(2.6, view.k * f));
+    view.x = mx - (mx - view.x) * (nk / view.k);
+    view.y = my - (my - view.y) * (nk / view.k);
+    view.k = nk; apply();
+  }
+
+  /* -------------------------------------------------------- show / hide */
+  function shown(n) {
+    if (n.group === "lookup" && !document.getElementById("t-look").checked)
+      return false;
+    return true;
+  }
+  function edgeOn(e) {
+    if (!shown(byId[e.src]) || !shown(byId[e.dst])) return false;
+    if (e.kind === "routine" && !document.getElementById("t-adv").checked)
+      return false;
+    if (e.kind === "lookup" && !document.getElementById("t-look-e").checked)
+      return false;
+    if (e.kind === "self" && !document.getElementById("t-self").checked)
+      return false;
+    return true;
+  }
+
+  var sel = null;
+  function matches(n) {
+    var q = qbox.value.trim().toUpperCase();
+    if (!q) return null;
+    return n.id.toUpperCase().indexOf(q) >= 0;
+  }
+
+  function render() {
+    layout();
+    var hot = {}, hotE = {};
+    if (sel) {
+      hot[sel] = 1;
+      adj[sel].forEach(function (a) { if (edgeOn(a.e)) hot[a.o] = 1; });
+      G.edges.forEach(function (e, i) {
+        if (e.src === sel || e.dst === sel) hotE[i] = 1;
+      });
+    }
+    G.nodes.forEach(function (n) {
+      var g = nodeEls[n.id];
+      var vis = shown(n);
+      g.style.display = vis ? "" : "none";
+      if (vis) g.setAttribute("transform",
+        "translate(" + n.cx + "," + n.cy + ")");
+      var m = matches(n);
+      var dim = (sel && !hot[n.id]) || (m === false);
+      g.classList.toggle("dim", !!dim);
+      g.classList.toggle("sel", n.id === sel || m === true);
+    });
+    edgeEls.forEach(function (p, i) {
+      var e = p.__e, on = edgeOn(e);
+      p.style.display = on ? "" : "none";
+      if (on) p.setAttribute("d", geom(e));
+      p.classList.toggle("dim", !!(sel && !hotE[i]));
+      p.classList.toggle("hot", !!hotE[i]);
+    });
+    document.getElementById("vcount").textContent =
+      G.nodes.filter(shown).length + " objects \u00b7 " +
+      G.edges.filter(edgeOn).length + " dependencies";
+  }
+
+  /* -------------------------------------------------------------- panel */
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+  var LABEL = {
+    description_long: "In full", description_origin: "Description origin",
+    description_quality: "Stored-text quality",
+    what: "What it is", contribution: "Contribution to this path",
+    system: "Logical system", appended_fields: "Appended fields (BW metadata)",
+    fill_logic: "Fill logic found in the source system", enhancement_verdict: "Verdict",
+    exit_program: "Exit code", exit_tables: "Tables the exit reads",
+    unguarded_for_all_entries: "Unguarded FOR ALL ENTRIES",
+    role: "Role on this path", upstream_traced: "Upstream traced here",
+    description: "Description", info_area: "InfoArea", parts: "Parts",
+    reached_via: "Reached via", full_name: "Runtime name",
+    purpose: "What it does", last_activated: "Last activated",
+    direct_bases: "Direct bases", nodes: "Nodes", final_node: "Final node",
+    calculated_columns: "Calculated columns",
+    analytic_privilege: "Analytic privilege", feeds: "Feeds back into BW as",
+    loads: "Loads", model_slot: "Model slot",
+    query_reads: "What the query reads from it",
+    declared_lookups: "Declared lookups", routine_lookups:
+      "Routine-derived reads (advisory)", compuid: "COMPUID", owner: "Owner",
+    last_executed: "Last executed", origin: "Origin",
+    description_origin: "Description origin", kind_basis: "Object kind read from",
+    provenance: "Source tables"
+  };
+  function show(id) {
+    var n = byId[id];
+    if (!n) {
+      panel.innerHTML = '<h4>Selected object</h4><p class="empty">Click any ' +
+        'box in the diagram to see what it is, where its facts came from, and ' +
+        'everything it connects to. Click the background to clear.</p>';
+      return;
+    }
+    var lane = G.layers[n.layer].name;
+    var m = n.meta || {};
+    var h = '<h4>Selected object</h4><div class="pname">' + esc(n.id) +
+      '</div>';
+    // What it is, before anything else. Flagged when the text is not purely BW's own.
+    if (m.description) {
+      var flag = m.description_origin && m.description_origin.indexOf("stored verbatim") < 0
+        ? ' <span class="genmark" title="' + esc(m.description_origin) +
+          '">not stored verbatim</span>' : '';
+      h += '<div class="pdesc">' + esc(m.description) + flag + '</div>';
+    }
+    h += '<div class="pkind"><span class="swatch" style="background:var(--k-' +
+      n.kind + ');border-color:var(--k-' + n.kind + '-e)"></span>' +
+      KINDNAME[n.kind] +
+      (lane === KINDNAME[n.kind] ? '' : ' \u00b7 ' + esc(lane)) + '</div>';
+    h += '<dl class="kv">';
+    Object.keys(LABEL).forEach(function (k) {
+      if (!(k in n.meta) || k === "description") return;
+      var v = n.meta[k];
+      if (Array.isArray(v)) v = v.join(", ");
+      var cls = "";
+      if (k === "enhancement_verdict")
+        cls = v === "resolved" ? "tagok" : v === "n/a" ? "tagmut" : "tagbad";
+      if (k === "unguarded_for_all_entries")
+        cls = v >= 10 ? "tagbad" : v > 0 ? "tagwarn" : "tagok";
+      h += '<dt>' + LABEL[k] + '</dt><dd' + (cls ? ' class="' + cls + '"' : '') +
+        (k === "provenance" || k === "full_name" ? ' class="mono"' : '') + '>' +
+        esc(v) + '</dd>';
+    });
+    h += '</dl>';
+    var ins = [], outs = [];
+    adj[id].forEach(function (a) {
+      if (!edgeOn(a.e)) return;
+      var row = '<li><span class="arrow">' + (a.dir === "in" ? "\u2190" :
+        "\u2192") + '</span> <b>' + esc(a.o === id ? "itself" : a.o) +
+        '</b> <span class="t2">' + EDGENAME[a.e.kind] + '</span></li>';
+      (a.dir === "in" ? ins : outs).push(row);
+    });
+    if (ins.length) h += '<ul class="nb"><li><b>Feeds in (' + ins.length +
+      ')</b></li>' + ins.join("") + '</ul>';
+    if (outs.length) h += '<ul class="nb"><li><b>Feeds out (' + outs.length +
+      ')</b></li>' + outs.join("") + '</ul>';
+    panel.innerHTML = h;
+  }
+
+  /* ------------------------------------------------------------ handlers */
+  function pick(id) { sel = (sel === id ? null : id); render(); show(sel); }
+  G.nodes.forEach(function (n) {
+    var g = nodeEls[n.id];
+    g.addEventListener("click", function (ev) { ev.stopPropagation();
+      pick(n.id); });
+    g.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault();
+        pick(n.id); }
+    });
+    g.addEventListener("pointerenter", function (ev) {
+      var d = n.degree, m = n.meta || {};
+      var body = m.description ? "<br>" + esc(m.description) : "";
+      var long = m.description_long && m.description_long !== m.description
+        ? "<br><span class='t2'>" + esc(m.description_long) + "</span>" : "";
+      tipShow(ev, "<b>" + esc(n.id) + "</b>" + body + long +
+        "<br><span class='t2'>" + KINDNAME[n.kind] + " \u00b7 " + d["in"] +
+        " in / " + d.out + " out" +
+        (m.description_origin ? " \u00b7 " + esc(m.description_origin.split(" - ")[0])
+          : "") + "</span>");
+    });
+    g.addEventListener("pointerleave", tipHide);
+  });
+  edgeEls.forEach(function (p) {
+    p.addEventListener("pointerenter", function (ev) {
+      var e = p.__e;
+      tipShow(ev, "<b>" + esc(e.src) + " \u2192 " + esc(e.dst) +
+        "</b><br><span class='t2'>" + EDGENAME[e.kind] + " \u00b7 " + e.basis +
+        (e.note ? "<br>" + esc(e.note) : "") + "</span>");
+    });
+    p.addEventListener("pointerleave", tipHide);
+  });
+  function tipShow(ev, html) {
+    var r = stage.getBoundingClientRect();
+    tip.innerHTML = html;
+    tip.style.left = Math.min(ev.clientX - r.left + 14, r.width - 310) + "px";
+    tip.style.top = (ev.clientY - r.top + 14) + "px";
+    tip.classList.add("on");
+  }
+  function tipHide() { tip.classList.remove("on"); }
+
+  stage.addEventListener("click", function (ev) {
+    if (!ev.target.closest("g.node")) { sel = null; render(); show(null); }
+  });
+  document.addEventListener("keydown", function (ev) {
+    if (ev.key === "Escape") { sel = null; qbox.value = ""; render();
+      show(null); }
+  });
+  ["t-look", "t-look-e", "t-adv", "t-self"].forEach(function (id) {
+    document.getElementById(id).addEventListener("change", function () {
+      if (sel && !shown(byId[sel])) sel = null;
+      render(); show(sel); fit();
+    });
+  });
+  qbox.addEventListener("input", render);
+  document.getElementById("b-in").addEventListener("click", function () {
+    zoom(1.25); });
+  document.getElementById("b-out").addEventListener("click", function () {
+    zoom(.8); });
+  document.getElementById("b-fit").addEventListener("click", fit);
+  document.getElementById("b-clear").addEventListener("click", function () {
+    sel = null; qbox.value = ""; render(); show(null);
+  });
+  document.getElementById("b-loop").addEventListener("click", function () {
+    qbox.value = ""; sel = "AOS.OTC.SD/SD_C07"; render(); show(sel);
+  });
+  window.addEventListener("resize", fit);
+
+  render(); show(null); fit();
+
+  /* ------------------------------------------------- toc scroll spy */
+  var secs = [].slice.call(document.querySelectorAll("main section[id]"));
+  var links = {};
+  [].slice.call(document.querySelectorAll("nav.toc a")).forEach(function (a) {
+    links[a.getAttribute("href").slice(1)] = a;
+  });
+  var io = new IntersectionObserver(function (ents) {
+    ents.forEach(function (en) {
+      if (!en.isIntersecting) return;
+      Object.keys(links).forEach(function (k) {
+        links[k].classList.toggle("on", k === en.target.id);
+      });
+    });
+  }, { rootMargin: "-48px 0px -72% 0px" });
+  secs.forEach(function (s) { io.observe(s); });
+})();
+</script>
+</body>
+</html>
