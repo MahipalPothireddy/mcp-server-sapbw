@@ -101,17 +101,19 @@
       "note": "",
       "releases": {
         "BW 7.40": "unverified",
-        "BW 7.50": "verified",
+        "BW 7.50": "expected",
         "BW/4HANA 2.0": "unverified"
       },
       "requires": [
         "chain_attr",
         "chain_edges",
         "chain_text",
-        "log_chain"
+        "dtp",
+        "log_chain",
+        "process_log"
       ],
       "tool": "bw_analyze_process_chain",
-      "validation": "integration_tested"
+      "validation": "unit_tested"
     },
     {
       "implementation": "implemented",
@@ -131,7 +133,8 @@
         "element_text",
         "element_xref",
         "query_dir",
-        "query_provider"
+        "query_provider",
+        "transformation"
       ],
       "tool": "bw_analyze_query",
       "validation": "unit_tested"
@@ -197,6 +200,7 @@
         "element_text",
         "hana_views",
         "log_chain",
+        "process_log",
         "query_dir",
         "query_provider",
         "transformation"
@@ -233,18 +237,21 @@
       "validation": "not_validated"
     },
     {
-      "implementation": null,
+      "implementation": "implemented",
       "measurement": "measured",
       "needs_connector": null,
-      "note": "Measured to read no BW metadata.",
+      "note": "",
       "releases": {
         "BW 7.40": "unverified",
-        "BW 7.50": "verified",
+        "BW 7.50": "expected",
         "BW/4HANA 2.0": "unverified"
       },
-      "requires": [],
+      "requires": [
+        "dict_domain_text",
+        "dict_domain_values"
+      ],
       "tool": "bw_check_code_decodes",
-      "validation": "not_validated"
+      "validation": "unit_tested"
     },
     {
       "implementation": "implemented",
@@ -276,7 +283,8 @@
       "requires": [
         "chain_attr",
         "chain_text",
-        "log_chain"
+        "log_chain",
+        "process_log"
       ],
       "tool": "bw_check_schedule_risk",
       "validation": "integration_tested"
@@ -410,6 +418,7 @@
         "hana_views",
         "log_chain",
         "object_dependencies",
+        "process_log",
         "query_dir",
         "query_provider",
         "routine_source",
@@ -495,7 +504,8 @@
         "BW/4HANA 2.0": "unverified"
       },
       "requires": [
-        "log_chain"
+        "log_chain",
+        "process_log"
       ],
       "tool": "bw_get_chain_runtimes",
       "validation": "integration_tested"
@@ -561,14 +571,15 @@
       "note": "",
       "releases": {
         "BW 7.40": "unverified",
-        "BW 7.50": "verified",
+        "BW 7.50": "expected",
         "BW/4HANA 2.0": "unverified"
       },
       "requires": [
-        "chain_edges"
+        "chain_edges",
+        "dtp"
       ],
       "tool": "bw_get_load_closure",
-      "validation": "integration_tested"
+      "validation": "unit_tested"
     },
     {
       "implementation": null,
@@ -706,7 +717,8 @@
       "requires": [
         "chain_attr",
         "chain_text",
-        "log_chain"
+        "log_chain",
+        "process_log"
       ],
       "tool": "bw_get_schedule_matrix",
       "validation": "integration_tested"
@@ -1132,6 +1144,9 @@
         "BW/4HANA 2.0": "unverified"
       },
       "requires": [
+        "dso_field",
+        "dso_header",
+        "dso_text",
         "element_dir",
         "element_range",
         "element_select",
@@ -1152,9 +1167,9 @@
       "unverified": 60
     },
     "BW 7.50": {
-      "expected": 16,
+      "expected": 19,
       "needs_connector": 2,
-      "verified": 44
+      "verified": 41
     },
     "BW/4HANA 2.0": {
       "needs_connector": 2,

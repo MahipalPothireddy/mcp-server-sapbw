@@ -22,34 +22,34 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 
 | Tool | Growth | Fixture payload | Shaped | Bounds |
 |---|---|--:|:-:|---|
-| `bw_access_report` | `constant` | 10,190 B | — | 5000 statements / 300s per call |
-| `bw_analyze_object` | `per_graph_node` | 9,923 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_analyze_process_chain` | `per_object` | 3,993 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_analyze_query` | `per_object` | 9,288 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_access_report` | `constant` | 10,230 B | — | 5000 statements / 300s per call |
+| `bw_analyze_object` | `per_graph_node` | 10,603 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_analyze_process_chain` | `per_object` | 9,339 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_analyze_query` | `per_object` | 9,333 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_analyze_routine` | `per_object` | 1,118 B | — | 5000 statements / 300s per call |
-| `bw_assess_change_impact` | `per_graph_node` | 10,480 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_assess_landscape` | `per_system` | 5,768 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
+| `bw_assess_change_impact` | `per_graph_node` | 10,525 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_assess_landscape` | `per_system` | 5,856 B | — | 9 analyses, each capped by limit_per_scenario (default 25); 5000 statements / 300s per call |
 | `bw_cache_status` | `constant` | 376 B | — | 5000 statements / 300s per call |
-| `bw_capability_report` | `constant` | 36,638 B | — | 5000 statements / 300s per call |
-| `bw_check_code_decodes` | `constant` | 397 B | — | 5000 statements / 300s per call |
+| `bw_capability_report` | `constant` | 36,644 B | — | 5000 statements / 300s per call |
+| `bw_check_code_decodes` | `constant` | 28,809 B | — | 5000 statements / 300s per call |
 | `bw_check_load_latency` | `per_system` | 639 B | — | 250 routine parses; 5000 statements / 300s per call |
-| `bw_check_schedule_risk` | `per_system` | 390 B | — | 5000 statements / 300s per call |
+| `bw_check_schedule_risk` | `per_system` | 1,364 B | — | 5000 statements / 300s per call |
 | `bw_compare_snapshots` | `per_system` | 380 B | — | 5000 statements / 300s per call |
 | `bw_compare_systems` | `per_system` | 1,574 B | — | 5000 statements / 300s per call |
-| `bw_create_snapshot` | `per_system` | 1,286 B | — | 5000 statements / 300s per call |
+| `bw_create_snapshot` | `per_system` | 1,328 B | — | 5000 statements / 300s per call |
 | `bw_describe_object` | `per_object` | 1,367 B | yes | 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 | `bw_find_layer_violations` | `per_system` | 673 B | — | 5000 statements / 300s per call |
 | `bw_find_unused_providers` | `per_system` | 1,749 B | — | 5000 statements / 300s per call |
 | `bw_generate_docs` | `per_system` | not measured | — | 5,000 detail pages per section; 5000 statements / 300s per call |
 | `bw_get_analysis_auth` | `per_object` | 407 B | — | 5000 statements / 300s per call |
-| `bw_get_calc_view_lineage` | `per_object` | 444 B | — | 5000 statements / 300s per call |
+| `bw_get_calc_view_lineage` | `per_object` | 364 B | — | 5000 statements / 300s per call |
 | `bw_get_calc_view_logic` | `per_object` | 425 B | — | 5000 statements / 300s per call |
 | `bw_get_chain` | `per_object` | 650 B | — | 5000 statements / 300s per call |
-| `bw_get_chain_runtimes` | `per_object` | 389 B | — | 5000 statements / 300s per call |
+| `bw_get_chain_runtimes` | `per_object` | 2,009 B | — | 5000 statements / 300s per call |
 | `bw_get_extractor_exit_code` | `per_system` | 410 B | — | 400 satellite program fetches (configurable); 5000 statements / 300s per call |
 | `bw_get_hana_crossings` | `per_page` | 247 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_get_lineage` | `per_graph_node` | 1,556 B | yes | 400 graph nodes, depth 12; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
-| `bw_get_load_closure` | `per_object` | 362 B | — | 5000 statements / 300s per call |
+| `bw_get_load_closure` | `per_object` | 448 B | — | 5000 statements / 300s per call |
 | `bw_get_provider_health` | `per_object` | 437 B | — | 5000 statements / 300s per call |
 | `bw_get_query` | `per_object` | 1,052 B | — | 5000 statements / 300s per call |
 | `bw_get_query_auth_exposure` | `per_object` | 587 B | — | 5000 statements / 300s per call |
@@ -57,7 +57,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_get_query_usage` | `per_object` | 244 B | — | 5000 statements / 300s per call |
 | `bw_get_routine_code` | `per_object` | 302 B | — | 5000 statements / 300s per call |
 | `bw_get_routine_register` | `per_system` | 1,170 B | — | 500 routines parsed (default 100); 5000 statements / 300s per call |
-| `bw_get_schedule_matrix` | `per_page` | 390 B | — | 500 rows per page; 5000 statements / 300s per call |
+| `bw_get_schedule_matrix` | `per_page` | 322 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_get_source_systems` | `per_system` | 405 B | — | 5000 statements / 300s per call |
 | `bw_get_transfer_rules` | `per_object` | 411 B | — | 5000 statements / 300s per call |
 | `bw_get_transformation` | `per_object` | 1,254 B | — | 5000 statements / 300s per call |
@@ -66,7 +66,7 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_list_analysis_auths` | `per_page` | 407 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_business_areas` | `per_system` | 403 B | — | 500 rows per page; one grouped COUNT per provider family; 5000 statements / 300s per call |
 | `bw_list_calc_views` | `per_page` | 510 B | — | 500 rows per page; 5000 statements / 300s per call |
-| `bw_list_chains` | `per_page` | 354 B | — | 500 rows per page; 5000 statements / 300s per call |
+| `bw_list_chains` | `per_page` | 353 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_extractor_enhancements` | `per_page` | 417 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_queries` | `per_page` | 332 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_list_snapshots` | `per_page` | 44 B | — | 500 rows per page; 5000 statements / 300s per call |
@@ -75,15 +75,15 @@ Build `0.1.0`. Every call runs inside a budget of **5000 statements / 300s**, ov
 | `bw_list_update_rules` | `per_page` | 407 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_performance_profile` | `constant` | not measured | — | 5000 statements / 300s per call |
 | `bw_refresh_cache` | `constant` | 58 B | — | 5000 statements / 300s per call |
-| `bw_refresh_capabilities` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
+| `bw_refresh_capabilities` | `constant` | 5,933 B | — | 5000 statements / 300s per call |
 | `bw_render_lineage` | `per_graph_node` | not measured | — | 400 graph nodes, depth 12; depth clamped to 8; 5000 statements / 300s per call |
 | `bw_review_scenario` | `per_system` | 420 B | — | 5000 statements / 300s per call |
 | `bw_search_objects` | `per_page` | 657 B | — | 500 rows per page; 5000 statements / 300s per call |
 | `bw_security_overview` | `per_system` | 407 B | — | 50,000 RSECVAL rows scanned; 5000 statements / 300s per call |
-| `bw_support_matrix` | `constant` | 22,878 B | — | 5000 statements / 300s per call |
-| `bw_system_profile` | `constant` | 5,132 B | — | 5000 statements / 300s per call |
+| `bw_support_matrix` | `constant` | 23,040 B | — | 5000 statements / 300s per call |
+| `bw_system_profile` | `constant` | 5,933 B | — | 5000 statements / 300s per call |
 | `bw_trace_to_source` | `per_graph_node` | 1,805 B | — | 400 graph nodes, depth 12; 5000 statements / 300s per call |
-| `bw_troubleshoot_missing_data` | `per_graph_node` | 9,632 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
+| `bw_troubleshoot_missing_data` | `per_graph_node` | 9,726 B | yes | 400 graph nodes, depth 12; depth clamped to 5; 40 fields, 60 nodes, 90 edges inlined; 5000 statements / 300s per call |
 
 ## Observed on the reference system
 

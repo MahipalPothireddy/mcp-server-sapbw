@@ -30,7 +30,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | Release | verified | expected | unverified | needs_connector | unknown |
 |---|---|---|---|---|---|
 | `BW 7.40` | 0 | 0 | 60 | 2 | 0 |
-| `BW 7.50` | 44 | 16 | 0 | 2 | 0 |
+| `BW 7.50` | 41 | 19 | 0 | 2 | 0 |
 | `BW/4HANA 2.0` | 0 | 0 | 60 | 2 | 0 |
 
 ## Per tool
@@ -41,32 +41,32 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 |---|---|---|---|---|---|
 | `bw_access_report` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_analyze_object` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `object_dependencies`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
-| `bw_analyze_process_chain` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_edges`, `chain_text`, `log_chain` |
-| `bw_analyze_query` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider` |
+| `bw_analyze_process_chain` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_edges`, `chain_text`, `dtp`, `log_chain`, `process_log` |
+| `bw_analyze_query` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider`, `transformation` |
 | `bw_analyze_routine` | `unverified` | `expected` | `unverified` | `unit_tested` | `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_assess_change_impact` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `object_dependencies`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
-| `bw_assess_landscape` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_text`, `dso_header`, `dtp`, `element_text`, `hana_views`, `log_chain`, `query_dir`, `query_provider`, `transformation` |
+| `bw_assess_landscape` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_text`, `dso_header`, `dtp`, `element_text`, `hana_views`, `log_chain`, `process_log`, `query_dir`, `query_provider`, `transformation` |
 | `bw_cache_status` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_capability_report` | `unverified` | `verified` | `unverified` | `not_validated` | - |
-| `bw_check_code_decodes` | `unverified` | `verified` | `unverified` | `not_validated` | - |
+| `bw_check_code_decodes` | `unverified` | `expected` | `unverified` | `unit_tested` | `dict_domain_text`, `dict_domain_values` |
 | `bw_check_load_latency` | `unverified` | `expected` | `unverified` | `unit_tested` | `dtp`, `transformation` |
-| `bw_check_schedule_risk` | `needs_connector` | `needs_connector` | `needs_connector` | `integration_tested` | `chain_attr`, `chain_text`, `log_chain` |
+| `bw_check_schedule_risk` | `needs_connector` | `needs_connector` | `needs_connector` | `integration_tested` | `chain_attr`, `chain_text`, `log_chain`, `process_log` |
 | `bw_compare_snapshots` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_header` |
 | `bw_compare_systems` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_header` |
 | `bw_create_snapshot` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_header`, `transformation` |
 | `bw_describe_object` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_field`, `dso_header`, `dso_text` |
 | `bw_find_layer_violations` | `unverified` | `verified` | `unverified` | `integration_tested` | `transformation` |
 | `bw_find_unused_providers` | `unverified` | `verified` | `unverified` | `integration_tested` | `dso_header`, `element_text`, `query_dir`, `query_provider`, `transformation` |
-| `bw_generate_docs` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_edges`, `chain_text`, `dso_field`, `dso_header`, `dso_text`, `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `hana_views`, `log_chain`, `object_dependencies`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_field`, `transformation_rule`, `transformation_step_rout`, `transformation_text` |
+| `bw_generate_docs` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_attr`, `chain_edges`, `chain_text`, `dso_field`, `dso_header`, `dso_text`, `dtp`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `hana_views`, `log_chain`, `object_dependencies`, `process_log`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_field`, `transformation_rule`, `transformation_step_rout`, `transformation_text` |
 | `bw_get_analysis_auth` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_calc_view_lineage` | `unverified` | `verified` | `unverified` | `integration_tested` | `object_dependencies` |
 | `bw_get_calc_view_logic` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_chain` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_edges`, `chain_text` |
-| `bw_get_chain_runtimes` | `unverified` | `verified` | `unverified` | `integration_tested` | `log_chain` |
+| `bw_get_chain_runtimes` | `unverified` | `verified` | `unverified` | `integration_tested` | `log_chain`, `process_log` |
 | `bw_get_extractor_exit_code` | `needs_connector` | `needs_connector` | `needs_connector` | `not_validated` | - |
 | `bw_get_hana_crossings` | `unverified` | `verified` | `unverified` | `integration_tested` | `object_dependencies` |
 | `bw_get_lineage` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `query_provider`, `routine_source`, `transformation`, `transformation_step_rout` |
-| `bw_get_load_closure` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_edges` |
+| `bw_get_load_closure` | `unverified` | `expected` | `unverified` | `unit_tested` | `chain_edges`, `dtp` |
 | `bw_get_provider_health` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_query` | `unverified` | `verified` | `unverified` | `integration_tested` | `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider` |
 | `bw_get_query_auth_exposure` | `unverified` | `verified` | `unverified` | `not_validated` | - |
@@ -74,7 +74,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_get_query_usage` | `unverified` | `verified` | `unverified` | `integration_tested` | `query_dir` |
 | `bw_get_routine_code` | `unverified` | `expected` | `unverified` | `unit_tested` | `routine_source`, `transformation`, `transformation_step_rout` |
 | `bw_get_routine_register` | `unverified` | `expected` | `unverified` | `unit_tested` | `routine_source`, `transformation`, `transformation_step_rout` |
-| `bw_get_schedule_matrix` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_text`, `log_chain` |
+| `bw_get_schedule_matrix` | `unverified` | `verified` | `unverified` | `integration_tested` | `chain_attr`, `chain_text`, `log_chain`, `process_log` |
 | `bw_get_source_systems` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_transfer_rules` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_get_transformation` | `unverified` | `expected` | `unverified` | `unit_tested` | `transformation`, `transformation_field`, `transformation_rule`, `transformation_step_rout`, `transformation_text` |
@@ -100,7 +100,7 @@ There is deliberately no `supported`. Every value says where the claim comes fro
 | `bw_support_matrix` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_system_profile` | `unverified` | `verified` | `unverified` | `not_validated` | - |
 | `bw_trace_to_source` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `dtp`, `query_dir`, `routine_source`, `transformation`, `transformation_step_rout` |
-| `bw_troubleshoot_missing_data` | `unverified` | `expected` | `unverified` | `unit_tested` | `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider`, `transformation`, `transformation_text` |
+| `bw_troubleshoot_missing_data` | `unverified` | `expected` | `unverified` | `unit_tested` | `dso_field`, `dso_header`, `dso_text`, `element_dir`, `element_range`, `element_select`, `element_text`, `element_xref`, `query_dir`, `query_provider`, `transformation`, `transformation_text` |
 
 ## Caveats
 
