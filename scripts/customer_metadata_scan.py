@@ -62,6 +62,53 @@ ALLOW = {
     "ZXRSAU04",
 }
 
+# Pattern 4: **IPv4 addresses.** Patterns 1-3 cannot see one: an address is not a BW object name
+# and not a dotted *host name* (no alphabetic TLD to match). That gap is not theoretical - two
+# internal addresses from a live landscape, quoted verbatim out of an hdbcli transport error into a
+# source comment, a test and the CHANGELOG, passed every check here and reached a public
+# repository. An address identifies a server and a subnet, which is Rule 5's concern whether or
+# not it is globally routable.
+#
+# Allow-listed by range rather than by value, for the same reason the host rule is: writing the
+# customer's actual addresses in here to detect them would *be* the leak. The documentation and
+# testing ranges reserved by RFC 5737 and RFC 3927 are free; everything else has to be justified.
+# Loopback and the unspecified address are free because they name no host.
+IPV4_PATTERN = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
+_IPV4 = re.compile(IPV4_PATTERN)
+_MAX_OCTET = 255
+
+#: Reserved for documentation (RFC 5737), link-local (RFC 3927), loopback, and placeholders.
+_IP_ALLOW_PREFIXES = (
+    "192.0.2.",  # RFC 5737 TEST-NET-1
+    "198.51.100.",  # RFC 5737 TEST-NET-2
+    "203.0.113.",  # RFC 5737 TEST-NET-3
+    "169.254.",  # RFC 3927 link-local
+    "127.",  # loopback
+    "0.0.0.0",  # the unspecified address
+    "255.255.255.",  # broadcast / netmasks
+)
+
+
+def _ipv4_tokens(text: str) -> set[str]:
+    """IPv4 addresses that are not from a reserved documentation or placeholder range.
+
+    Three-component version strings never match, because four octets are required. A
+    four-component version is indistinguishable from an address by shape alone, so it is reported:
+    a false positive costs one allow-list entry, a missed address costs a disclosure. (No example
+    is written out here - this file is scanned too, and the first draft of this docstring tripped
+    the check on its own illustration.)
+    """
+    hits: set[str] = set()
+    for match in _IPV4.finditer(text):
+        token = match.group(0)
+        if any(token.startswith(prefix) for prefix in _IP_ALLOW_PREFIXES):
+            continue
+        if any(int(octet) > _MAX_OCTET for octet in token.split(".")):
+            continue  # not a valid address: a version string or an identifier
+        hits.add(token)
+    return hits
+
+
 # Pattern 3: dotted host names. Deliberately broad; narrowed by allow-list rather than by guessing
 # which TLDs a customer might use.
 #
@@ -208,14 +255,15 @@ def _walk_paths() -> list[Path]:
     ]
 
 
-def scan_working_tree() -> tuple[set[str], set[str]]:
-    """Object-name hits and host-name hits across everything that could be committed."""
+def scan_working_tree() -> tuple[set[str], set[str], set[str]]:
+    """Object-name, host-name and IP-address hits across everything that could be committed."""
     paths = _committable_paths()
     git_aware = paths is not None
     if paths is None:
         paths = _walk_paths()
     found: set[str] = set()
     hosts: set[str] = set()
+    addresses: set[str] = set()
     for path in paths:
         if not path.is_file():
             continue
@@ -237,9 +285,13 @@ def scan_working_tree() -> tuple[set[str], set[str]]:
         if host_hits:
             print(f"  working tree {rel}: host name(s) {sorted(host_hits)}")
             hosts |= host_hits
+        ip_hits = _ipv4_tokens(text)
+        if ip_hits:
+            print(f"  working tree {rel}: IP address(es) {sorted(ip_hits)}")
+            addresses |= ip_hits
     if not git_aware:
         print("  (git unavailable: scanned the filesystem, so git-ignored files were included)")
-    return found, hosts
+    return found, hosts, addresses
 
 
 def _history_grep(pattern: str) -> list[str]:
@@ -259,11 +311,11 @@ def _history_grep(pattern: str) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def scan_history() -> tuple[set[str], set[str]]:
-    """Object-name and host-name hits anywhere in history.
+def scan_history() -> tuple[set[str], set[str], set[str]]:
+    """Object-name, host-name and IP-address hits anywhere in history.
 
     A clean tip is meaningless if an earlier commit leaked, and a squashed commit does not remove
-    history - so both patterns are replayed over every reachable revision.
+    history - so every pattern is replayed over every reachable revision.
     """
     found = {
         token
@@ -275,12 +327,17 @@ def scan_history() -> tuple[set[str], set[str]]:
         if not _HOST.fullmatch(token):
             continue
         hosts |= _host_tokens(token)
-    return found, hosts
+    addresses: set[str] = set()
+    for token in _history_grep(IPV4_PATTERN):
+        if not _IPV4.fullmatch(token):
+            continue
+        addresses |= _ipv4_tokens(token)
+    return found, hosts, addresses
 
 
 def main() -> int:
-    working_tree, tree_hosts = scan_working_tree()
-    history, history_hosts = scan_history()
+    working_tree, tree_hosts, tree_ips = scan_working_tree()
+    history, history_hosts, history_ips = scan_history()
     failed = False
     if working_tree or history:
         failed = True
@@ -306,6 +363,21 @@ def main() -> int:
             "the git-ignored .env / profiles.yaml only. Use a reserved documentation form "
             "(.invalid, .example, .example.com) in anything tracked. If the host is a genuine "
             "public domain this project cites, add it to HOST_ALLOW here on purpose."
+        )
+    if tree_ips or history_ips:
+        failed = True
+        print("\nPotential IP addresses detected:")
+        if tree_ips:
+            print(f"  working tree: {sorted(tree_ips)}")
+        if history_ips:
+            print(f"  git history:  {sorted(history_ips)}")
+        print(
+            "\nIP addresses must never be committed (mission Rule 5): an address names a server "
+            "and a subnet whether or not it is globally routable. Use an RFC 5737 documentation "
+            "range (192.0.2.x, 198.51.100.x, 203.0.113.x) in anything tracked. A real address "
+            "most often arrives quoted verbatim out of a driver error message - scrub the message, "
+            "do not paste it. If the value is genuinely not an address, add its prefix to "
+            "_IP_ALLOW_PREFIXES here on purpose."
         )
     if failed:
         return 1

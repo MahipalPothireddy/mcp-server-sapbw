@@ -33,6 +33,7 @@ from customer_metadata_scan import (  # noqa: E402
     HOST_ALLOW,
     SKIP_DIRS,
     _host_tokens,
+    _ipv4_tokens,
     _tokens,
 )
 from leak_scan_samples import (  # noqa: E402
@@ -41,6 +42,11 @@ from leak_scan_samples import (  # noqa: E402
     HOST_HITS,
     HOST_MISSES,
     HOST_SHAPED_FILE_NAMES,
+    IP_BARE,
+    IP_DRIVER_ERROR,
+    IP_DRIVER_ERROR_ENDPOINTS,
+    IP_HITS,
+    IP_MISSES,
     OBJECT_HITS,
     OBJECT_MISSES,
     STORAGE_KEY_ALIASES,
@@ -120,13 +126,20 @@ def test_the_scanner_source_is_itself_clean() -> None:
     source = (_ROOT / "scripts" / "customer_metadata_scan.py").read_text(encoding="utf-8")
     assert _tokens(source) == set()
     assert _host_tokens(source) == set()
+    assert _ipv4_tokens(source) == set()
 
 
 def test_this_test_module_is_itself_clean() -> None:
-    """A test proving these patterns fire must not itself be a leak. Hence the fixture import."""
+    """A test proving these patterns fire must not itself be a leak. Hence the fixture import.
+
+    The address rule was added with its samples written inline here, and the scan then failed on
+    its own test suite - caught by running the check against a rewritten clone rather than in
+    place. That is what this assertion is for.
+    """
     source = Path(__file__).read_text(encoding="utf-8")
     assert _tokens(source) == set()
     assert _host_tokens(source) == set()
+    assert _ipv4_tokens(source) == set()
 
 
 def test_the_sample_fixture_is_exempt_only_by_living_under_fixtures() -> None:
@@ -142,3 +155,36 @@ def test_the_sample_fixture_is_exempt_only_by_living_under_fixtures() -> None:
     source = samples.read_text(encoding="utf-8")
     assert _tokens(source), "the object samples stopped matching, so those tests prove nothing"
     assert _host_tokens(source), "the host samples stopped matching, so those tests prove nothing"
+    assert _ipv4_tokens(source), (
+        "the address samples stopped matching, so those tests prove nothing"
+    )
+
+
+# --- pattern 4: IPv4 addresses -----------------------------------------------------------------
+#
+# D76. An address is not a BW object name and not a dotted host name, so patterns 1-3 could not
+# see one, and two internal addresses reached a public repository through a driver error message
+# pasted into a comment, a test and the CHANGELOG. These cases are the regression.
+
+
+@pytest.mark.parametrize("text", IP_HITS)
+def test_ip_addresses_are_caught(text: str) -> None:
+    assert _ipv4_tokens(text), f"expected an IP hit in {text!r}"
+
+
+@pytest.mark.parametrize("text", IP_MISSES)
+def test_reserved_ranges_and_versions_are_not_flagged(text: str) -> None:
+    assert not _ipv4_tokens(text), f"unexpected IP hit in {text!r}"
+
+
+def test_the_driver_error_shape_is_caught_in_full() -> None:
+    """Both endpoints, not just the first: the message names the server *and* the client."""
+    assert _ipv4_tokens(IP_DRIVER_ERROR) == IP_DRIVER_ERROR_ENDPOINTS
+
+
+def test_an_address_is_caught_even_where_a_host_name_would_not_be() -> None:
+    """The two rules are independent; neither substitutes for the other."""
+    assert not _host_tokens(IP_BARE), (
+        "an address has no alphabetic TLD, so the host rule cannot see it"
+    )
+    assert _ipv4_tokens(IP_BARE)

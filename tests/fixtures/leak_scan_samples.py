@@ -82,3 +82,50 @@ HOST_SHAPED_FILE_NAMES: tuple[str, ...] = (
 #: profile-alias spellings that used to collapse onto one cache file; one of them is a single label,
 #: a dot and a two-letter suffix, host-shaped to a naive pattern. It appeared twelve times.
 STORAGE_KEY_ALIASES = "prd/eu, prd_eu, prd.eu, prd eu and prd:eu all produced prd_eu.sqlite"
+
+
+# --- pattern 4: IPv4 addresses -----------------------------------------------------------------
+#
+# The gap these cover: an address is neither a BW object name nor a dotted *host* name, so
+# patterns 1-3 cannot see one. Two internal addresses, quoted verbatim out of an hdbcli transport
+# error into a source comment, a test and the CHANGELOG, passed every earlier check and reached a
+# public repository. The driver error shape below is the exact route they took.
+IP_HITS: tuple[str, ...] = (
+    "10.1.2.3",
+    "172.16.4.5",
+    "192.168.1.1",
+    "connected to 10.11.12.13:30215",
+    # The real route: an address a *driver* volunteers, inside a message someone pastes.
+    "System call 'recv' failed, rc=10054 {10.9.8.7:62939 -> 10.1.1.1:30215}",
+    "host=10.0.0.42 port=30015",
+)
+
+#: Reserved documentation and placeholder ranges, plus shapes that are not addresses at all.
+IP_MISSES: tuple[str, ...] = (
+    # RFC 5737 documentation ranges - the forms anything tracked should use.
+    "198.51.100.10",
+    "203.0.113.67",
+    "192.0.2.1",
+    # RFC 3927 link-local, loopback, unspecified, broadcast.
+    "169.254.1.1",
+    "127.0.0.1",
+    "0.0.0.0",
+    "255.255.255.0",
+    # Not addresses: three-component versions never match the four-octet shape.
+    "version 1.10.0 of the driver",
+    "python 3.12.1",
+    # Four components, but an octet over 255 cannot be an address.
+    "build 2024.300.1.7",
+)
+
+
+#: The exact shape the real addresses arrived in: an hdbcli transport error naming the resolved
+#: server endpoint and the client's own. Kept here rather than inline in the test, because the
+#: scanner reads ``tests/`` and skips only ``tests/fixtures/`` - a sample address written into the
+#: test module would make the check fail on its own test suite, which is how this file earns its
+#: existence.
+IP_DRIVER_ERROR = "System call 'recv' failed {10.9.8.7:62939 -> 10.1.1.1:30215}"
+IP_DRIVER_ERROR_ENDPOINTS = {"10.9.8.7", "10.1.1.1"}
+
+#: An address with no surrounding structure, for asserting that the host rule cannot see one.
+IP_BARE = "connected to 10.1.2.3"

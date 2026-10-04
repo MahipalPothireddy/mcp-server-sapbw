@@ -11,9 +11,9 @@ All notable changes to this project are documented here. The format is based on
 The scrubber removed the profile's host string by literal replacement, which cannot catch an
 address the process never configured. `hdbcli` volunteers exactly that: a transport failure names
 the *resolved* server address, the client's own address and both ports — `System call 'recv'
-failed ... {198.51.100.10:62939 -> 203.0.113.67:30215}`. So a genuine connection drop put both
-endpoints into the tool response and into the log, which is the one thing the security model says
-never happens.
+failed ... {198.51.100.10:62939 -> 203.0.113.67:30215}` (RFC 5737 documentation addresses here;
+the real pair is not repeated). So a genuine connection drop put both endpoints into the tool
+response and into the log, which is the one thing the security model says never happens.
 
 Any IPv4-with-optional-port shape is now masked whether or not it matches the configured host.
 Numeric error codes (`rc=10054`, `(-10807,`) do not match that shape and are deliberately left

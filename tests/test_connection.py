@@ -278,8 +278,9 @@ def test_scrubber_still_masks_a_configured_host_that_is_not_an_address() -> None
 
 # --- Reconnect on transport loss -----------------------------------------------------------
 #
-# A whole-system analysis run does not fit in one database session: the reference system closed the session ~34
-# minutes into a documentation generation. Retrying has to be limited to transport failures, and a
+# A whole-system analysis run does not fit in one database session: the reference system closed
+# the session ~34 minutes into a documentation generation. Retrying has to be limited to transport
+# failures, and a
 # reconnect must not become a way onto a connection that never passed the grant check.
 
 _LOST = "Connection to the server was lost: forcibly closed by the remote host"

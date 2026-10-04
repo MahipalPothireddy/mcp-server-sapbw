@@ -228,6 +228,10 @@ def assert_read_only(sql: str) -> None:
 #: returned both endpoints to the caller and wrote them to the log. Numeric error codes (`rc=10054`,
 #: `(-10807,`) do not match this shape and are left intact, because they are what makes the error
 #: diagnosable.
+#:
+#: The addresses above are RFC 5737 documentation ranges, not the ones observed. The observed pair
+#: was committed here verbatim and reached a public repository - which is the same class of
+#: mistake this regex exists to prevent, made one layer out.
 _ENDPOINT = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?\b")
 
 
