@@ -52,7 +52,6 @@ detect-secrets scan --all-files
 - Keep changes scoped to a single build prompt / task where possible.
 - Reference the relevant requirement IDs (see `.kiro/specs/mcp-server-sapbw/requirements.md`).
 - Update `CHANGELOG.md` under `[Unreleased]`.
-- Update `PROGRESS.md` at the end of a build-prompt session.
 
 ## Build order
 

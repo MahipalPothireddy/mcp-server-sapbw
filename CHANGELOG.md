@@ -1167,8 +1167,10 @@ degradation when `RSPCLOGCHAIN` or `RSPCCHAIN` is absent.
 - Removed a concrete customer query name from two tracked probe scripts (they now take the object
   name as an argument) and from a 3.x test fixture (now synthetic). Added `tmp_*` to `.gitignore`:
   probe scripts run against a live system and routinely carry real object names.
-  **Outstanding:** one customer query name remains in git history, and therefore on the remote.
-  Purging it needs `git filter-repo` plus a force-push — see PROGRESS.md.
+  **Resolved since.** The query name is no longer anywhere in history; the only customer-namespace
+  tokens left are the SAP-defined `ZXRSAU0n` include names, which carry no customer information
+  and are allow-listed on purpose. Verified by replaying the pattern over every reachable
+  revision.
 
 ### Added — capability merge from two script-based BW analysis projects
 

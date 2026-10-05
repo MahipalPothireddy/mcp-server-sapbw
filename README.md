@@ -55,7 +55,7 @@ onboarding exercise, not a development one.
 > Still planned: a BI connector for scenarios 9.7/9.8 (report schedules and dashboards live outside
 > BW, so those two analyses return a template naming the connector required). The ECC source-system
 > connector is implemented (ADT, read-only) but not yet exercised against a live source system. See
-> `PROGRESS.md` for the build log and `.kiro/specs/mcp-server-sapbw/` for the spec.
+> `CHANGELOG.md` for what changed and why, and `.kiro/specs/mcp-server-sapbw/` for the spec.
 
 ## See the output first
 
